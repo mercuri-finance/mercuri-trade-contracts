@@ -2,14 +2,14 @@
 
 This is a separate Git repository: Trade's contract set, apart from Launch's.
 Launch's deployed contracts live in `lib/mercuri-launch-contracts` (a pinned
-submodule of the public repository) and in the canonical `arc.launch/contracts/`
-records; never change them here, and never change them for a Trade feature
+submodule of the public repository) and in the canonical public
+`contracts/launch/deployments/` records; never change them here, and never change them for a Trade feature
 without flagging it to the owner as a live-contract change. Trade adds no
 deployed contract yet: `src/LocalOrderFiller.sol` is a local candidate, absent
 from every deployment record.
 
 Before any commit, push, PR or issue, follow the identity gate in
-`arc.launch/docs/agents/release.md`: the active GitHub login, the commit author
+`../../docs/agents/release.md` in the Mercurifi workspace: the active GitHub login, the commit author
 and committer, and the push transport must all be `mercurifinance`; use the
 HTTPS remote so the pusher is recorded as `mercurifinance`. No AI
 `Co-authored-by` trailer.

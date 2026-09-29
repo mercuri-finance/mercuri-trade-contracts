@@ -1,0 +1,3 @@
+[submodule "lib/mercuri-launch-contracts"]
+	path = lib/mercuri-launch-contracts
+	url = https://github.com/mercuri-finance/mercuri-launch-contracts.git

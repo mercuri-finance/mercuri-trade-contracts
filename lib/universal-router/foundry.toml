@@ -1,0 +1,12 @@
+[profile.default]
+src = "contracts"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 4444
+via_ir = true
+bytecode_hash = "none"
+ast = true
+auto_detect_remappings = false

@@ -20,7 +20,7 @@ interface ICanonicalRouter {
     function execute(bytes calldata commands, bytes[] calldata inputs, uint256 deadline) external payable;
 }
 
-contract UniversalRouterSwapTest is LaunchFixture {
+abstract contract UniversalRouterHarness is LaunchFixture {
     ICanonicalRouter internal router;
     IV4Quoter internal quoter;
     address internal trader = makeAddr("router trader");
@@ -153,6 +153,14 @@ contract UniversalRouterSwapTest is LaunchFixture {
         router.execute(commands, inputs, block.timestamp + 60);
     }
 
+    function _assertEmpty(Market memory m) internal view {
+        assertEq(IERC20(USDC).balanceOf(address(router)), 0);
+        assertEq(m.token.balanceOf(address(router)), 0);
+        assertEq(address(router).balance, 0);
+    }
+}
+
+contract UniversalRouterSwapTest is UniversalRouterHarness {
     function test_exportAppFeeReceipts() public {
         vm.createDir("test-export/trade-router", true);
         for (uint256 side; side < 2; ++side) {
@@ -185,12 +193,6 @@ contract UniversalRouterSwapTest is LaunchFixture {
             string memory result = vm.serializeString(key, "logs", raw);
             vm.writeJson(result, string.concat("test-export/trade-router/", key, ".json"));
         }
-    }
-
-    function _assertEmpty(Market memory m) internal view {
-        assertEq(IERC20(USDC).balanceOf(address(router)), 0);
-        assertEq(m.token.balanceOf(address(router)), 0);
-        assertEq(address(router).balance, 0);
     }
 
     function test_R1MercuriBuyBothOrderings() public {

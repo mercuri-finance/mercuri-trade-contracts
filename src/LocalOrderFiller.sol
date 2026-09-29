@@ -17,17 +17,27 @@ interface IOrderSwapRouter {
     function execute(bytes calldata commands, bytes[] calldata inputs, uint256 deadline) external payable;
 }
 
-/// Local integration candidate only. No deployment or release manifest entry.
-/// The reactor owns signatures/nonces; this immutable filler builds single-pool
-/// recipes and gives all surplus to the signed trader after atomic settlement.
+/// @notice Settles one signed UniswapX order through one Arc v4 USDC pool.
+/// @dev Local integration candidate only; there is no deployment or release record.
+/// The reactor verifies signatures and nonces. This immutable contract has no owner,
+/// pause or upgrade path; a replacement requires a new deployment and new orders.
+/// The signed trader receives every output above the resolved minimum. Tokens sent
+/// to this contract outside a fill are not spent to subsidize another order.
 contract LocalOrderFiller is IReactorCallback {
     using SafeERC20 for IERC20;
+    /// @notice Reactor that authenticates orders and invokes the callback.
     IReactor public immutable reactor;
+    /// @notice Universal Router used for the v4 swap and app fee payment.
     IOrderSwapRouter public immutable router;
+    /// @notice Permit2 allowance target used by the router.
     IAllowanceTransfer public immutable permit2;
+    /// @notice USDC token address used for the pool and app fee.
     address public immutable usdc;
+    /// @notice Launch hook address; pools with this hook pay Launch's hook fee.
     address public immutable launchHook;
+    /// @notice Recipient of the app fee on other USDC pools.
     address public immutable appRecipient;
+    /// @notice App fee in basis points of the USDC side, fixed at 50 bps.
     uint256 public constant APP_FEE_BPS = 50;
     bool private active;
     uint256 private inputBaseline;
@@ -35,6 +45,13 @@ contract LocalOrderFiller is IReactorCallback {
     error ForbiddenCallback();
     error NetMinimumNotMet();
 
+    /// @notice Sets the immutable settlement dependencies and fee recipient.
+    /// @param r Reactor that authenticates the signed order.
+    /// @param u Universal Router used for the swap.
+    /// @param p Permit2 allowance target used by the router.
+    /// @param usd USDC token address.
+    /// @param hook Deployed Launch hook; its pools use the Launch fee path.
+    /// @param recipient App fee recipient for other USDC pools.
     constructor(IReactor r, IOrderSwapRouter u, IAllowanceTransfer p, address usd, address hook, address recipient) {
         require(
             address(r) != address(0) && address(u) != address(0) && address(p) != address(0) && usd != address(0)
@@ -48,10 +65,17 @@ contract LocalOrderFiller is IReactorCallback {
         appRecipient = recipient;
     }
 
+    /// @notice Fills one signed order and delivers its entire net output to the trader.
+    /// @dev Anyone may submit a signed order. The reactor enforces its signature,
+    /// nonce and deadline; this call reverts atomically if the net minimum is unmet.
+    /// @param signed User-signed UniswapX V3 Dutch order and signature.
+    /// @param key The one USDC pool used for this fill.
     function fill(SignedOrder calldata signed, PoolKey calldata key) external {
         if (active) revert InvalidOrder();
         V3DutchOrder memory order = abi.decode(signed.order, (V3DutchOrder));
-        if (order.baseOutputs.length != 1 || order.baseOutputs[0].recipient != order.info.swapper) revert InvalidOrder();
+        if (order.baseOutputs.length != 1 || order.baseOutputs[0].recipient != order.info.swapper) {
+            revert InvalidOrder();
+        }
         IERC20 output = IERC20(order.baseOutputs[0].token);
         IERC20 input = IERC20(address(order.baseInput.token));
         uint256 beforeBalance = output.balanceOf(order.info.swapper);
@@ -73,6 +97,10 @@ contract LocalOrderFiller is IReactorCallback {
         inputBaseline = 0;
     }
 
+    /// @notice Settles the reactor's resolved order against the supplied pool.
+    /// @dev Only the configured reactor can call this during an active fill.
+    /// @param orders The reactor's resolved orders; exactly one is accepted.
+    /// @param callbackData ABI-encoded pool key supplied to `fill`.
     function reactorCallback(ResolvedOrder[] memory orders, bytes memory callbackData) external {
         if (msg.sender != address(reactor) || !active) revert ForbiddenCallback();
         if (orders.length != 1 || orders[0].outputs.length != 1) revert InvalidOrder();
@@ -80,7 +108,9 @@ contract LocalOrderFiller is IReactorCallback {
         PoolKey memory key = abi.decode(callbackData, (PoolKey));
         address input = address(order.input.token);
         address output = order.outputs[0].token;
-        if (input == output || output == address(0) || order.outputs[0].recipient != order.info.swapper) revert InvalidOrder();
+        if (input == output || output == address(0) || order.outputs[0].recipient != order.info.swapper) {
+            revert InvalidOrder();
+        }
         if (!((input == Currency.unwrap(key.currency0) && output == Currency.unwrap(key.currency1))
                     || (input == Currency.unwrap(key.currency1) && output == Currency.unwrap(key.currency0)))) revert InvalidOrder();
         if (input != usdc && output != usdc) revert InvalidOrder();

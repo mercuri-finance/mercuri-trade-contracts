@@ -1,0 +1,115 @@
+{
+  "observedOn": "2026-09-27",
+  "networks": [
+    {
+      "chainId": 5042002,
+      "block": "64325644",
+      "contracts": {
+        "router": {
+          "address": "0x4fcA4a51Ab4F23A7447b3284fBd7D73289A89Fb1",
+          "bytes": 24546,
+          "sha256": "3e0ff3cbf17db72716d49ab7fb6e3174038fa2c3e971237ae3eaa65a13a6708d"
+        },
+        "quoter": {
+          "address": "0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94",
+          "bytes": 6118,
+          "sha256": "aa37fb59c400cc63566d93fd24982289227cdc90716656332e93a42bb17ba758"
+        },
+        "stateView": {
+          "address": "0xF3334192D15450CdD385c8B70e03f9A6bD9E673b",
+          "bytes": 3531,
+          "sha256": "60cd24035661345b74c14895a641420f2598f910e376fb3f115bbd6bf504c8c0"
+        }
+      }
+    },
+    {
+      "chainId": 5042,
+      "block": "23084816",
+      "contracts": {
+        "router": {
+          "address": "0x4fcA4a51Ab4F23A7447b3284fBd7D73289A89Fb1",
+          "bytes": 24546,
+          "sha256": "93f94c5caf02dd0ff92b783bfdbcdfe8e72287b5d6c3a079491de4ff9e7f72ae"
+        },
+        "quoter": {
+          "address": "0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94",
+          "bytes": 6118,
+          "sha256": "aa37fb59c400cc63566d93fd24982289227cdc90716656332e93a42bb17ba758"
+        },
+        "stateView": {
+          "address": "0xF3334192D15450CdD385c8B70e03f9A6bD9E673b",
+          "bytes": 3531,
+          "sha256": "60cd24035661345b74c14895a641420f2598f910e376fb3f115bbd6bf504c8c0"
+        }
+      }
+    }
+  ],
+  "routerDifference": {
+    "byteCount": 35,
+    "cachedDomainSeparator": {
+      "offset": 18261,
+      "length": 32,
+      "testnet": "0x8e03285c358bfb6a5d3dd3996aa5ff249ad7b0d4c79797129e1633a27e5e9b60",
+      "mainnet": "0x508b2ceeb814a1de6ed33eb344ce7a5c438a8da013197d102c8881a5dbd94057",
+      "recomputedFromEIP712Domain": true
+    },
+    "cachedChainId": {
+      "offset": 18450,
+      "length": 32,
+      "testnet": 5042002,
+      "mainnet": 5042
+    },
+    "allOtherBytesIdentical": true
+  },
+  "upstreamReleaseReproductionComplete": true,
+  "routerImmutableWiringCheckComplete": true,
+  "upstreamRouterRevision": "999d561c3ad58fb5cab91b602911f3c75591a9c7",
+  "immutableProof": [
+    {
+      "chainId": 5042,
+      "fullRuntimeReconstructionMatches": true,
+      "immutables": {
+        "poolManager": "0x0000000000000000000000008366a39cc670b4001a1121b8f6a443a643e40951",
+        "SPOKE_POOL": "0x0000000000000000000000008bceaa40b9acdfaedf85adf4ff01f5ad6517937f",
+        "V3_POSITION_MANAGER": "0x00000000000000000000000039654a85a4c05127f5fd6ed22caec077a0fb1377",
+        "V4_POSITION_MANAGER": "0x0000000000000000000000006049c9a0e26405c0985f9e3685c87d0ae917f82b",
+        "WETH9": "0x0000000000000000000000008bceaa40b9acdfaedf85adf4ff01f5ad6517937f",
+        "PERMIT2": "0x000000000000000000000000000000000022d473030f116ddee9f6b43ac78ba3",
+        "UNISWAP_V2_FACTORY": "0x00000000000000000000000089e5db8b5aa49aa85ac63f691524311aeb649eba",
+        "UNISWAP_V2_PAIR_INIT_CODE_HASH": "0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f",
+        "UNISWAP_V3_FACTORY": "0x000000000000000000000000f0db7b58379503491d857db50ac9ece64c653918",
+        "UNISWAP_V3_POOL_INIT_CODE_HASH": "0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54",
+        "_cachedDomainSeparator": "0x508b2ceeb814a1de6ed33eb344ce7a5c438a8da013197d102c8881a5dbd94057",
+        "_cachedChainId": "0x00000000000000000000000000000000000000000000000000000000000013b2",
+        "_cachedThis": "0x0000000000000000000000004fca4a51ab4f23a7447b3284fbd7d73289a89fb1",
+        "_hashedName": "0xa11b775f1048ec545859d88137f90763cf7eee88ee2eace12b317c4eb4f76c80",
+        "_hashedVersion": "0xad7c5bef027816a800da1736444fb58a807ef4c9603b7848673f7e3a68eb14a5",
+        "_name": "0x556e6976657273616c526f75746572000000000000000000000000000000000f",
+        "_version": "0x3200000000000000000000000000000000000000000000000000000000000001"
+      }
+    },
+    {
+      "chainId": 5042002,
+      "fullRuntimeReconstructionMatches": true,
+      "immutables": {
+        "poolManager": "0x0000000000000000000000008366a39cc670b4001a1121b8f6a443a643e40951",
+        "SPOKE_POOL": "0x0000000000000000000000008bceaa40b9acdfaedf85adf4ff01f5ad6517937f",
+        "V3_POSITION_MANAGER": "0x00000000000000000000000039654a85a4c05127f5fd6ed22caec077a0fb1377",
+        "V4_POSITION_MANAGER": "0x0000000000000000000000006049c9a0e26405c0985f9e3685c87d0ae917f82b",
+        "WETH9": "0x0000000000000000000000008bceaa40b9acdfaedf85adf4ff01f5ad6517937f",
+        "PERMIT2": "0x000000000000000000000000000000000022d473030f116ddee9f6b43ac78ba3",
+        "UNISWAP_V2_FACTORY": "0x00000000000000000000000089e5db8b5aa49aa85ac63f691524311aeb649eba",
+        "UNISWAP_V2_PAIR_INIT_CODE_HASH": "0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f",
+        "UNISWAP_V3_FACTORY": "0x000000000000000000000000f0db7b58379503491d857db50ac9ece64c653918",
+        "UNISWAP_V3_POOL_INIT_CODE_HASH": "0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54",
+        "_cachedDomainSeparator": "0x8e03285c358bfb6a5d3dd3996aa5ff249ad7b0d4c79797129e1633a27e5e9b60",
+        "_cachedChainId": "0x00000000000000000000000000000000000000000000000000000000004cef52",
+        "_cachedThis": "0x0000000000000000000000004fca4a51ab4f23a7447b3284fbd7d73289a89fb1",
+        "_hashedName": "0xa11b775f1048ec545859d88137f90763cf7eee88ee2eace12b317c4eb4f76c80",
+        "_hashedVersion": "0xad7c5bef027816a800da1736444fb58a807ef4c9603b7848673f7e3a68eb14a5",
+        "_name": "0x556e6976657273616c526f75746572000000000000000000000000000000000f",
+        "_version": "0x3200000000000000000000000000000000000000000000000000000000000001"
+      }
+    }
+  ]
+}

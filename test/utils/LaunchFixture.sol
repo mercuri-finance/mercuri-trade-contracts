@@ -37,6 +37,9 @@ abstract contract LaunchFixture is V4Fixture {
     address internal alice = makeAddr("alice");
     address internal bob = makeAddr("bob");
     address internal referrer = makeAddr("referrer");
+    // Trade suites can open several markets in one test. A fresh salt keeps
+    // each CREATE2 launch distinct after invariant warmup and inherited tests.
+    uint256 private nextOrderedSalt = 1_000;
 
     function _deploySystem() internal {
         _deployV4();
@@ -133,7 +136,7 @@ abstract contract LaunchFixture is V4Fixture {
     /// @dev Creates a launch whose token address sorts below (or above) USDC, to cover both pool orderings.
     function _createOrdered(bool tokenBelowUsdc) internal returns (LaunchToken token, BondingCurve curve) {
         for (uint256 i; i < 256; ++i) {
-            bytes32 salt = bytes32(i + 1_000);
+            bytes32 salt = bytes32(nextOrderedSalt++);
             (address predicted,) = factory.computeAddresses(alice, _params(salt));
             if ((predicted < USDC) == tokenBelowUsdc) return _create(salt);
         }

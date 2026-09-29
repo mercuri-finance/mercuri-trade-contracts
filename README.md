@@ -37,8 +37,10 @@ git submodule update --init --recursive
 python3 script/check-trade-sources.py   # the two upstream closures are unchanged
 bash script/build-trade-router.sh        # the pinned router, read by the tests from out/trade-router
 forge build
-forge test --no-match-contract 'TradeForkInvariants'
+bash script/check-contracts.sh
 ```
+
+For stress and pinned fork checks, set `ARC_LOCAL_FORK_RPC`, `TRADE_FORK_CHAIN_ID` and `TRADE_FORK_BLOCK`, then run `bash script/check-contracts.sh --stress`. The default gate runs locally without a fork.
 
 The fork invariants read `ARC_LOCAL_FORK_RPC` (a loopback Anvil fork),
 `TRADE_FORK_CHAIN_ID` and `TRADE_FORK_BLOCK`; they are skipped without them.

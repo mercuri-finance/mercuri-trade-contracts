@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {UniversalRouterSwapTest} from "./UniversalRouterSwap.t.sol";
+import {UniversalRouterHarness} from "./UniversalRouterSwap.t.sol";
 import {LocalOrderFiller, IOrderSwapRouter} from "../../src/LocalOrderFiller.sol";
 import {V3DutchOrderReactor} from "../../lib/uniswapx/src/reactors/V3DutchOrderReactor.sol";
 import {IPermit2 as XPermit2} from "../../lib/uniswapx/lib/permit2/src/interfaces/IPermit2.sol";
@@ -29,14 +29,16 @@ import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiqui
 import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {ResolvedOrder} from "../../lib/uniswapx/src/base/ReactorStructs.sol";
 
-contract UniswapXFillerTest is UniversalRouterSwapTest {
+abstract contract UniswapXFillerHarness is UniversalRouterHarness {
     using V3DutchOrderLib for V3DutchOrder;
     V3DutchOrderReactor internal reactor;
     LocalOrderFiller internal filler;
     uint256 internal constant TRADER_KEY = 123456789;
     uint256 internal constant COSIGNER_KEY = 987654321;
 
-    function _orderChainID() internal view virtual returns (uint256) { return 5042002; }
+    function _orderChainID() internal view virtual returns (uint256) {
+        return 5042002;
+    }
 
     function setUp() public virtual override {
         vm.chainId(_orderChainID());
@@ -109,12 +111,43 @@ contract UniswapXFillerTest is UniversalRouterSwapTest {
         filler.fill(signed, m.key);
     }
 
+    function _adversarialMarket(bool narrow) internal returns (Market memory m, AdversarialTradeToken token) {
+        token = new AdversarialTradeToken(trader);
+        m.token = LaunchToken(address(token));
+        m.usdcIs0 = USDC < address(token);
+        m.key = PoolKey(
+            Currency.wrap(m.usdcIs0 ? USDC : address(token)),
+            Currency.wrap(m.usdcIs0 ? address(token) : USDC),
+            3000,
+            60,
+            IHooks(address(0))
+        );
+        poolManager.initialize(m.key, uint160(1 << 96));
+        PoolModifyLiquidityTest lp = new PoolModifyLiquidityTest(poolManager);
+        token.approve(address(lp), type(uint256).max);
+        IERC20(USDC).approve(address(lp), type(uint256).max);
+        lp.modifyLiquidity(
+            m.key,
+            ModifyLiquidityParams(
+                narrow ? int24(-60) : int24(-887220), narrow ? int24(60) : int24(887220), 1e9, bytes32(0)
+            ),
+            ""
+        );
+        vm.startPrank(trader);
+        token.approve(address(permit2), type(uint256).max);
+        IERC20(USDC).approve(address(permit2), type(uint256).max);
+        vm.stopPrank();
+    }
+}
+
+contract UniswapXFillerTest is UniswapXFillerHarness {
     function test_exportOrderFillReceipts() public {
         vm.createDir("test-export/trade-router", true);
         for (uint256 side; side < 2; ++side) {
             bool buy = side == 0;
             Market memory m = _market(buy, false);
-            SignedOrder memory signed = _order(buy ? USDC : address(m.token), buy ? address(m.token) : USDC, 100e6, 1, side + 1);
+            SignedOrder memory signed =
+                _order(buy ? USDC : address(m.token), buy ? address(m.token) : USDC, 100e6, 1, side + 1);
             vm.recordLogs();
             filler.fill(signed, m.key);
             Vm.Log[] memory logs = vm.getRecordedLogs();
@@ -138,70 +171,61 @@ contract UniswapXFillerTest is UniversalRouterSwapTest {
             vm.serializeAddress(key, "trader", trader);
             vm.serializeAddress(key, "currency0", Currency.unwrap(m.key.currency0));
             vm.serializeAddress(key, "currency1", Currency.unwrap(m.key.currency1));
-            vm.serializeBytes(key, "input", abi.encodeCall(LocalOrderFiller.fill,(signed,m.key)));
+            vm.serializeBytes(key, "input", abi.encodeCall(LocalOrderFiller.fill, (signed, m.key)));
             string memory result = vm.serializeString(key, "logs", raw);
-            vm.writeJson(result, string.concat("test-export/trade-router/",key,".json"));
+            vm.writeJson(result, string.concat("test-export/trade-router/", key, ".json"));
         }
     }
 
-    function _adversarialMarket(bool narrow) internal returns(Market memory m,AdversarialTradeToken token) {
-        token=new AdversarialTradeToken(trader);
-        m.token=LaunchToken(address(token));
-        m.usdcIs0=USDC<address(token);
-        m.key=PoolKey(Currency.wrap(m.usdcIs0 ? USDC : address(token)),Currency.wrap(m.usdcIs0 ? address(token) : USDC),3000,60,IHooks(address(0)));
-        poolManager.initialize(m.key,uint160(1<<96));
-        PoolModifyLiquidityTest lp=new PoolModifyLiquidityTest(poolManager);
-        token.approve(address(lp),type(uint256).max);
-        IERC20(USDC).approve(address(lp),type(uint256).max);
-        lp.modifyLiquidity(m.key,ModifyLiquidityParams(narrow ? int24(-60) : int24(-887220),narrow ? int24(60) : int24(887220),1e9,bytes32(0)),"");
-        vm.startPrank(trader);
-        token.approve(address(permit2),type(uint256).max);
-        IERC20(USDC).approve(address(permit2),type(uint256).max);
-        vm.stopPrank();
-    }
     function test_orderRejectsForeignCallbackAndWrongPool() public {
         vm.expectRevert(LocalOrderFiller.ForbiddenCallback.selector);
-        filler.reactorCallback(new ResolvedOrder[](0),"");
-        Market memory m=_market(true,false);
-        SignedOrder memory signed=_order(USDC,address(m.token),100e6,1,3);
-        m.key.currency0=Currency.wrap(address(0x1234));
-        vm.expectRevert();filler.fill(signed,m.key);
-        assertEq(XPermit2(address(permit2)).nonceBitmap(trader,0),0);
+        filler.reactorCallback(new ResolvedOrder[](0), "");
+        Market memory m = _market(true, false);
+        SignedOrder memory signed = _order(USDC, address(m.token), 100e6, 1, 3);
+        m.key.currency0 = Currency.wrap(address(0x1234));
+        vm.expectRevert();
+        filler.fill(signed, m.key);
+        assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
     }
+
     function test_orderTransferTaxRollsBackAndReentrancyIsBlocked() public {
-        (Market memory m,AdversarialTradeToken token)=_adversarialMarket(false);
-        SignedOrder memory sell=_order(address(token),USDC,100e6,1,4);
-        token.configure(1000,address(0),"");
-        uint256 beforeBalance=token.balanceOf(trader);
-        vm.expectRevert();filler.fill(sell,m.key);
-        assertEq(token.balanceOf(trader),beforeBalance);
-        assertEq(XPermit2(address(permit2)).nonceBitmap(trader,0),0);
-        token.configure(0,address(filler),abi.encodeCall(LocalOrderFiller.fill,(sell,m.key)));
-        filler.fill(sell,m.key);
-        assertTrue(token.attempted());assertFalse(token.callbackSucceeded());
-        assertEq(token.balanceOf(address(filler)),0);
+        (Market memory m, AdversarialTradeToken token) = _adversarialMarket(false);
+        SignedOrder memory sell = _order(address(token), USDC, 100e6, 1, 4);
+        token.configure(1000, address(0), "");
+        uint256 beforeBalance = token.balanceOf(trader);
+        vm.expectRevert();
+        filler.fill(sell, m.key);
+        assertEq(token.balanceOf(trader), beforeBalance);
+        assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
+        token.configure(0, address(filler), abi.encodeCall(LocalOrderFiller.fill, (sell, m.key)));
+        filler.fill(sell, m.key);
+        assertTrue(token.attempted());
+        assertFalse(token.callbackSucceeded());
+        assertEq(token.balanceOf(address(filler)), 0);
     }
+
     function test_orderTaxedOutputCannotMeetGrossMinimum() public {
-        (Market memory m,AdversarialTradeToken token)=_adversarialMarket(false);
-        uint256 quoted=_quote(m,true,99500000,"");
-        SignedOrder memory buy=_order(USDC,address(token),100e6,quoted,5);
-        token.configure(1000,address(0),"");
-        uint256 beforeUsdc=IERC20(USDC).balanceOf(trader);
-        vm.expectRevert();filler.fill(buy,m.key);
-        assertEq(IERC20(USDC).balanceOf(trader),beforeUsdc);
-        assertEq(XPermit2(address(permit2)).nonceBitmap(trader,0),0);
-        assertEq(appRecipient.balance,0);
+        (Market memory m, AdversarialTradeToken token) = _adversarialMarket(false);
+        uint256 quoted = _quote(m, true, 99500000, "");
+        SignedOrder memory buy = _order(USDC, address(token), 100e6, quoted, 5);
+        token.configure(1000, address(0), "");
+        uint256 beforeUsdc = IERC20(USDC).balanceOf(trader);
+        vm.expectRevert();
+        filler.fill(buy, m.key);
+        assertEq(IERC20(USDC).balanceOf(trader), beforeUsdc);
+        assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
+        assertEq(appRecipient.balance, 0);
     }
 
     function test_orderRejectsPartialFillWhenLiquidityRunsOut() public {
-        (Market memory m,AdversarialTradeToken token)=_adversarialMarket(true);
-        SignedOrder memory sell=_order(address(token),USDC,100e6,1,7);
-        uint256 beforeBalance=token.balanceOf(trader);
+        (Market memory m, AdversarialTradeToken token) = _adversarialMarket(true);
+        SignedOrder memory sell = _order(address(token), USDC, 100e6, 1, 7);
+        uint256 beforeBalance = token.balanceOf(trader);
         vm.expectRevert(LocalOrderFiller.InvalidOrder.selector);
-        filler.fill(sell,m.key);
-        assertEq(token.balanceOf(trader),beforeBalance);
-        assertEq(XPermit2(address(permit2)).nonceBitmap(trader,0),0);
-        assertEq(appRecipient.balance,0);
+        filler.fill(sell, m.key);
+        assertEq(token.balanceOf(trader), beforeBalance);
+        assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
+        assertEq(appRecipient.balance, 0);
     }
 
     function test_orderMercuriBuy() public {
@@ -219,7 +243,8 @@ contract UniswapXFillerTest is UniversalRouterSwapTest {
             bool buy = side == 0;
             uint256 gross = _quote(m, buy, buy ? 99500000 : 100e6, "");
             uint256 net = buy ? gross : gross - gross * 50 / 10000;
-            SignedOrder memory signed = _order(buy ? USDC : address(m.token), buy ? address(m.token) : USDC, 100e6, net, 20 + side);
+            SignedOrder memory signed =
+                _order(buy ? USDC : address(m.token), buy ? address(m.token) : USDC, 100e6, net, 20 + side);
             filler.fill(signed, m.key);
             assertEq(IERC20(USDC).balanceOf(address(filler)), 7);
             assertEq(IERC20(address(m.token)).balanceOf(address(filler)), 11);
@@ -265,7 +290,9 @@ contract UniswapXFillerTest is UniversalRouterSwapTest {
 
     function test_orderRejectsZeroHookConfiguration() public {
         vm.expectRevert();
-        new LocalOrderFiller(IReactor(address(reactor)), IOrderSwapRouter(address(router)), permit2, USDC, address(0), appRecipient);
+        new LocalOrderFiller(
+            IReactor(address(reactor)), IOrderSwapRouter(address(router)), permit2, USDC, address(0), appRecipient
+        );
     }
 
     function test_orderMercuriSell() public {

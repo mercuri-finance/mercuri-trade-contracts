@@ -1,9 +1,37 @@
-# mercurifi trade · contracts
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.png">
+    <img src="assets/banner-light.png" alt="mercurifi trade — Markets with a pool, on Arc." width="100%">
+  </picture>
+</p>
 
-The Solidity source of **mercurifi trade**, the DEX on Arc for every USDC pool: the ones mercurifi launch graduates into
-and the listed Arc assets. It is a separate product with a separate contract set: Launch's deployed contracts stay in
-[mercuri-launch-contracts](https://github.com/mercuri-finance/mercuri-launch-contracts) and are never changed for
-Trade; anything Trade needs on chain lives here.
+<p align="center">
+  <img src="assets/mark.svg" width="56" height="56" alt="">
+</p>
+
+<h1 align="center">mercurifi trade · contracts</h1>
+
+<p align="center">
+  <a href="deployments/manifest-5042002.json"><img src="https://img.shields.io/badge/Arc_testnet-target_chain_5042002-43459D?style=flat-square" alt="Arc testnet target, chain 5042002"></a>
+  <a href="#deployment"><img src="https://img.shields.io/badge/release-not_deployed-1B3158?style=flat-square" alt="release not deployed"></a>
+  <a href="#build-and-verify"><img src="https://img.shields.io/badge/build-pinned-1B3158?style=flat-square" alt="build pinned"></a>
+  <a href="foundry.toml"><img src="https://img.shields.io/badge/solidity-0.8.26-1B3158?style=flat-square" alt="Solidity 0.8.26"></a>
+  <a href="src/MercuriOrderFiller.sol"><img src="https://img.shields.io/badge/orders-UniswapX-1B3158?style=flat-square" alt="UniswapX"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-1B3158?style=flat-square" alt="MIT license"></a>
+</p>
+
+<p align="center">
+  <a href="https://trade.mercuri.finance">trade.mercuri.finance</a> ·
+  <a href="https://docs.mercuri.finance/trade">docs.mercuri.finance/trade</a> ·
+  <a href="https://trade-api.mercuri.finance/v1/pools">public API</a>
+</p>
+
+The Solidity source of **[trade.mercuri.finance](https://trade.mercuri.finance)**, the DEX for USDC pools on Arc: the
+ones mercurifi launch graduates into and the listed Arc assets. It is a separate product with a separate contract set:
+Launch's deployed contracts stay in
+[mercuri-launch-contracts](https://github.com/mercuri-finance/mercuri-launch-contracts) and are never changed for Trade;
+anything Trade needs on chain lives here. Contracts, the pinned upstream sources they compile against, the testnet
+deployment inputs and the release evidence. The backend, the keeper and the web app are separate and not published.
 
 Spot swaps go through Uniswap's Universal Router and Permit2 into the Uniswap v4 pools on Arc; the 1% trade fee on a
 graduated token's pool is Launch's hook, unchanged. Listed Arc assets pay an app fee to the treasury as a command in
@@ -26,12 +54,19 @@ to run until they are set.
 
 | Dependency | Address (testnet, chain 5042002) | Mutability |
 | --- | --- | --- |
-| Universal Router | [`0x4fcA4a51Ab4F23A7447b3284fBd7D73289A89Fb1`](https://explorer.testnet.arc.io/address/0x4fcA4a51Ab4F23A7447b3284fBd7D73289A89Fb1) | immutable, upstream |
-| Permit2 | [`0x000000000022D473030F116dDEE9F6B43aC78BA3`](https://explorer.testnet.arc.io/address/0x000000000022D473030F116dDEE9F6B43aC78BA3) | immutable, upstream |
-| Launch hook | [`0x87e6BaBAc4598F99f4A0717ad294934455Fe60cc`](https://explorer.testnet.arc.io/address/0x87e6BaBAc4598F99f4A0717ad294934455Fe60cc) | immutable, mercurifi launch |
-| USDC | [`0x3600000000000000000000000000000000000000`](https://explorer.testnet.arc.io/address/0x3600000000000000000000000000000000000000) | upstream, Arc system contract |
+| Universal Router | [`0x4fcA4a51Ab4F23A7447b3284fBd7D73289A89Fb1`](https://explorer.testnet.arc.io/address/0x4fcA4a51Ab4F23A7447b3284fBd7D73289A89Fb1) | immutable · upstream |
+| Permit2 | [`0x000000000022D473030F116dDEE9F6B43aC78BA3`](https://explorer.testnet.arc.io/address/0x000000000022D473030F116dDEE9F6B43aC78BA3) | immutable · upstream |
+| Launch hook | [`0x87e6BaBAc4598F99f4A0717ad294934455Fe60cc`](https://explorer.testnet.arc.io/address/0x87e6BaBAc4598F99f4A0717ad294934455Fe60cc) | immutable · mercurifi launch |
+| USDC | [`0x3600000000000000000000000000000000000000`](https://explorer.testnet.arc.io/address/0x3600000000000000000000000000000000000000) | Arc system contract · upstream |
 
 ## How it works
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/order-flow-dark.png">
+    <img src="assets/order-flow-light.png" alt="An order's life: signed at any time, watched every block, cosigned and filled when a limit's price is reached or a take-profit or stop-loss trigger has held for six blocks, settled in the same transaction with at least the signed minimum to the trader and the execution fee to the keeper." width="600">
+  </picture>
+</p>
 
 1. **Sign.** The trader signs a limit, take-profit or stop-loss order as a UniswapX V3 Dutch order. Nothing moves
    until it is filled.
@@ -86,6 +121,10 @@ event OrderFilled(bytes32 indexed orderHash, address indexed swapper, bytes32 in
 `orderHash` is the trader-signed order hash the reactor's `Fill` event carries; `poolId` is
 `keccak256(abi.encode(key))` of the pool used.
 
+A public read API lists the pools Trade routes to on mainnet:
+[`trade-api.mercuri.finance/v1/pools`](https://trade-api.mercuri.finance/v1/pools), and `/v1/network` names the order
+reactor and cosigner, both empty while orders are closed.
+
 ## Build and verify
 
 ```sh
@@ -100,7 +139,7 @@ bash script/check-contracts.sh
 
 `forge build` uses the pinned settings in [`foundry.toml`](foundry.toml): Solidity 0.8.26, Cancun, via-IR, per-path
 optimizer runs, no metadata hash. `bash script/build-trade-router.sh` compiles the pinned router with its own profile,
-leaving Mercurifi's compiler profiles alone. [`lib-versions.md`](lib-versions.md) records every pin and where each
+leaving this repository's compiler profiles alone. [`lib-versions.md`](lib-versions.md) records every pin and where each
 source came from.
 
 For stress and pinned fork checks, set `ARC_LOCAL_FORK_RPC` (a loopback Anvil fork), `TRADE_FORK_CHAIN_ID` and
@@ -117,7 +156,7 @@ gate runs its offline self-tests.
 | | |
 | --- | --- |
 | [`docs/reports/2026-10-02-order-filler-release.md`](docs/reports/2026-10-02-order-filler-release.md) | Release evidence for the filler candidate: source revision, tests, gas, reviewer questions and open items. |
-| Mutability | The filler is immutable, with no owner. Replacing it, including rotating the keeper key, means deploying a new filler and switching the keeper by configuration. |
+| Mutability | The filler is immutable: no owner, pause, upgrade or rescue path. Replacing it, including rotating the keeper key, means deploying a new filler and switching the keeper by configuration. |
 
 The filler has not been independently reviewed yet, and no third-party audit has been performed. To report a
 vulnerability, see [`SECURITY.md`](SECURITY.md).

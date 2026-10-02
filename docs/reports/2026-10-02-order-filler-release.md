@@ -8,7 +8,7 @@ The 29 Sep report `docs/reports/2026-09-29-filler-assurance.md` predates the ren
 
 | Requirement | Baseline | Candidate | Command / artifact | Result | Open gap |
 | --- | --- | --- | --- | --- | --- |
-| Source revision | `d84519d3e451146ef3b53fe32358db226c588ac3` (29 Sep candidate; `LocalOrderFiller`) | branch `orders/late-cosign`, HEAD `4be34522396dee1c3ac5966ee9ed1fdeaaf19f11`, clean tree at the gate run, local only (not pushed) | `git rev-parse HEAD`, `git status --short` (empty), `git log --oneline d84519d..HEAD` | Six commits: bc4047b rename, d43c0b5 output-token fees, c3371ea invariant reachability, ea78ad8 expiry curve, b794a9c deploy package, 4be3452 deploy guards | The final tag/SHA to deploy is PENDING; any further commit invalidates this packet |
+| Source revision | `d84519d3e451146ef3b53fe32358db226c588ac3` (29 Sep candidate; `LocalOrderFiller`) | branch `orders/late-cosign`, HEAD `4be34522396dee1c3ac5966ee9ed1fdeaaf19f11`, clean tree at the gate run, local only (not pushed). Code is identical at `71177f1`; only this report was added after `4be3452` | `git rev-parse HEAD`, `git status --short` (empty), `git log --oneline d84519d..HEAD` | Six commits: bc4047b rename, d43c0b5 output-token fees, c3371ea invariant reachability, ea78ad8 expiry curve, b794a9c deploy package, 4be3452 deploy guards | The final tag/SHA to deploy is PENDING; any further commit invalidates this packet |
 | Compiler and settings | solc 0.8.26, cancun, via-IR, optimizer, `bytecode_hash=none`; `src/**` compiled at optimizer_runs 200 | Unchanged except `fs_permissions` gained `read ./deployments` | `foundry.toml`; forge 1.4.3-Homebrew | Same compiler, EVM and optimizer settings as baseline; the only `foundry.toml` diff is the `./deployments` read permission (needed by deploy-script tests) | None |
 | Filler runtime size | 7,542 bytes (29 Sep report) | 9,838 bytes (below EIP-170 limit of 24,576) | `script/verify-trade-filler.py --self-test` | 9,838 bytes, keccak `0x351554fc...a32fada` in the self-test; fork rehearsal keccak `0xa2568eef7d6ad8dc62060ec3a171997c0c43974d4212df72607a5d911802598d` (with rehearsal immutables) | Growth of 2,296 bytes is not individually attributed; PENDING |
 | Filler source hash | recorded for `LocalOrderFiller.sol` | `src/MercuriOrderFiller.sol` sha256 `a586804270c082cd8ea67e6b3433c4864c5a1e69e4fe39dcfc7a6c9f54caa5dd` | `source-manifest.json`, `python3 script/check-local-source.py` | Pass inside gate | None |
@@ -26,7 +26,7 @@ The 29 Sep report `docs/reports/2026-09-29-filler-assurance.md` predates the ren
 | `_owed(order, output)`: sum of all outputs, all must be the output token with non-zero recipient, else `InvalidOrder`; replaces `outputs.length != 1` and `outputs[0].amount` | `reactorCallback` | Reactor fee controller outputs in the output token (spec D8, R4) | Section 7 |
 | NatSpec: immutability, orders bound to reactor and cosigner not filler, donations never spent | contract and callback docs | Spec D8, E11 | `check-natspec.py` |
 
-Deviation to resolve: spec D8 says `OrderFilled(orderHash, swapper, poolId, appFee)`. The candidate event has no `appFee` field. Nothing in the A1 report records a decision to drop it. Status: OPEN, owner or controller to confirm the omission is intended before the reviewer is told the event is final.
+Decided (plan review ruling 10): `OrderFilled(orderHash, swapper, poolId)` deliberately has no `appFee` field. A balance-delta fee could be inflated by a hooked pool calling `FeeManager.claimPlatform()` during the fill, so app-fee revenue stays with the indexer's transfer-log attribution. The controller has corrected spec D8 to match. Not an open item.
 
 Non-source changes: tests (`test/integration/UniswapXFiller.t.sol`, `UniswapXLocal.t.sol`, `test/invariant/TradeInvariants.t.sol`, `test/local/DeployScripts.t.sol`, `test/utils/MockFeeController.sol`), `script/` deploy package and verifier, `script/check-contracts.sh`, `.gas-snapshot`, `deployments/manifest-5042002.json`.
 
@@ -36,11 +36,11 @@ The final gate run (this packet, section 12) ran with `forge test --fuzz-seed 0x
 
 | Suite | Tests | Result in final gate run | Notes |
 | --- | --- | --- | --- |
-| `UniswapXFillerTest` | 30 (27 snapshot-covered, 3 fuzz excluded from snapshot) | 30 passed, 655.91 ms | Fuzz default 512 runs; includes `testFuzz_protocolFeeOutput` (513 runs reported by A2), `testFuzz_expiryBoundary` |
+| `UniswapXFillerTest` | 30 (27 snapshot-covered, 3 fuzz excluded from snapshot) | 30 passed (655.91 ms, from the A5 gate run in section 12; not recorded by implementers) | Fuzz default 512 runs; includes `testFuzz_protocolFeeOutput` (513 runs reported by A2), `testFuzz_expiryBoundary` |
 | `UniswapXLocalTest` | 5 | 5 passed | Includes `test_exportExpiringOrderVector` |
 | `UniversalRouterSwapTest` and `.small` | 10 + 10 | 20 passed | Unchanged from baseline |
 | `DeployScriptsTest` | 11 | 11 passed | Sentinel, anvil guard, wrong chain, reactor mismatch (`codehash`, `permit2`, `owner`), no-code |
-| `TradeInvariantsTest` | 1 (5 handlers, see section 4) | passed, 2.41 s | 64 runs x 64 depth, `fail_on_revert=true`; 4,096 calls, 0 reverts, 0 discards |
+| `TradeInvariantsTest` | 1 (5 handlers, see section 4) | passed (2.41 s, A5 gate run) | 64 runs x 64 depth, `fail_on_revert=true`; 4,096 calls, 0 reverts, 0 discards |
 | `UniversalRouterForkTest`, `TradeForkInvariantsTest`, `TradeLocalStateTest` | 1 each | 3 skipped (fork variables unset in the plain gate; state export off) | Fork results are in section 5 |
 | Total, plain gate | 70 | 67 passed, 0 failed, 3 skipped; exit 0 | Final run in section 12 |
 
@@ -72,7 +72,7 @@ Not evidenced: the 29 Sep report states stress invariants of 262,144 calls but n
 | Pinned fork suites | `UniversalRouterFork` 10 passed; `TradeForkInvariants` 1,024 runs, 262,144 calls, 0 reverts, on a fresh loopback fork of Arc testnet at block 65100759, chain 5042002 | A4 report |
 | Rehearsal fork | anvil at block 65100759 (first rehearsal) and 65102574 (fix-round rehearsal); anvil needs `--fork-header 'User-Agent: curl/8.7.1'` | A4 report |
 | Shims | `unchecked_cheatcode_artifacts = true` in `foundry.toml` (forge 1.4.3 artifact restriction, foundry-rs/foundry#12231); `fs_permissions` read for `./out`, `./deployments`, read-write `./test-export`; test fixtures under `test/utils/` and `test/utils/launch/` copied from the Launch working tree on 29 Sep 2026 | `foundry.toml`, `lib-versions.md` |
-| Stress gate RPC | `ARC_LOCAL_FORK_RPC` set to the read-only testnet RPC (A2, A3) or a loopback fork (A4) with `TRADE_FORK_CHAIN_ID=5042002` | A2, A3, A4 reports |
+| Stress gate RPC | `ARC_LOCAL_FORK_RPC` set to the read-only testnet RPC (A2, A3: `https://rpc.testnet.arc.io`; the A4 anvil fork used `https://rpc.testnet.arc.network`; both hostnames were used, read-only) or a loopback fork (A4) with `TRADE_FORK_CHAIN_ID=5042002` | A2, A3, A4 reports |
 | Mainnet fork | Not run in this work. The 29 Sep report recorded mainnet-fork evidence for the old candidate. Mainnet fork evidence for this candidate is PENDING (mainnet is a separate plan) | none |
 | Fork-suite caveat | Anvil stopped answering after receiving the rehearsal deployments and then being forked by forge; a fresh fork at the same block passes. Tooling limitation, not a contract result | A4 report |
 | Fixture limits | Fork shims and test fixtures must never enter a deployment graph; the deploy scripts import only `TradeManifest.sol` and production sources | A4 scripts |
@@ -140,11 +140,11 @@ Block time and wall-clock figures in the spec ("about 10 s") are not evidenced b
 | A4 | Test that manifest `usdc` and `launchHook` equal the Launch testnet record |
 | A4 | Verifier `required_owner` `int(owner,16)` gives a traceback on bad hex; `_isAddressString` accepts a `0X` prefix; stale comment at `DeployScripts.t.sol:43` |
 
-Additional gaps found while preparing this packet (not in the ledger): the `OrderFilled` event omits `appFee` relative to spec D8; the A4 verifier reads the reactor's `_getBlockNumberish` function id from an `eth_call` constructor simulation rather than from source (it is bounded to at most 0xFF); the lowest-level fork evidence for this exact candidate on the real testnet RPC at final HEAD is PENDING.
+Additional gaps found while preparing this packet (not in the ledger): the A4 verifier reads the reactor's `_getBlockNumberish` function id from an `eth_call` constructor simulation rather than from source (it is bounded to at most 0xFF); the evidence for this exact candidate on the real testnet RPC at final HEAD is PENDING.
 
 ## 11. Deployment package and guards (A4)
 
-See Part B below for full details. Summary table:
+See the appendix below for full details; section 12 supersedes it for the gate result. Summary table:
 
 | Guard | Evidence | Result |
 | --- | --- | --- |
@@ -162,7 +162,7 @@ See Part B below for full details. Summary table:
 
 ## 12. Final gate run for this packet
 
-Command: `bash script/check-contracts.sh` in `the contracts checkout` at HEAD `4be3452` before this report was committed. Exit code 0. Forge test: 9 suites, 67 passed, 0 failed, 3 skipped (70 total), seed `0x5042`. Snapshot check: 4 suites, 50 passed, 0 failed, 0 skipped. The `order_expiring.json` copy check printed its skip notice because `TRADE_VECTOR_BACKEND` and `TRADE_VECTOR_WEBUI` were not set in this shell. The `--stress` variant was not re-run for this packet.
+Command: `bash script/check-contracts.sh` in `the contracts checkout` at HEAD `4be3452` before this report was committed. Exit code 0. Forge test (source of the 9-suite and per-suite duration figures in section 3): 9 suites, 67 passed, 0 failed, 3 skipped (70 total), seed `0x5042`. Snapshot check: 4 suites, 50 passed, 0 failed, 0 skipped. The `order_expiring.json` copy check printed its skip notice because `TRADE_VECTOR_BACKEND` and `TRADE_VECTOR_WEBUI` were not set in this shell. The `--stress` variant was not re-run for this packet.
 
 ## 13. Scope for the independent reviewer
 
@@ -188,7 +188,7 @@ Questions we want answered:
 3. Is the input-token fee limit acceptable as a liveness-only failure? Is there a way for a third party who owns a reactor controller to cause loss rather than a stall?
 4. Does the expiry curve behave as described at the boundaries (offsets 20 and 21), including `uint128` overflow in the reactor's decay arithmetic, for every cosigner-supplied `decayStartBlock`, including values in the future and far in the past?
 5. Is the claim that a replacement filler can settle existing orders correct against the order struct and the reactor, and is the keeper's switch-by-configuration safe against settling one order through two fillers?
-6. Is `OrderFilled` sufficient for off-chain accounting, and should it carry `appFee` as spec D8 states?
+6. Is the `OrderFilled` event sufficient for off-chain accounting, given it has no fee field (ruling 10; fees are attributed from transfer logs)?
 7. Does the runtime verifier's treatment of the `_getBlockNumberish` function-pointer immutable (from an `eth_call` constructor simulation, at most 0xFF, other bytes compared) leave room for a hidden difference? Is any tolerance too wide?
 8. Do the deployment guards (sentinel, anvil-only override, reactor code-hash, permit2 and owner checks) prevent a wrong-network or wrong-owner broadcast, and is `TRADE_REACTOR_CODEHASH` a sound trust anchor?
 9. Is the invariant campaign meaningful given the setUp warm-up and per-run state reset? Would a missing handler be caught for every selector, not just `feeFill`?
@@ -198,11 +198,11 @@ Findings from the reviewer must be resolved, and affected gates rerun, before Ta
 
 ---
 
-# Part B. Deployment package and loopback rehearsal (A4 evidence)
+# Appendix: A4 rehearsal record (verbatim)
 
-This is the start of the A5 release-evidence packet. It records a rehearsal on a loopback Arc testnet fork only. Nothing was broadcast to Arc testnet or mainnet, no `deployments/5042002.json` exists, and the owner has not chosen `reactorFeeOwner`.
+Section 12 supersedes this appendix for the gate result. The record below was written by A4 and describes a rehearsal on a loopback Arc testnet fork only. Nothing was broadcast to Arc testnet or mainnet, no `deployments/5042002.json` exists, and the owner has not chosen `reactorFeeOwner`.
 
-The 29 Sep report `docs/reports/2026-09-29-filler-assurance.md` predates the rename of `LocalOrderFiller` to `MercuriOrderFiller`; read its findings as describing the same contract under its former name.
+
 
 ### Package
 
@@ -273,4 +273,3 @@ Rehearsal caveat: the same stress run against the anvil instance that had just r
 
 - Owner names `reactorFeeOwner`; replace the sentinel in the manifest in the same reviewed change.
 - Real deployment needs `deployments/5042002.json` written from the verified output (`reactor`, `reactorFeeOwner`, `filler`, `router`, `permit2`, `usdc`, `launchHook`, `appRecipient`, `block`, `blockHash`, `fillerRuntimeKeccak`, `reactorRuntimeKeccak`, `sourceRevision`, `compiler`), then `verify-trade-filler.py` at that block.
-- A5 completes this packet.

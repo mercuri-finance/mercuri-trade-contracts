@@ -21,15 +21,15 @@ interface IOrderSwapRouter {
 /// @notice Settles one signed UniswapX order through one Arc v4 USDC pool. The signed trader receives every output
 ///         above what the reactor takes (its protocol fee) and, on a sell, above the execution fee: a fixed USDC fee
 ///         paid to `feeRecipient` (the keeper) on each successful fill, only out of value above the signed minimum.
-/// @dev Immutable: no owner, pause, upgrade or rescue path. `executionFee` documents which side of a buy or sell pays
-///      the fee. Tokens sent to this contract outside a fill never subsidize another order or the fee. Orders are bound
-///      to their reactor and cosigner, not to this contract, so a replacement filler can settle orders that are
-///      already signed. Only the configured keeper (`feeRecipient`) can call `fill`. The keeper cosigns each order
-///      exclusive to this filler, and the caller of `fill` chooses the pool, so an open `fill` would let a copier
-///      route a keeper-cosigned order through a pool of its choice (for example around Launch's hook fee) or race
-///      the keeper for its own transaction. Restricting the caller keeps settlement and pool choice with the keeper.
-///      Replacing the filler, including rotating the keeper key, therefore means deploying a new filler and switching
-///      the keeper to it by configuration.
+/// @dev Immutable: no owner, pause, upgrade or rescue path. The execution fee comes from the USDC side (see
+///      `executionFee`). Tokens sent to this contract outside a fill never subsidize another order or the fee. Orders
+///      are bound to their reactor and cosigner, not to this contract, so a replacement filler can settle orders that
+///      are already signed. Only the configured keeper (`feeRecipient`) can call `fill`. The keeper cosigns each order
+///      exclusive to this filler, and the caller of `fill` chooses the pool, so an open `fill` would let a copier route
+///      a keeper-cosigned order through a pool of its choice (for example around Launch's hook fee) or race the keeper
+///      for its own transaction. Restricting the caller keeps settlement and pool choice with the keeper. Replacing the
+///      filler, including rotating the keeper key, therefore means deploying a new filler and switching the keeper to
+///      it by configuration.
 contract MercuriOrderFiller is IReactorCallback {
     using SafeERC20 for IERC20;
     using V3DutchOrderLib for V3DutchOrder;

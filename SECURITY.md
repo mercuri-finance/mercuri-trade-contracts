@@ -2,15 +2,15 @@
 
 ## Reporting a vulnerability
 
-This repository is private, so GitHub's private reporting does not reach it. Report privately through
-**Security → Report a vulnerability** on the public
-[mercuri-launch-contracts](https://github.com/mercuri-finance/mercuri-launch-contracts) repository, naming Trade and
-the filler. The report is visible only to the maintainers until a fix is deployed and disclosed. Please do not open a
-public issue for anything that could be exploited.
+This repository is private, so GitHub's private reporting does not reach it. Report privately through **Security →
+Report a vulnerability** on the public
+[mercuri-launch-contracts](https://github.com/mercuri-finance/mercuri-launch-contracts) repository, naming Trade and the
+filler. The report is visible only to the maintainers until a fix is deployed and disclosed. Please do not open a public
+issue for anything that could be exploited.
 
-Include the contract and function, the chain (testnet 5042002), a transaction or a Foundry test that
-shows the behaviour, and what you think the impact is. You will get an acknowledgement within 48 hours and updates as
-the fix moves.
+Include the contract and function, the chain (testnet 5042002), a transaction or a Foundry test that shows the
+behaviour, and what you think the impact is. You will get an acknowledgement within 48 hours and updates as the fix
+moves.
 
 ## Scope
 

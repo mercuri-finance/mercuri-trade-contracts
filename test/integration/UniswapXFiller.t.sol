@@ -21,6 +21,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
+import {MockFeeController} from "../utils/MockFeeController.sol";
 import {AdversarialTradeToken} from "../utils/AdversarialTradeToken.sol";
 import {LaunchToken} from "@mercuri/launch/LaunchToken.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
@@ -330,6 +331,60 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         vm.expectEmit(true, true, true, true, address(filler));
         emit MercuriOrderFiller.OrderFilled(order.hash(), trader, keccak256(abi.encode(m.key)));
         filler.fill(signed, m.key);
+    }
+
+    function _protocolFeeFill(bool mercuri, bool buy, uint256 bps) internal {
+        address feeTo = makeAddr("uniswap fee");
+        reactor.setProtocolFeeController(address(new MockFeeController(feeTo, bps, false)));
+        Market memory m = _market(buy, mercuri);
+        uint128 amount = buy || !mercuri ? 100e6 : 1000000e18;
+        uint128 netInput = !mercuri && buy ? amount - amount * 50 / 10000 : amount;
+        bytes memory data = mercuri ? abi.encode(uint256(uint160(trader))) : bytes("");
+        uint256 gross = _quote(m, buy, netInput, data);
+        uint256 net = !mercuri && !buy ? gross - gross * 50 / 10000 : gross;
+        uint256 minimum = net * 10_000 / (10_000 + bps); // room for the protocol fee
+        address input = buy ? USDC : address(m.token);
+        address output = buy ? address(m.token) : USDC;
+        uint256 beforeOut = IERC20(output).balanceOf(trader);
+        uint256 beforeFee = IERC20(output).balanceOf(feeTo);
+        filler.fill(_order(input, output, amount, minimum, 51), m.key);
+        assertGe(IERC20(output).balanceOf(trader) - beforeOut, minimum);
+        assertEq(IERC20(output).balanceOf(feeTo) - beforeFee, minimum * bps / 10_000);
+        assertEq(IERC20(input).balanceOf(address(filler)), 0);
+        assertEq(IERC20(output).balanceOf(address(filler)), 0);
+        assertEq(IERC20(input).allowance(address(filler), address(permit2)), 0);
+        assertEq(IERC20(output).allowance(address(filler), address(reactor)), 0);
+    }
+
+    function test_protocolFeeOutputMercuriSell() public {
+        _protocolFeeFill(true, false, 5);
+    }
+
+    function test_protocolFeeOutputMercuriBuy() public {
+        _protocolFeeFill(true, true, 5);
+    }
+
+    function test_protocolFeeOutputOtherBuy() public {
+        _protocolFeeFill(false, true, 5);
+    }
+
+    function test_protocolFeeOutputOtherSell() public {
+        _protocolFeeFill(false, false, 5);
+    }
+
+    function testFuzz_protocolFeeOutput(uint8 bps, bool buy, bool launchPool) public {
+        _protocolFeeFill(launchPool, buy, bound(bps, 0, 5));
+    }
+
+    function test_protocolFeeOnInputFailsWithoutLoss() public {
+        reactor.setProtocolFeeController(address(new MockFeeController(makeAddr("uniswap fee"), 5, true)));
+        Market memory m = _market(true, false);
+        SignedOrder memory signed = _order(USDC, address(m.token), 100e6, 1, 52);
+        uint256 before = IERC20(USDC).balanceOf(trader);
+        vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+        filler.fill(signed, m.key);
+        assertEq(IERC20(USDC).balanceOf(trader), before);
+        assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
     }
 
     function test_constructorRejectsZeroAddress() public {

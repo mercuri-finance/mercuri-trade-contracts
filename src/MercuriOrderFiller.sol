@@ -105,13 +105,28 @@ contract MercuriOrderFiller is IReactorCallback {
         inputBaseline = 0;
     }
 
+    /// @dev The trader's output plus any reactor protocol fee. Fees must be in the
+    /// output token: the whole input is spent on the swap, so an input-token fee
+    /// cannot be paid and the fill is refused (the order stays open, no funds move).
+    /// @param order The resolved order; `outputs[0]` is the trader's.
+    /// @param output The output token.
+    /// @return owed The total the reactor will take from this contract.
+    function _owed(ResolvedOrder memory order, address output) private pure returns (uint256 owed) {
+        uint256 n = order.outputs.length;
+        if (n == 0) revert InvalidOrder();
+        for (uint256 i; i < n; ++i) {
+            if (order.outputs[i].token != output || order.outputs[i].recipient == address(0)) revert InvalidOrder();
+            owed += order.outputs[i].amount;
+        }
+    }
+
     /// @notice Settles the reactor's resolved order against the supplied pool.
     /// @dev Only the configured reactor can call this during an active fill.
-    /// @param orders The reactor's resolved orders; exactly one is accepted.
+    /// @param orders The reactor's resolved orders; exactly one is accepted, with output-token fee outputs allowed.
     /// @param callbackData ABI-encoded pool key supplied to `fill`.
     function reactorCallback(ResolvedOrder[] memory orders, bytes memory callbackData) external {
         if (msg.sender != address(reactor) || !active) revert ForbiddenCallback();
-        if (orders.length != 1 || orders[0].outputs.length != 1) revert InvalidOrder();
+        if (orders.length != 1) revert InvalidOrder();
         ResolvedOrder memory order = orders[0];
         PoolKey memory key = abi.decode(callbackData, (PoolKey));
         address input = address(order.input.token);
@@ -123,7 +138,7 @@ contract MercuriOrderFiller is IReactorCallback {
                     || (input == Currency.unwrap(key.currency1) && output == Currency.unwrap(key.currency0)))) revert InvalidOrder();
         if (input != usdc && output != usdc) revert InvalidOrder();
         uint256 amount = order.input.amount;
-        uint256 minimum = order.outputs[0].amount;
+        uint256 minimum = _owed(order, output);
         if (amount > type(uint128).max || minimum > type(uint128).max) revert InvalidOrder();
         // A taxed input must not spend pre-existing donated funds to fill the gap.
         if (IERC20(input).balanceOf(address(this)) != inputBaseline + amount) revert InvalidOrder();

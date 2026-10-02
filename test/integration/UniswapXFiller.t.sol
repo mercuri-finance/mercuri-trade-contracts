@@ -721,6 +721,10 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
 
     uint256 internal constant MAX_FEE = 100_000;
 
+    function _usdcOf(address who) internal view returns (uint256) {
+        return IERC20(USDC).balanceOf(who);
+    }
+
     /// Balances that a fill may move, read before and after.
     struct Snap {
         uint256 traderUsdc;
@@ -1298,7 +1302,14 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
         }
     }
 
-    function testFuzz_executionFeeConservation(uint256 amountSeed, uint256 feeSeed, bool buy, bool launch) public {
+    function testFuzz_executionFeeConservation(
+        uint256 amountSeed,
+        uint256 feeSeed,
+        uint256 minSeed,
+        bool buy,
+        bool launch,
+        bool protocolOn
+    ) public {
         uint256 fee = bound(feeSeed, 0, MAX_FEE);
         MercuriOrderFiller f = _newFiller(fee);
         Market memory m = _market(buy, launch);
@@ -1328,26 +1339,44 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
             assertFalse(_nonceUsed(250));
             return;
         }
-        uint256 minimum = buy ? got : got - fee;
-        f.fill(_order(input, output, amount, minimum, 250), m.key);
+        // The signed minimum is fuzzed over everything the fill can pay: a buy's output, a sell's output less the fee,
+        // each less room for a 5 bps protocol fee when it is on (the reactor takes it on top of the minimum).
+        uint256 bps = protocolOn ? 5 : 0;
+        address feeTo = makeAddr("uniswap fee");
+        uint256 cap = (buy ? got : got - fee) * 10_000 / (10_000 + bps);
+        if (cap == 0) return; // no signable minimum of at least 1 leaves room for the fee
+        uint256 minimum = bound(minSeed, 1, cap);
+        if (protocolOn) reactor.setProtocolFeeController(address(new MockFeeController(feeTo, bps, false)));
+        SignedOrder memory signed = _order(input, output, amount, minimum, 250);
+        uint256 pmBefore = _usdcOf(address(poolManager));
+        uint256 hookBefore = _usdcOf(address(feeManager));
+        uint256 feeToBefore = IERC20(output).balanceOf(feeTo);
+        before = _snap(m, f, address(this));
+        f.fill(signed, m.key);
         Snap memory afterFill = _snap(m, f, address(this));
+        uint256 protocolFee = IERC20(output).balanceOf(feeTo) - feeToBefore;
+        assertEq(protocolFee, minimum * bps / 10_000, "protocol fee");
         assertEq(afterFill.keeper - before.keeper, fee, "fee recipient gets exactly the fee");
         assertEq(afterFill.app - before.app, appFee, "app fee");
         assertEq(afterFill.caller, before.caller, "caller earns nothing");
         if (buy) {
-            // The output is the quote for exactly amount - appFee - fee, so that much was swapped; the trader's
-            // input is that swap input plus the app fee and the execution fee, and nothing else.
-            assertEq(afterFill.traderToken - before.traderToken, got, "trader gets the whole swap output");
+            // Independent quantity: the USDC the pool manager received is the swap input, and the trader's whole USDC
+            // outlay is that plus the app fee and the execution fee. The protocol fee is in the token, not USDC.
+            // A Launch pool's hook fee is taken out of the pool manager to the fee manager, so add it back.
+            uint256 swapIn = _usdcOf(address(poolManager)) + (_usdcOf(address(feeManager)) - hookBefore) - pmBefore;
+            assertEq(swapIn, amount - appFee - fee, "pool manager received the swap input");
+            assertEq(before.traderUsdc - afterFill.traderUsdc, swapIn + appFee + fee, "conservation");
+            assertGe(afterFill.traderToken - before.traderToken, minimum, "trader gets at least the signed minimum");
             assertEq(
-                before.traderUsdc - afterFill.traderUsdc,
-                (amount - appFee - fee) + (afterFill.app - before.app) + (afterFill.keeper - before.keeper),
-                "conservation"
+                afterFill.traderToken - before.traderToken + protocolFee, got, "token: trader + protocol fee = output"
             );
         } else {
+            // Independent quantity: the USDC the pool manager paid out is the swap output, and it splits exactly into
+            // trader + execution fee + app fee + protocol fee.
+            uint256 swapOut = pmBefore - _usdcOf(address(poolManager)) - (_usdcOf(address(feeManager)) - hookBefore);
             uint256 traderDelta = afterFill.traderUsdc - before.traderUsdc;
-            // USDC side: swap output = trader + execution fee + app fee (no protocol fee here).
-            assertEq(traderDelta + fee + appFee, got + appFee, "conservation");
-            assertEq(traderDelta, minimum);
+            assertEq(swapOut, traderDelta + fee + appFee + protocolFee, "conservation");
+            assertGe(traderDelta, minimum, "trader gets at least the signed minimum");
             assertEq(before.traderToken - afterFill.traderToken, amount);
         }
         _assertFillerClean(m, f);

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Check compiler-emitted NatSpec for the protocol's own public ABI after forge build.
 
+Functions, the constructor, custom errors and events are all checked.
+
 Standard inherited ERC-20/UUPS/ownership methods use vendored documentation. Own
 overrides are checked. Public-variable getters require notices; functions also
 require named inputs and all outputs. This checks completeness, not semantic truth.
@@ -36,6 +38,24 @@ for contract in CONTRACTS:
         metadata = json.loads(metadata)
     user = metadata["output"]["userdoc"].get("methods", {})
     dev = metadata["output"]["devdoc"].get("methods", {})
+    # Custom errors and events need a @notice too: they are what a reverted fill
+    # or an indexer shows to someone reading the contract.
+    # Forge's parsed `metadata` drops userdoc errors and events; the compiler's
+    # own rawMetadata keeps them.
+    raw_userdoc = json.loads(artifact["rawMetadata"])["output"]["userdoc"]
+    for kind, section in (("error", "errors"), ("event", "events")):
+        documented = raw_userdoc.get(section, {})
+        for item in artifact["abi"]:
+            # Library errors (SafeERC20) carry their vendored documentation.
+            if item["type"] != kind or not re.search(r"\b" + kind + r"\s+" + item["name"] + r"\s*\(", source):
+                continue
+            signature = item["name"] + "(" + ",".join(abi_type(i) for i in item["inputs"]) + ")"
+            entry = documented.get(signature, {})
+            # Solidity lists error docs per overload, event docs as one object.
+            notices = [e.get("notice", "") for e in entry] if isinstance(entry, list) else [entry.get("notice", "")]
+            checked += 1
+            if not any(n.strip() for n in notices):
+                failures.append(contract + "." + signature + ": missing @notice on " + kind)
     for item in artifact["abi"]:
         kind = item["type"]
         if kind not in ("function", "constructor"):

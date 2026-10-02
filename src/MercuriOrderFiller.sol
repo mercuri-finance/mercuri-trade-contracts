@@ -47,9 +47,13 @@ contract MercuriOrderFiller is IReactorCallback {
     /// @param swapper The trader who signed the order.
     /// @param poolId `keccak256(abi.encode(key))` of the pool used.
     event OrderFilled(bytes32 indexed orderHash, address indexed swapper, bytes32 indexed poolId);
+    /// @notice A constructor dependency or the fee recipient is the zero address.
     error ZeroAddress();
+    /// @notice The order, its outputs or the pool do not fit this filler, or a fill is already in progress.
     error InvalidOrder();
+    /// @notice The callback came from someone other than the reactor, or outside a fill.
     error ForbiddenCallback();
+    /// @notice The trader's balance rose by less than the order's signed minimum output.
     error NetMinimumNotMet();
 
     /// @notice Sets the immutable settlement dependencies and fee recipient.

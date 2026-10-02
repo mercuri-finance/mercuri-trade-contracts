@@ -5,37 +5,91 @@ import {Test} from "forge-std/Test.sol";
 import {DeployTestnetReactor} from "../../script/DeployTestnetReactor.s.sol";
 import {DeployOrderFiller} from "../../script/DeployOrderFiller.s.sol";
 import {TradeManifest} from "../../script/TradeManifest.sol";
+import {V3DutchOrderReactor} from "../../lib/uniswapx/src/reactors/V3DutchOrderReactor.sol";
+import {IPermit2} from "../../lib/uniswapx/lib/permit2/src/interfaces/IPermit2.sol";
 
-/// @notice The deployment scripts must refuse the shipped manifest (sentinel owner) and any other chain.
+/// @dev Exposes the internal decision logic so tests pass inputs directly and never touch process-wide env vars.
+contract FillerHarness is DeployOrderFiller {
+    function resolve(string memory manifest, bool rehearsal, address override_, bytes memory client)
+        external
+        view
+        returns (address)
+    {
+        return _resolveFeeOwner(manifest, rehearsal, override_, client);
+    }
+
+    function requireReactor(address reactor, address permit2, address feeOwner, bytes32 codeHash) external view {
+        _requireReactor(reactor, permit2, feeOwner, codeHash);
+    }
+}
+
+/// @notice The deployment scripts must refuse the shipped manifest (sentinel owner) and any other chain, and the
+/// rehearsal override must be unreachable outside a loopback anvil.
 contract DeployScriptsTest is Test {
+    address internal constant ANVIL_1 = 0x70997970C51812dc3A010C7d01b50e0d17dc79C8;
+    address internal constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+    string internal constant SENTINEL = '{"reactorFeeOwner":"REQUIRED_AT_D2_OWNER_GO"}';
+    string internal constant CHOSEN = '{"reactorFeeOwner":"0x00000000000000000000000000000000000000cc"}';
+
     function setUp() public {
         vm.chainId(5042002);
+    }
+
+    function test_manifestShipsSentinel() public view {
+        string memory manifest = vm.readFile("deployments/manifest-5042002.json");
+        assertEq(vm.parseJsonString(manifest, ".reactorFeeOwner"), "REQUIRED_AT_D2_OWNER_GO");
+    }
+
+    // The scripts read TRADE_LOCAL_REHEARSAL; no test in this contract sets it, so an unset variable means false.
+    // A lingering real-shell value is overridden below only for the tests that need a fixed value.
+    function test_reactorScriptRefusesShippedManifest() public {
         vm.setEnv("TRADE_LOCAL_REHEARSAL", "false");
-    }
-
-    function test_reactorScriptRefusesSentinelOwner() public {
         DeployTestnetReactor script = new DeployTestnetReactor();
-        vm.expectRevert(); // vm.parseAddress rejects the sentinel string
-
+        vm.expectRevert(TradeManifest.ReactorFeeOwnerNotChosen.selector);
         script.run();
     }
 
-    /// @dev Positive control: the same script succeeds once the rehearsal override supplies an address, so the
-    /// revert above is caused by the sentinel and not by an unrelated failure.
-    function test_reactorScriptRunsWithRehearsalOverride() public {
-        vm.etch(0x000000000022D473030F116dDEE9F6B43aC78BA3, hex"00");
-        vm.setEnv("TRADE_LOCAL_REHEARSAL", "true");
-        vm.setEnv("REACTOR_FEE_OWNER_OVERRIDE", "0x00000000000000000000000000000000000000BB");
-        DeployTestnetReactor script = new DeployTestnetReactor();
-        address reactor = address(script.run());
-        assertGt(reactor.code.length, 0);
-    }
-
-    function test_fillerScriptRefusesSentinelOwner() public {
-        vm.setEnv("TRADE_REACTOR", "0x00000000000000000000000000000000000000AA");
+    function test_fillerScriptRefusesShippedManifest() public {
+        vm.setEnv("TRADE_LOCAL_REHEARSAL", "false");
         DeployOrderFiller script = new DeployOrderFiller();
-        vm.expectRevert();
+        vm.expectRevert(TradeManifest.ReactorFeeOwnerNotChosen.selector);
         script.run();
+    }
+
+    function test_sentinelResolverRefuses() public {
+        FillerHarness h = new FillerHarness();
+        vm.expectRevert(TradeManifest.ReactorFeeOwnerNotChosen.selector);
+        h.resolve(SENTINEL, false, address(0), "");
+    }
+
+    function test_malformedOwnerResolverRefuses() public {
+        FillerHarness h = new FillerHarness();
+        vm.expectRevert(TradeManifest.ReactorFeeOwnerNotChosen.selector);
+        h.resolve('{"reactorFeeOwner":"0xnothex0000000000000000000000000000000000"}', false, address(0), "");
+        vm.expectRevert(TradeManifest.ReactorFeeOwnerNotChosen.selector);
+        h.resolve('{"reactorFeeOwner":"0x0000000000000000000000000000000000000000"}', false, address(0), "");
+    }
+
+    function test_addressResolverAccepts() public {
+        FillerHarness h = new FillerHarness();
+        assertEq(h.resolve(CHOSEN, false, address(0), ""), address(0xcc));
+    }
+
+    function test_overrideNeedsAnvilClient() public {
+        FillerHarness h = new FillerHarness();
+        vm.expectRevert(TradeManifest.RehearsalNeedsAnvil.selector);
+        h.resolve(SENTINEL, true, ANVIL_1, bytes('"Arc/v1.0"'));
+    }
+
+    function test_overrideNeedsAnvilDevAccount() public {
+        FillerHarness h = new FillerHarness();
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.RehearsalOwnerNotAnvilAccount.selector, address(0xcc)));
+        h.resolve(SENTINEL, true, address(0xcc), bytes('"anvil/v1.4.3"'));
+    }
+
+    function test_overrideAcceptedOnAnvilWithDevAccount() public {
+        FillerHarness h = new FillerHarness();
+        assertEq(h.resolve(SENTINEL, true, ANVIL_1, bytes('"anvil/v1.4.3"')), ANVIL_1);
     }
 
     function test_scriptsRefuseOtherChains() public {
@@ -48,8 +102,26 @@ contract DeployScriptsTest is Test {
         fillerScript.run();
     }
 
-    function test_manifestShipsSentinel() public view {
-        string memory manifest = vm.readFile("deployments/manifest-5042002.json");
-        assertEq(vm.parseJsonString(manifest, ".reactorFeeOwner"), "REQUIRED_AT_D2_OWNER_GO");
+    function test_fillerRefusesWrongReactor() public {
+        FillerHarness h = new FillerHarness();
+        V3DutchOrderReactor reactor = new V3DutchOrderReactor(IPermit2(PERMIT2), ANVIL_1);
+        bytes32 hash = address(reactor).codehash;
+        h.requireReactor(address(reactor), PERMIT2, ANVIL_1, hash); // accepted
+
+        vm.expectRevert(abi.encodeWithSelector(DeployOrderFiller.ReactorMismatch.selector, "codehash"));
+        h.requireReactor(address(reactor), PERMIT2, ANVIL_1, bytes32(uint256(1)));
+
+        // Any other contract, such as the harness itself, is not the reactor.
+        vm.expectRevert(abi.encodeWithSelector(DeployOrderFiller.ReactorMismatch.selector, "codehash"));
+        h.requireReactor(address(h), PERMIT2, ANVIL_1, hash);
+
+        vm.expectRevert(abi.encodeWithSelector(DeployOrderFiller.ReactorMismatch.selector, "permit2"));
+        h.requireReactor(address(reactor), address(0xdead), ANVIL_1, hash);
+
+        vm.expectRevert(abi.encodeWithSelector(DeployOrderFiller.ReactorMismatch.selector, "owner"));
+        h.requireReactor(address(reactor), PERMIT2, address(0xbeef), hash);
+
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.NoCode.selector, "reactor", address(0xabc)));
+        h.requireReactor(address(0xabc), PERMIT2, ANVIL_1, hash);
     }
 }

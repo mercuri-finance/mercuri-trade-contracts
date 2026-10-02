@@ -5,12 +5,25 @@ import {console2} from "forge-std/console2.sol";
 import {TradeManifest} from "./TradeManifest.sol";
 import {MercuriOrderFiller, IOrderSwapRouter} from "../src/MercuriOrderFiller.sol";
 import {IReactor} from "../lib/uniswapx/src/interfaces/IReactor.sol";
+import {V3DutchOrderReactor} from "../lib/uniswapx/src/reactors/V3DutchOrderReactor.sol";
 import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 
 /// @notice Deploys the immutable MercuriOrderFiller against the reactor named in TRADE_REACTOR.
 /// Contains no key: pass --account or --ledger. The reactor fee owner must still parse as an address
-/// because the reactor deployment is part of the same release.
+/// because the reactor deployment is part of the same release. Also needs TRADE_REACTOR_CODEHASH.
 contract DeployOrderFiller is TradeManifest {
+    error ReactorMismatch(string what);
+
+    /// @dev TRADE_REACTOR is operator input, so prove it is the reactor from the reactor step: same permit2, same fee
+    /// owner, and runtime code hash equal to TRADE_REACTOR_CODEHASH (the runtime keccak that
+    /// `verify-trade-filler.py` prints for the reactor, copied by the operator).
+    function _requireReactor(address reactor, address permit2, address feeOwner, bytes32 codeHash) internal view {
+        if (reactor.code.length == 0) revert NoCode("reactor", reactor);
+        if (reactor.codehash != codeHash) revert ReactorMismatch("codehash");
+        if (address(V3DutchOrderReactor(payable(reactor)).permit2()) != permit2) revert ReactorMismatch("permit2");
+        if (V3DutchOrderReactor(payable(reactor)).owner() != feeOwner) revert ReactorMismatch("owner");
+    }
+
     function run() external returns (MercuriOrderFiller filler) {
         _requireTestnet();
         string memory manifest = _manifest();
@@ -22,7 +35,7 @@ contract DeployOrderFiller is TradeManifest {
         address usdc = _address(manifest, ".usdc");
         address launchHook = _address(manifest, ".launchHook");
         address appRecipient = _address(manifest, ".appRecipient");
-        _requireCode("reactor", reactor);
+        _requireReactor(reactor, permit2, feeOwner, vm.envBytes32("TRADE_REACTOR_CODEHASH"));
         _requireCode("router", router);
         _requireCode("permit2", permit2);
         _requireCode("usdc", usdc);

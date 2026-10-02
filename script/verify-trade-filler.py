@@ -18,7 +18,13 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 DEFAULT_RPC = 'https://rpc.testnet.arc.network'
-JUMPDEST = 0x5B
+SENTINEL = 'REQUIRED_AT_D2_OWNER_GO'
+POINTER = '_getBlockNumberish'
+# The only immutables each contract may carry. A different set in either direction is a reviewed-source change.
+EXPECTED_IMMUTABLES = {
+    'filler': {'reactor', 'router', 'permit2', 'usdc', 'launchHook', 'appRecipient'},
+    'reactor': {'permit2', POINTER},
+}
 
 
 def cast_keccak(raw):
@@ -69,7 +75,7 @@ def address_word(address):
     return bytes(12) + bytes.fromhex(address.removeprefix('0x').rjust(40, '0'))
 
 
-def expected_runtime(artifact, values, pointers=None):
+def expected_runtime(artifact, values, kind, pointers=None):
     """Return (expected bytes, immutable ranges). Values map immutable name to a 32-byte word.
 
     A name missing from values is an internal function pointer. Via-IR stores a small compiler-assigned function id
@@ -78,6 +84,12 @@ def expected_runtime(artifact, values, pointers=None):
     """
     code = bytearray.fromhex(artifact['deployedBytecode']['object'].removeprefix('0x'))
     names = immutable_names(artifact)
+    found = {names[key] for key in artifact['deployedBytecode']['immutableReferences']}
+    if found != EXPECTED_IMMUTABLES[kind]:
+        raise SystemExit(
+            f'{kind}: immutable set differs: unexpected {sorted(found - EXPECTED_IMMUTABLES[kind])}, '
+            f'missing {sorted(EXPECTED_IMMUTABLES[kind] - found)}'
+        )
     ranges = []
     for key, refs in artifact['deployedBytecode']['immutableReferences'].items():
         name = names[key]
@@ -85,9 +97,14 @@ def expected_runtime(artifact, values, pointers=None):
             start, length = ref['start'], ref['length']
             ranges.append((start, start + length, name))
             if name in values:
-                assert length == 32 and len(values[name]) == 32
+                if length != 32 or len(values[name]) != 32:
+                    raise SystemExit(f'{kind}: immutable {name} is not one 32-byte word')
                 code[start:start + length] = values[name]
-            elif pointers is not None and len(pointers) >= start + length:
+            elif name != POINTER:
+                raise SystemExit(f'{kind}: no value supplied for immutable {name}')
+            elif pointers is None or len(pointers) < start + length:
+                raise SystemExit(f'{kind}: no constructor simulation for {name}')
+            else:
                 if int.from_bytes(pointers[start:start + length], 'big') > 0xFF:
                     raise SystemExit(f'immutable {name} is not a small function id')
                 code[start:start + length] = pointers[start:start + length]
@@ -101,8 +118,8 @@ def differing(expected, live):
     return offsets
 
 
-def verify(label, artifact, values, live, pointers=None):
-    expected, ranges = expected_runtime(artifact, values, pointers)
+def verify(label, kind, artifact, values, live, pointers=None):
+    expected, ranges = expected_runtime(artifact, values, kind, pointers)
     diff = differing(expected, live)
     if diff:
         where = ''
@@ -134,11 +151,9 @@ def manifest_values(manifest, reactor):
     }
 
 
-def verify_reactor(args, manifest, deployment, tag, live):
+def verify_reactor(args, manifest, owner, tag, live):
     """The compiler profile is selected by forge, so try each built variant and accept an exact match."""
     word = address_word(manifest['permit2'])
-    owner = rpc_call(args.rpc, 'eth_call', [{'to': deployment['reactor'], 'data': '0x8da5cb5b'}, tag])
-    owner = '0x' + owner[-40:]
     ctor = subprocess.run(
         ['cast', 'abi-encode', 'constructor(address,address)', manifest['permit2'], owner],
         capture_output=True, text=True, check=True,
@@ -148,13 +163,54 @@ def verify_reactor(args, manifest, deployment, tag, live):
         artifact = json.loads(path.read_text())
         creation = '0x' + artifact['bytecode']['object'].removeprefix('0x') + ctor
         simulated = bytes.fromhex(rpc_call(args.rpc, 'eth_call', [{'data': creation}, tag]).removeprefix('0x'))
-        expected, _ = expected_runtime(artifact, {'permit2': word}, simulated)
+        expected, _ = expected_runtime(artifact, {'permit2': word}, 'reactor', simulated)
         if expected == live:
-            return verify(f'reactor ({path.name})', artifact, {'permit2': word}, live, simulated)
+            return verify(f'reactor ({path.name})', 'reactor', artifact, {'permit2': word}, live, simulated)
         first = first or (path, artifact, simulated)
     path, artifact, simulated = first
-    verify(f'reactor ({path.name})', artifact, {'permit2': word}, live, simulated)
+    verify(f'reactor ({path.name})', 'reactor', artifact, {'permit2': word}, live, simulated)
     return False
+
+
+def required_owner(manifest, deployment):
+    """The fee owner is mandatory: an address in the manifest, never the sentinel, and equal to the record."""
+    owner = manifest.get('reactorFeeOwner', '')
+    if owner == SENTINEL:
+        raise SystemExit('manifest reactorFeeOwner is still the sentinel; the owner choice has not been recorded')
+    if not (isinstance(owner, str) and len(owner) == 42 and owner.startswith('0x')):
+        raise SystemExit(f'manifest reactorFeeOwner is not an address: {owner!r}')
+    int(owner, 16)
+    recorded = deployment.get('reactorFeeOwner')
+    if recorded is None or recorded.lower() != owner.lower():
+        raise SystemExit(f'deployment reactorFeeOwner {recorded!r} != manifest {owner}')
+    return owner
+
+
+def expect_rejected(label, artifact, values, kind):
+    try:
+        expected_runtime(artifact, values, kind)
+    except SystemExit as error:
+        print(f'{label}: rejected ({error})')
+        return True
+    print(f'{label}: NOT rejected')
+    return False
+
+
+def immutable_set_self_test():
+    import copy
+    manifest = load('deployments/manifest-5042002.json')
+    filler = load('out/MercuriOrderFiller.sol/MercuriOrderFiller.json')
+    values = manifest_values(manifest, '0x00000000000000000000000000000000000000aa')
+    extra = copy.deepcopy(filler)
+    extra['deployedBytecode']['immutableReferences']['999999999'] = [{'start': 0, 'length': 32}]
+    extra.setdefault('ast', {}).setdefault('nodes', []).append(
+        {'nodeType': 'VariableDeclaration', 'mutability': 'immutable', 'id': 999999999, 'name': 'sneakyZero'}
+    )
+    missing = copy.deepcopy(filler)
+    del missing['deployedBytecode']['immutableReferences'][next(iter(missing['deployedBytecode']['immutableReferences']))]
+    return expect_rejected('unknown immutable', extra, values, 'filler') & expect_rejected(
+        'missing immutable', missing, values, 'filler'
+    )
 
 
 def self_test(flip):
@@ -162,13 +218,13 @@ def self_test(flip):
     filler = load('out/MercuriOrderFiller.sol/MercuriOrderFiller.json')
     fake_reactor = '0x00000000000000000000000000000000000000aa'
     values = manifest_values(manifest, fake_reactor)
-    live, ranges = expected_runtime(filler, values)
+    live, ranges = expected_runtime(filler, values, 'filler')
     live = bytearray(live)
     if flip:
         # Flip one byte inside the usdc immutable, as a wrong constructor argument would.
         start = next(s for s, e, n in ranges if n == 'usdc')
         live[start + 31] ^= 0x01
-    ok = verify('filler self-test' + (' (one immutable byte flipped)' if flip else ''), filler, values, bytes(live))
+    ok = verify('filler self-test' + (' (one immutable byte flipped)' if flip else ''), 'filler', filler, values, bytes(live))
     return ok
 
 
@@ -187,7 +243,8 @@ def main():
     if args.self_test:
         good = self_test(False)
         bad = self_test(True)
-        if not good or bad:
+        sets = immutable_set_self_test()
+        if not good or bad or not sets:
             print('self-test FAILED: verifier did not behave as required')
             sys.exit(1)
         print('self-test ok: unmodified runtime matches, flipped immutable byte is rejected')
@@ -198,7 +255,8 @@ def main():
     manifest = load(args.manifest)
     deployment = json.loads(Path(args.deployment).read_text())
     chain = int(rpc_call(args.rpc, 'eth_chainId', []), 16)
-    assert chain == manifest['chainId'], f'chain id {chain} != manifest {manifest["chainId"]}'
+    if chain != manifest['chainId']:
+        raise SystemExit(f'chain id {chain} != manifest {manifest["chainId"]}')
     tag = hex(args.block)
     block = rpc_call(args.rpc, 'eth_getBlockByNumber', [tag, False])
     print(f'block {args.block} hash {block["hash"]}')
@@ -206,16 +264,17 @@ def main():
     def code(address):
         return bytes.fromhex(rpc_call(args.rpc, 'eth_getCode', [address, tag]).removeprefix('0x'))
 
-    ok = verify_reactor(args, manifest, deployment, tag, code(deployment['reactor']))
+    owner = required_owner(manifest, deployment)
+    ok = verify_reactor(args, manifest, owner, tag, code(deployment['reactor']))
     filler = load('out/MercuriOrderFiller.sol/MercuriOrderFiller.json')
-    ok &= verify('filler', filler, manifest_values(manifest, deployment['reactor']), code(deployment['filler']))
-    owner = rpc_call(args.rpc, 'eth_call', [{'to': deployment['reactor'], 'data': '0x8da5cb5b'}, tag])
-    owner = '0x' + owner[-40:]
-    if 'reactorFeeOwner' in deployment and owner.lower() != deployment['reactorFeeOwner'].lower():
-        print(f'reactor owner {owner} != recorded reactorFeeOwner {deployment["reactorFeeOwner"]}')
+    ok &= verify('filler', 'filler', filler, manifest_values(manifest, deployment['reactor']), code(deployment['filler']))
+    onchain = rpc_call(args.rpc, 'eth_call', [{'to': deployment['reactor'], 'data': '0x8da5cb5b'}, tag])
+    onchain = '0x' + onchain[-40:]
+    if onchain.lower() != owner.lower():
+        print(f'reactor owner {onchain} != manifest reactorFeeOwner {owner}')
         ok = False
     else:
-        print(f'reactor owner {owner}')
+        print(f'reactor owner {onchain} matches the manifest')
     sys.exit(0 if ok else 1)
 
 

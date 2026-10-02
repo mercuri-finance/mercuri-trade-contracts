@@ -29,18 +29,73 @@ abstract contract TradeManifest is Script {
         if (account.code.length == 0) revert NoCode(name, account);
     }
 
+    error ReactorFeeOwnerNotChosen();
+    error RehearsalNeedsAnvil();
+    error RehearsalOwnerNotAnvilAccount(address owner);
+
     /// @dev `reactorFeeOwner` is an owner choice made at deployment time and ships as a sentinel string.
-    /// `vm.parseAddress` reverts on anything that is not an address, so the sentinel stops the script.
-    /// TRADE_LOCAL_REHEARSAL=true swaps in REACTOR_FEE_OWNER_OVERRIDE for a loopback fork rehearsal only.
-    function _reactorFeeOwner(string memory manifest) internal view returns (address owner) {
-        if (vm.envOr("TRADE_LOCAL_REHEARSAL", false)) {
-            owner = vm.envAddress("REACTOR_FEE_OWNER_OVERRIDE");
-            console2.log(
-                "WARNING: LOCAL REHEARSAL. reactorFeeOwner overridden; NEVER set TRADE_LOCAL_REHEARSAL on a real deployment"
-            );
+    /// TRADE_LOCAL_REHEARSAL=true swaps in REACTOR_FEE_OWNER_OVERRIDE for a loopback fork rehearsal only. Because
+    /// the real testnet shares chain id 5042002, the override additionally needs an RPC that reports itself as
+    /// anvil and an owner that is one of anvil's public default accounts.
+    function _reactorFeeOwner(string memory manifest) internal returns (address) {
+        bool rehearsal = vm.envOr("TRADE_LOCAL_REHEARSAL", false);
+        address override_ = rehearsal ? vm.envAddress("REACTOR_FEE_OWNER_OVERRIDE") : address(0);
+        bytes memory client = rehearsal ? vm.rpc("web3_clientVersion", "[]") : bytes("");
+        return _resolveFeeOwner(manifest, rehearsal, override_, client);
+    }
+
+    /// @dev Pure decision logic, parameterised so tests need no environment variables.
+    function _resolveFeeOwner(string memory manifest, bool rehearsal, address override_, bytes memory clientVersion)
+        internal
+        view
+        returns (address owner)
+    {
+        if (rehearsal) {
+            if (!_contains(clientVersion, bytes("anvil"))) revert RehearsalNeedsAnvil();
+            if (!_isAnvilDefaultAccount(override_)) revert RehearsalOwnerNotAnvilAccount(override_);
+            owner = override_;
+            console2.log("WARNING: LOCAL REHEARSAL on anvil. reactorFeeOwner overridden with a public dev account");
         } else {
-            owner = vm.parseAddress(vm.parseJsonString(manifest, ".reactorFeeOwner"));
+            string memory text = vm.parseJsonString(manifest, ".reactorFeeOwner");
+            if (!_isAddressString(text)) revert ReactorFeeOwnerNotChosen();
+            owner = vm.parseAddress(text);
         }
-        if (owner == address(0)) revert NoCode("reactorFeeOwner", owner);
+        if (owner == address(0)) revert ReactorFeeOwnerNotChosen();
+    }
+
+    /// @dev Checked in Solidity because `vm.parseAddress` reverts uncatchably without an external call, and a
+    /// script may not call itself.
+    function _isAddressString(string memory text) internal pure returns (bool) {
+        bytes memory b = bytes(text);
+        if (b.length != 42 || b[0] != "0" || (b[1] != "x" && b[1] != "X")) return false;
+        for (uint256 i = 2; i < 42; i++) {
+            bytes1 c = b[i];
+            bool hex_ = (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F");
+            if (!hex_) return false;
+        }
+        return true;
+    }
+
+    function _isAnvilDefaultAccount(address a) internal pure returns (bool) {
+        return a == 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 || a == 0x70997970C51812dc3A010C7d01b50e0d17dc79C8
+            || a == 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC || a == 0x90F79bf6EB2c4f870365E785982E1f101E93b906
+            || a == 0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65 || a == 0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc
+            || a == 0x976EA74026E726554dB657fA54763abd0C3a0aa9 || a == 0x14dC79964da2C08b23698B3D3cc7Ca32193d9955
+            || a == 0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f || a == 0xa0Ee7A142d267C1f36714E4a8F75612F20a79720;
+    }
+
+    function _contains(bytes memory haystack, bytes memory needle) internal pure returns (bool) {
+        if (needle.length > haystack.length) return false;
+        for (uint256 i = 0; i + needle.length <= haystack.length; i++) {
+            bool hit = true;
+            for (uint256 j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) {
+                    hit = false;
+                    break;
+                }
+            }
+            if (hit) return true;
+        }
+        return false;
     }
 }

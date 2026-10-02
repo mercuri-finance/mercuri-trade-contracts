@@ -111,7 +111,7 @@ abstract contract TradeManifest is Script {
     function _isAddressString(string memory text) internal pure returns (bool) {
         bytes memory b = bytes(text);
         if (b.length != 42 || b[0] != "0" || (b[1] != "x" && b[1] != "X")) return false;
-        for (uint256 i = 2; i < 42; i++) {
+        for (uint256 i = 2; i < 42; ++i) {
             bytes1 c = b[i];
             bool hex_ = (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F");
             if (!hex_) return false;
@@ -129,9 +129,9 @@ abstract contract TradeManifest is Script {
 
     function _contains(bytes memory haystack, bytes memory needle) internal pure returns (bool) {
         if (needle.length > haystack.length) return false;
-        for (uint256 i = 0; i + needle.length <= haystack.length; i++) {
+        for (uint256 i; i + needle.length <= haystack.length; ++i) {
             bool hit = true;
-            for (uint256 j = 0; j < needle.length; j++) {
+            for (uint256 j; j < needle.length; ++j) {
                 if (haystack[i + j] != needle[j]) {
                     hit = false;
                     break;

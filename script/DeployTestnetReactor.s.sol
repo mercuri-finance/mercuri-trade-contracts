@@ -6,7 +6,8 @@ import {V3DutchOrderReactor} from "../lib/uniswapx/src/reactors/V3DutchOrderReac
 import {IPermit2} from "../lib/uniswapx/lib/permit2/src/interfaces/IPermit2.sol";
 import {TradeManifest} from "./TradeManifest.sol";
 
-/// @notice Deploys the pinned UniswapX V3 Dutch reactor on Arc testnet. Contains no key: pass --account or --ledger.
+/// @notice Deploys the pinned UniswapX V3 Dutch reactor on Arc testnet. Contains no key: pass `--account` or
+///         `--ledger`.
 contract DeployTestnetReactor is TradeManifest {
     function run() external returns (V3DutchOrderReactor reactor) {
         _requireTestnet();

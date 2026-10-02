@@ -15,6 +15,7 @@ import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.so
 interface ITradeExercise {
     function exercise(uint256 seed) external;
     function toggleOutputFee() external;
+    function exerciseExpiring(uint256 offset) external;
     function inputFeeAttempt(uint256 seed) external;
     function feeFill(uint256 seed) external;
 }
@@ -41,6 +42,10 @@ contract TradeSequenceHandler {
     function feeFill(uint256 seed) external {
         suite.feeFill(seed);
     }
+
+    function expiring(uint256 offset) external {
+        suite.exerciseExpiring(offset);
+    }
 }
 
 /// Sequence properties for the new Trade filler, separate from Launch invariants.
@@ -60,6 +65,8 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
     uint256 public inputFeeRejections;
     uint256 internal feeFillsBase;
     uint256 internal inputFeeRejectionsBase;
+    uint256 public expiredRejections;
+    uint256 internal expiredRejectionsBase;
     bool internal outputFeeOn;
     uint256 private beforeProtocolFee; // storage: `exercise` is at the stack limit
     address internal feeTo;
@@ -89,11 +96,12 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         feeTo = makeAddr("uniswap fee");
         outputFee = new MockFeeController(feeTo, 5, false);
         inputFee = new MockFeeController(feeTo, 5, true);
-        bytes4[] memory selectors = new bytes4[](4);
+        bytes4[] memory selectors = new bytes4[](5);
         selectors[0] = handler.step.selector;
         selectors[1] = handler.toggleOutputFee.selector;
         selectors[2] = handler.inputFeeAttempt.selector;
         selectors[3] = handler.feeFill.selector;
+        selectors[4] = handler.expiring.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         // Warm each branch, including every pool/direction, before random sequences.
         for (uint256 i; i < 4; ++i) {
@@ -109,9 +117,12 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         this.exercise(1);
         this.inputFeeAttempt(0);
         this.toggleOutputFee();
+        this.exerciseExpiring(0);
+        this.exerciseExpiring(EXPIRY_BLOCKS + 1);
         // Reachability is judged on campaign activity only, not on this warm-up.
         feeFillsBase = feeFills;
         inputFeeRejectionsBase = inputFeeRejections;
+        expiredRejectionsBase = expiredRejections;
     }
 
     /// Runs one successful fill with the output-token protocol fee on, then restores the prior fee state.
@@ -127,6 +138,55 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
             outputFeeOn = false;
             reactor.setProtocolFeeController(address(0));
         }
+    }
+
+    /// Fills a late-cosigned expiring buy `offset` blocks (even seeds land inside the window, odd ones past it) after its decay start: it must fill through block +20 and
+    /// be refused as `InvalidOrder` from +21, leaving the filler empty and the nonce unused either way.
+    function exerciseExpiring(uint256 offset) external {
+        require(msg.sender == address(handler) || msg.sender == address(this), "handler only");
+        offset = offset % 2 == 0 ? offset / 2 % (EXPIRY_BLOCKS + 1) : EXPIRY_BLOCKS + 1 + offset / 2 % 20; // both sides of +20
+        Market memory m = markets[offset % 4];
+        uint128 amount = 1e6 + uint128(offset) * 1e5;
+        bool app = address(m.key.hooks) == address(0);
+        uint128 netInput = app ? uint128(amount - uint256(amount) * 50 / 10000) : amount;
+        uint256 minimum = _quote(m, true, netInput, app ? bytes("") : abi.encode(uint256(uint160(trader))));
+        if (outputFeeOn) minimum = minimum * 10_000 / 10_005; // room for the 5 bps protocol fee
+        uint256 nonce = nextNonce++;
+        uint256 start = block.number;
+        SignedOrder memory signed = _expiringOrder(USDC, address(m.token), amount, minimum / 2, nonce, start, minimum);
+        vm.roll(start + offset);
+        uint256 beforeInput = IERC20(USDC).balanceOf(trader);
+        uint256 beforeOutput = IERC20(address(m.token)).balanceOf(trader);
+        uint256 beforeBitmap = XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8);
+        steps++;
+        if (offset <= EXPIRY_BLOCKS) {
+            filler.fill(signed, m.key);
+            assertEq(beforeInput - IERC20(USDC).balanceOf(trader), amount, "expiring exact input");
+            assertGe(IERC20(address(m.token)).balanceOf(trader) - beforeOutput, minimum, "expiring output");
+            assertEq(
+                XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8),
+                beforeBitmap | (1 << (nonce & 255)),
+                "expiring nonce used"
+            );
+            successfulFills++;
+        } else {
+            try filler.fill(signed, m.key) {
+                fail("expired order filled");
+            } catch (bytes memory err) {
+                assertEq(bytes4(err), MercuriOrderFiller.InvalidOrder.selector, "expiry reverted for another reason");
+                expiredRejections++;
+            }
+            assertEq(IERC20(USDC).balanceOf(trader), beforeInput, "expired fill spent input");
+            assertEq(
+                XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8), beforeBitmap, "expired fill used nonce"
+            );
+        }
+        assertEq(IERC20(USDC).balanceOf(address(filler)), donated[USDC], "expiring filler USDC");
+        assertEq(
+            IERC20(address(m.token)).balanceOf(address(filler)), donated[address(m.token)], "expiring filler token"
+        );
+        assertEq(IERC20(USDC).allowance(address(filler), address(reactor)), 0);
+        assertEq(IERC20(address(m.token)).allowance(address(filler), address(reactor)), 0);
     }
 
     /// Switches the reactor's protocol fee (5 bps of the trader output) on or off.
@@ -267,6 +327,7 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         assertGt(expectedFailures, 0);
         assertGt(feeFills, feeFillsBase, "campaign never ran an output-fee fill");
         assertGt(inputFeeRejections, inputFeeRejectionsBase, "campaign never saw an input-fee rejection");
+        assertGt(expiredRejections, expiredRejectionsBase, "campaign never saw an expired-order rejection");
         assertGe(steps, 13);
     }
 }

@@ -15,6 +15,21 @@ forge fmt --check
 forge build
 python3 script/check-natspec.py
 forge test --fuzz-seed 0x5042
+# The expiring-order vector is consumed by the backend and the web app. All three copies must be identical.
+if [[ -n ${TRADE_VECTOR_BACKEND:-} && -n ${TRADE_VECTOR_WEBUI:-} ]]; then
+  vector=test-export/trade-orders/order_expiring.json
+  expected=$(shasum -a 256 "$vector" | cut -d' ' -f1)
+  for copy in "$TRADE_VECTOR_BACKEND" "$TRADE_VECTOR_WEBUI"; do
+    actual=$(shasum -a 256 "$copy" | cut -d' ' -f1)
+    if [[ $actual != "$expected" ]]; then
+      echo "order_expiring.json differs: $copy ($actual) vs $vector ($expected)" >&2
+      exit 1
+    fi
+  done
+  echo "order_expiring.json identical in contracts, backend and web app ($expected)"
+else
+  echo "notice: TRADE_VECTOR_BACKEND/TRADE_VECTOR_WEBUI not set; skipping order_expiring.json copy check"
+fi
 forge snapshot --check --match-path 'test/integration/*.t.sol' \
   --no-match-contract 'Fork' --no-match-test '^testFuzz_' --fuzz-seed 0x5042
 

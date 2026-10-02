@@ -71,6 +71,14 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
         bytes32 h = order.hash();
         (uint8 cv, bytes32 cr, bytes32 cs) = vm.sign(COSIGNER_KEY, order.cosignerDigest(h));
         order.cosignature = abi.encodePacked(cr, cs, cv);
+        signed = SignedOrder(abi.encode(order), _traderSig(input, amount, nonce, order.info.deadline, h));
+    }
+
+    function _traderSig(address input, uint256 amount, uint256 nonce, uint256 deadline, bytes32 h)
+        internal
+        view
+        returns (bytes memory)
+    {
         bytes32 typeHash = keccak256(
             abi.encodePacked(
                 "PermitWitnessTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline,",
@@ -83,11 +91,58 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
             abi.encodePacked(
                 hex"1901",
                 permit2.DOMAIN_SEPARATOR(),
-                keccak256(abi.encode(typeHash, permissions, address(reactor), nonce, order.info.deadline, h))
+                keccak256(abi.encode(typeHash, permissions, address(reactor), nonce, deadline, h))
             )
         );
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(TRADER_KEY, digest);
-        signed = SignedOrder(abi.encode(order), abi.encodePacked(r, s, v));
+        return abi.encodePacked(r, s, v);
+    }
+
+    uint256 internal constant EXPIRY_BLOCKS = 20;
+
+    function _expiryCurve() internal pure returns (NonlinearDutchDecay memory c) {
+        int256[] memory amounts = new int256[](2);
+        amounts[0] = 0;
+        amounts[1] = -int256(uint256(1) << 128);
+        c = NonlinearDutchDecay(EXPIRY_BLOCKS | ((EXPIRY_BLOCKS + 1) << 16), amounts);
+    }
+
+    /// Re-cosigns and re-signs `order` after a test edits it, so the edit is the only change.
+    function _resign(V3DutchOrder memory order, address input, uint256 amount, uint256 nonce)
+        internal
+        view
+        returns (SignedOrder memory signed)
+    {
+        bytes32 h = order.hash();
+        (uint8 cv, bytes32 cr, bytes32 cs) = vm.sign(COSIGNER_KEY, order.cosignerDigest(h));
+        order.cosignature = abi.encodePacked(cr, cs, cv);
+        signed = SignedOrder(abi.encode(order), _traderSig(input, amount, nonce, order.info.deadline, h));
+    }
+
+    function _expiringOrder(
+        address input,
+        address output,
+        uint256 amount,
+        uint256 minimum,
+        uint256 nonce,
+        uint256 decayStart,
+        uint256 raised
+    ) internal view returns (SignedOrder memory signed) {
+        NonlinearDutchDecay memory flat = NonlinearDutchDecay(0, new int256[](0));
+        V3DutchOutput[] memory outputs = new V3DutchOutput[](1);
+        outputs[0] = V3DutchOutput(output, minimum, _expiryCurve(), trader, minimum, 0);
+        V3DutchOrder memory order;
+        order.info = OrderInfo(
+            IReactor(address(reactor)), trader, nonce, block.timestamp + 1 days, IValidationCallback(address(0)), ""
+        );
+        order.cosigner = vm.addr(COSIGNER_KEY);
+        order.startingBaseFee = 0;
+        order.baseInput = V3DutchInput(XERC20(input), amount, flat, amount, 0);
+        order.baseOutputs = outputs;
+        uint256[] memory overrides = new uint256[](1);
+        overrides[0] = raised;
+        order.cosignerData = CosignerData(decayStart, address(0), 0, 0, overrides);
+        signed = _resign(order, input, amount, nonce);
     }
 
     function _fillPath(bool mercuri, bool buy) internal {
@@ -385,6 +440,113 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         filler.fill(signed, m.key);
         assertEq(IERC20(USDC).balanceOf(trader), before);
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
+    }
+
+    function test_expiringOrderFillsInsideWindow() public {
+        Market memory m = _market(false, true);
+        uint256 gross = _quote(m, false, 1000000e18, abi.encode(uint256(uint160(trader))));
+        uint256 start = block.number;
+        SignedOrder memory signed = _expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 61, start, 0);
+        vm.roll(start + EXPIRY_BLOCKS);
+        filler.fill(signed, m.key); // last valid block
+    }
+
+    function test_expiringOrderDeadAfterWindow() public {
+        Market memory m = _market(false, true);
+        uint256 start = block.number;
+        SignedOrder memory signed = _expiringOrder(address(m.token), USDC, 1000000e18, 1, 62, start, 0);
+        vm.roll(start + EXPIRY_BLOCKS + 1);
+        vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector); // owed > uint128
+        filler.fill(signed, m.key);
+        assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
+    }
+
+    function testFuzz_expiryBoundary(uint8 offset) public {
+        offset = uint8(bound(offset, 0, 40));
+        Market memory m = _market(false, true);
+        uint256 gross = _quote(m, false, 1000000e18, abi.encode(uint256(uint160(trader))));
+        uint256 start = block.number;
+        SignedOrder memory signed = _expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 65, start, 0);
+        uint256 snap = vm.snapshotState();
+        vm.roll(start + offset);
+        bool filled;
+        try filler.fill(signed, m.key) {
+            filled = true;
+        } catch (bytes memory err) {
+            assertEq(bytes4(err), MercuriOrderFiller.InvalidOrder.selector, "dead order must fail as InvalidOrder");
+        }
+        assertEq(filled, offset <= EXPIRY_BLOCKS, "fills iff inside the window");
+        assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0) != 0, filled);
+        assertTrue(vm.revertToState(snap));
+        assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0, "snapshot restored");
+    }
+
+    function test_raisedOutputAboveMarketReverts() public {
+        Market memory m = _market(false, true);
+        uint256 gross = _quote(m, false, 1000000e18, abi.encode(uint256(uint160(trader))));
+        uint256 before = IERC20(USDC).balanceOf(trader);
+        SignedOrder memory signed =
+            _expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 63, block.number, gross + 1);
+        // The router refuses a swap that yields one unit less than the raised output.
+        vm.expectRevert(abi.encodeWithSignature("V4TooLittleReceived(uint256,uint256)", gross + 1, gross));
+        filler.fill(signed, m.key);
+        assertEq(IERC20(USDC).balanceOf(trader), before);
+        assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
+        // The same order at the market quote itself still fills.
+        filler.fill(_expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 66, block.number, gross), m.key);
+        assertEq(IERC20(USDC).balanceOf(trader) - before, gross);
+    }
+
+    function test_cosignerCannotLowerOutput() public {
+        Market memory m = _market(false, true);
+        SignedOrder memory signed = _expiringOrder(address(m.token), USDC, 1000000e18, 1000e6, 64, block.number, 999e6);
+        vm.expectRevert(V3DutchOrderReactor.InvalidCosignerOutput.selector);
+        filler.fill(signed, m.key);
+    }
+
+    function test_feeControllerExpiringRaisedOutputStillFills() public {
+        address feeTo = makeAddr("uniswap fee");
+        reactor.setProtocolFeeController(address(new MockFeeController(feeTo, 5, false)));
+        Market memory m = _market(false, true);
+        uint256 gross = _quote(m, false, 1000000e18, abi.encode(uint256(uint160(trader))));
+        uint256 raised = gross * 9_900 / 10_000;
+        uint256 before = IERC20(USDC).balanceOf(trader);
+        filler.fill(_expiringOrder(address(m.token), USDC, 1000000e18, raised / 2, 67, block.number, raised), m.key);
+        assertGe(IERC20(USDC).balanceOf(trader) - before, raised);
+        assertEq(IERC20(USDC).balanceOf(feeTo), raised * 5 / 10_000);
+        assertEq(IERC20(USDC).balanceOf(address(filler)), 0);
+        assertEq(IERC20(address(m.token)).balanceOf(address(filler)), 0);
+        assertEq(IERC20(USDC).allowance(address(filler), address(reactor)), 0);
+    }
+
+    function test_orderWithConditionDataStillFills() public {
+        // The reactor ignores additionalValidationData while the contract is zero; the keeper owns the trigger.
+        Market memory m = _market(false, true);
+        uint256 gross = _quote(m, false, 1000000e18, abi.encode(uint256(uint160(trader))));
+        SignedOrder memory signed = _expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 68, block.number, 0);
+        V3DutchOrder memory order = abi.decode(signed.order, (V3DutchOrder));
+        order.info.additionalValidationData = abi.encode(uint8(1), uint256(2e18));
+        signed = _resign(order, address(m.token), 1000000e18, 68);
+        filler.fill(signed, m.key);
+    }
+
+    function test_expiryBoundarySweep() public {
+        Market memory m = _market(false, true);
+        uint256 gross = _quote(m, false, 1000000e18, abi.encode(uint256(uint160(trader))));
+        uint256 start = block.number;
+        SignedOrder memory signed = _expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 69, start, 0);
+        uint256 snap = vm.snapshotState();
+        for (uint256 offset; offset <= 40; ++offset) {
+            vm.roll(start + offset);
+            if (offset <= EXPIRY_BLOCKS) {
+                filler.fill(signed, m.key);
+            } else {
+                vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+                filler.fill(signed, m.key);
+            }
+            assertTrue(vm.revertToState(snap));
+            snap = vm.snapshotState();
+        }
     }
 
     function test_constructorRejectsZeroAddress() public {

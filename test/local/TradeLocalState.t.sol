@@ -16,11 +16,10 @@ import {IValidationCallback} from "../../lib/uniswapx/src/interfaces/IValidation
 import {ERC20 as XERC20} from "../../lib/uniswapx/lib/solmate/src/tokens/ERC20.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 
-/// Offline state export for the Go/Anvil late-cosigning test. Never broadcast.
-/// Four trader-signed, uncosigned limit orders (buy and sell on a Launch pool
-/// and on a listed, hookless pool) carry the single-point expiry curve and the signed
-/// condition, exactly as the web app submits them. The backend keeper cosigns
-/// them at fill time with Anvil's second development key.
+/// @dev Offline state export for the Go/Anvil late-cosigning test. Never broadcast. Four trader-signed, uncosigned
+///      limit orders (buy and sell on a Launch pool and on a listed, hookless pool) carry the single-point expiry curve
+///      and the signed condition, exactly as the web app submits them. The backend keeper cosigns them at fill time
+///      with Anvil's second development key.
 contract TradeLocalStateTest is UniswapXFillerHarness {
     using V3DutchOrderLib for V3DutchOrder;
 

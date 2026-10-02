@@ -709,8 +709,8 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
     }
 }
 
-/// Reruns every `UniswapXFillerTest` case against a filler with no execution fee. With a zero fee the D14 quote
-/// math reduces to the pre-fee math, so each case proves that a zero fee behaves exactly as before.
+/// @dev Reruns every `UniswapXFillerTest` case against a filler with no execution fee. With a zero fee the D14 quote
+///      math reduces to the pre-fee math, so each case proves that a zero fee behaves exactly as before.
 contract UniswapXFillerZeroFeeTest is UniswapXFillerTest {
     function _executionFee() internal pure override returns (uint256) {
         return 0;
@@ -722,7 +722,7 @@ contract UniswapXFillerZeroFeeTest is UniswapXFillerTest {
     }
 }
 
-/// Execution fee (spec D13/D14): paid once per successful fill, in USDC, to the fixed `feeRecipient`.
+/// @dev Execution fee (spec D13/D14): paid once per successful fill, in USDC, to the fixed `feeRecipient`.
 contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
     using V3DutchOrderLib for V3DutchOrder;
 

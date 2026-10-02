@@ -2,7 +2,7 @@
 pragma solidity ^0.8.26;
 import {V3DutchOrder, V3DutchOrderLib} from "../../lib/uniswapx/src/lib/V3DutchOrderLib.sol";
 
-/// ABI and cross-language digest oracle for local backend tests only.
+/// @dev ABI and cross-language digest oracle for local backend tests only.
 contract TradeOrderCodec {
     using V3DutchOrderLib for V3DutchOrder;
 

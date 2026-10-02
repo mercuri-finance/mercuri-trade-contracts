@@ -11,8 +11,8 @@ import {IV4Quoter} from "@uniswap/v4-periphery/src/interfaces/IV4Quoter.sol";
 import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import {NativeUsdcShim} from "../utils/NativeUsdcShim.sol";
 
-/// Fork dependencies stay untouched except the documented Arc USDC precompile
-/// shim. The reactor, filler, test tokens, positions and Launch system are local.
+/// @dev Fork dependencies stay untouched except the documented Arc USDC precompile shim. The reactor, filler, test
+///      tokens, positions and Launch system are local.
 contract TradeForkInvariantsTest is TradeInvariantsTest {
     uint256 private forkChain;
 

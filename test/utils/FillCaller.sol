@@ -11,10 +11,10 @@ interface IRouterExecute {
     function execute(bytes calldata commands, bytes[] calldata inputs, uint256 deadline) external payable;
 }
 
-/// @notice Test-only contract that submits fills to MercuriOrderFiller. Armed with a second order, any call into
-/// it during a fill (receive, fallback or `reenter`, e.g. from a token transfer hook) tries every re-entry it can:
-/// a nested `fill`, a direct `reactorCallback`, a reactor execution, a router sweep and a USDC pull from the
-/// filler. Each attempt's outcome is recorded; none may succeed.
+/// @notice Test-only contract that submits fills to MercuriOrderFiller. Armed with a second order, any call into it
+///         during a fill (receive, fallback or `reenter`, e.g. from a token transfer hook) tries every re-entry it can:
+///         a nested `fill`, a direct `reactorCallback`, a reactor execution, a router sweep and a USDC pull from the
+///         filler. Each attempt's outcome is recorded; none may succeed.
 contract FillCaller {
     MercuriOrderFiller public immutable filler;
     IReactor public immutable reactor;

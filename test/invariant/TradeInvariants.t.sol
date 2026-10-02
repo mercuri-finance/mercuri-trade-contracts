@@ -52,7 +52,7 @@ contract TradeSequenceHandler {
     }
 }
 
-/// Sequence properties for the new Trade filler, separate from Launch invariants.
+/// @dev Sequence properties for the new Trade filler, separate from Launch invariants.
 contract TradeInvariantsTest is UniswapXFillerHarness {
     Market[4] internal markets;
     TradeSequenceHandler internal handler;

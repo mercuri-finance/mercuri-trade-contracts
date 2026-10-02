@@ -10,9 +10,9 @@ import {IV4Quoter} from "@uniswap/v4-periphery/src/interfaces/IV4Quoter.sol";
 import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import {NativeUsdcShim} from "../utils/NativeUsdcShim.sol";
 
-/// Read-only RPC fork; launches, liquidity and swaps exist only in Foundry memory.
-/// Arc's native ERC-20 precompile is modelled by the same rollback-safe shim as
-/// the isolated suite. Router, PoolManager, quoter and Permit2 retain fork code.
+/// @dev Read-only RPC fork; launches, liquidity and swaps exist only in Foundry memory. Arc's native ERC-20 precompile
+///      is modelled by the same rollback-safe shim as the isolated suite. Router, PoolManager, quoter and Permit2
+///      retain fork code.
 contract UniversalRouterForkTest is UniversalRouterSwapTest {
     function setUp() public override {
         string memory rpc = vm.envOr("ARC_LOCAL_FORK_RPC", string(""));

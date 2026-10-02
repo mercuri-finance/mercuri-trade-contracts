@@ -20,7 +20,7 @@ import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {ExclusivityLib} from "../../lib/uniswapx/src/lib/ExclusivityLib.sol";
 import {CallbackFiller} from "../utils/CallbackFiller.sol";
 
-/// Local-only deployment: no reactor is assumed to exist on Arc testnet.
+/// @dev Local-only deployment: no reactor is assumed to exist on Arc testnet.
 contract UniswapXLocalTest is LaunchFixture {
     using V3DutchOrderLib for V3DutchOrder;
     V3DutchOrderReactor internal reactor;

@@ -273,3 +273,14 @@ Rehearsal caveat: the same stress run against the anvil instance that had just r
 
 - Owner names `reactorFeeOwner`; replace the sentinel in the manifest in the same reviewed change.
 - Real deployment needs `deployments/5042002.json` written from the verified output (`reactor`, `reactorFeeOwner`, `filler`, `router`, `permit2`, `usdc`, `launchHook`, `appRecipient`, `block`, `blockHash`, `fillerRuntimeKeccak`, `reactorRuntimeKeccak`, `sourceRevision`, `compiler`), then `verify-trade-filler.py` at that block.
+
+## 14. Addendum: exclusive cosigned orders and the single-point curve (spec D18)
+
+This supersedes the curve and vector rows of section 8. The filler source is unchanged (`src/MercuriOrderFiller.sol` sha256 `459538fa…af24f1`); exclusivity is enforced by the upstream reactor (`V3DutchOrderReactor._resolve` → `ExclusivityLib.handleExclusiveOverrideBlock`).
+
+| Requirement | Candidate | Tests | Result |
+| --- | --- | --- | --- |
+| Curve | Trader-signed output curve is one point: relative block `1`, amount `-2^128`. The keeper cosigns at head `H` with `decayStartBlock = H + 20`, `exclusiveFiller = MercuriOrderFiller`, `exclusivityOverrideBps = 0`. Through `H + 20` the output is its (cosigned) start amount; at `H + 21` it is start + 2^128, above `uint128`, and our filler reverts `InvalidOrder` with the nonce unused | `test_exclusiveWindowFillsThroughFiller` (+1..+20), `test_expiringOrderFillsInsideWindow`, `test_expiringOrderDeadAfterWindow`, `test_expiryBoundarySweep` (0..40) | Pass |
+| Exclusivity | Any other filler is refused `NoExclusiveOverride` through `H + 20` (strict, override 0); from `H + 21` exclusivity ends but the output is unpayable, so no one can fill | `test_thirdPartyFillerBlockedInsideWindow` (control: the same order cosigned without an exclusive filler fills through the outside filler), `test_thirdPartyFillerCannotFillAfterWindow`, `testFuzz_exclusiveExpiryBoundary` (offset 0..40: fills iff offset <= 20, and only through our filler) | Pass; fuzz 10,001 runs under stress |
+| Invariant | `expiring` handler: inside the window an outside filler must revert `NoExclusiveOverride` (input and nonce unchanged), then ours fills; outside it ours must revert `InvalidOrder`. Campaign counters for both refusals must grow | `TradeInvariants.t.sol`, `TradeForkInvariants.t.sol` | Pass, about 52k `expiring` calls per stress campaign, 0 reverts |
+| Cross-language vector | `order_expiring.json` regenerated: uncosigned order with the new curve; `cosignedOrder` at `decayStartBlock` 1020 with `exclusiveFiller` = the exported `filler`; the export fills it through that filler at block 1020 after another caller is refused, and proves it dead at 1021. SHA-256 `25fbc6bc74d97ca6bb4ec137b9fc1ea5c464d20ade41c885ef24c2a35d1d1f79` | `test_exportExpiringOrderVector`, `check-contracts.sh` SHA gate with both copies set | Pass |

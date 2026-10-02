@@ -1,13 +1,33 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 import {UniswapXFillerHarness} from "../integration/UniswapXFiller.t.sol";
-import {AdversarialTradeToken} from "../utils/AdversarialTradeToken.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
-import {SignedOrder} from "../../lib/uniswapx/src/base/ReactorStructs.sol";
+import {SignedOrder, OrderInfo} from "../../lib/uniswapx/src/base/ReactorStructs.sol";
+import {
+    V3DutchOrder,
+    V3DutchOrderLib,
+    V3DutchInput,
+    V3DutchOutput,
+    NonlinearDutchDecay,
+    CosignerData
+} from "../../lib/uniswapx/src/lib/V3DutchOrderLib.sol";
+import {IReactor} from "../../lib/uniswapx/src/interfaces/IReactor.sol";
+import {IValidationCallback} from "../../lib/uniswapx/src/interfaces/IValidationCallback.sol";
+import {ERC20 as XERC20} from "../../lib/uniswapx/lib/solmate/src/tokens/ERC20.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 
-/// Offline state export for the Go/Anvil end-to-end order test. Never broadcast.
+/// Offline state export for the Go/Anvil late-cosigning test. Never broadcast.
+/// Four trader-signed, uncosigned limit orders (buy and sell on a Launch pool
+/// and on a listed, hookless pool) carry the expiry curve and the signed
+/// condition, exactly as the web app submits them. The backend keeper cosigns
+/// them at fill time with Anvil's second development key.
 contract TradeLocalStateTest is UniswapXFillerHarness {
+    using V3DutchOrderLib for V3DutchOrder;
+
+    /// Anvil development account 1; the Go test signs with its public dev key.
+    address internal constant LOCAL_COSIGNER = 0x70997970C51812dc3A010C7d01b50e0d17dc79C8;
+    string internal constant KEY = "anvil";
+
     function setUp() public override {
         if (!vm.envOr("TRADE_EXPORT_STATE", false)) vm.skip(true);
     }
@@ -17,27 +37,94 @@ contract TradeLocalStateTest is UniswapXFillerHarness {
         // so constructor storage and untouched reactor/router code are included.
         super.setUp();
         vm.warp(1800000000);
-        // Anvil does not implement Arc's native USDC precompile or cheatcodes.
-        // Ordinary ERC-20 USDC is sufficient for this R4 settlement integration;
-        // native/precompile equivalence is covered by the separate fork suite.
+        // Markets are built while USDC is the native shim, as on Arc.
+        Market memory launch = _market(true, true);
+        Market memory listed = _market(false, false);
+        _serializeMarket("launch", launch);
+        _serializeMarket("listed", listed);
+        _exportOrder("launchBuy", launch, true, 1);
+        _exportOrder("launchSell", launch, false, 2);
+        _exportOrder("listedBuy", listed, true, 3);
+        _exportOrder("listedSell", listed, false, 4);
+        // Anvil has neither Arc's native USDC precompile nor cheatcodes, so the
+        // shim cannot run there. Replace it with a plain ERC-20 holding the same
+        // balances for every account that moves USDC in these fills.
+        address[3] memory holders = [address(poolManager), trader, appRecipient];
+        uint256[3] memory balances;
+        for (uint256 i; i < holders.length; ++i) {
+            balances[i] = holders[i].balance / 1e12;
+        }
         vm.etch(USDC, address(new MockERC20("USDC", "USDC", 6)).code);
-        MockERC20(USDC).mint(address(this), 100000e6);
-        MockERC20(USDC).mint(trader, 100000e6);
-        (Market memory m, AdversarialTradeToken token) = _adversarialMarket(false);
-        SignedOrder memory signed = _order(address(token), USDC, 100e6, 1, 99);
-        string memory key = "anvil";
-        vm.serializeAddress(key, "reactor", address(reactor));
-        vm.serializeAddress(key, "permit2", address(permit2));
-        vm.serializeAddress(key, "filler", address(filler));
-        vm.serializeAddress(key, "trader", trader);
-        vm.serializeAddress(key, "inputToken", address(token));
-        vm.serializeAddress(key, "usdc", USDC);
-        vm.serializeAddress(key, "currency0", Currency.unwrap(m.key.currency0));
-        vm.serializeAddress(key, "currency1", Currency.unwrap(m.key.currency1));
-        vm.serializeBytes(key, "order", signed.order);
-        string memory output = vm.serializeBytes(key, "signature", signed.sig);
+        for (uint256 i; i < holders.length; ++i) {
+            MockERC20(USDC).mint(holders[i], balances[i]);
+        }
+        vm.prank(trader);
+        MockERC20(USDC).approve(address(permit2), type(uint256).max);
+        // FeeManager checks its native balance backs every hook fee; ERC-20 USDC
+        // moved by the pool no longer touches native balance, so pre-fund it.
+        vm.deal(address(feeManager), address(feeManager).balance + 1_000_000e18);
+        vm.serializeAddress(KEY, "reactor", address(reactor));
+        vm.serializeAddress(KEY, "permit2", address(permit2));
+        vm.serializeAddress(KEY, "filler", address(filler));
+        vm.serializeAddress(KEY, "quoter", address(quoter));
+        vm.serializeAddress(KEY, "poolManager", address(poolManager));
+        vm.serializeAddress(KEY, "launchHook", address(hook));
+        vm.serializeAddress(KEY, "cosigner", LOCAL_COSIGNER);
+        vm.serializeAddress(KEY, "trader", trader);
+        string memory output = vm.serializeAddress(KEY, "usdc", USDC);
         vm.createDir("test-export/trade-orders", true);
         vm.writeJson(output, "test-export/trade-orders/anvil-order.json");
         vm.dumpState("test-export/trade-orders/anvil-state.json");
+    }
+
+    function _serializeMarket(string memory name, Market memory m) internal {
+        vm.serializeAddress(KEY, string.concat(name, "Token"), address(m.token));
+        vm.serializeAddress(KEY, string.concat(name, "Currency0"), Currency.unwrap(m.key.currency0));
+        vm.serializeAddress(KEY, string.concat(name, "Currency1"), Currency.unwrap(m.key.currency1));
+        vm.serializeAddress(KEY, string.concat(name, "Hooks"), address(m.key.hooks));
+        vm.serializeUint(KEY, string.concat(name, "Fee"), m.key.fee);
+        vm.serializeInt(KEY, string.concat(name, "TickSpacing"), m.key.tickSpacing);
+    }
+
+    /// The signed minimum is half of today's net quote, so the keeper's raised
+    /// output (the live net quote less 1%) is visibly above it.
+    function _exportOrder(string memory name, Market memory m, bool buy, uint256 nonce) internal {
+        bool mercuri = address(m.key.hooks) == address(hook);
+        uint128 amount = buy || !mercuri ? 100e6 : 1000000e18;
+        uint128 netInput = !mercuri && buy ? amount - amount * 50 / 10000 : amount;
+        bytes memory data = mercuri ? abi.encode(uint256(uint160(trader))) : bytes("");
+        uint256 gross = _quote(m, buy, netInput, data);
+        uint256 net = !mercuri && !buy ? gross - gross * 50 / 10000 : gross;
+        address input = buy ? USDC : address(m.token);
+        address output = buy ? address(m.token) : USDC;
+        SignedOrder memory signed = _uncosigned(input, output, amount, net / 2, nonce);
+        vm.serializeBytes(KEY, string.concat(name, "Order"), signed.order);
+        vm.serializeBytes(KEY, string.concat(name, "Signature"), signed.sig);
+    }
+
+    function _uncosigned(address input, address output, uint256 amount, uint256 minimum, uint256 nonce)
+        internal
+        view
+        returns (SignedOrder memory)
+    {
+        NonlinearDutchDecay memory flat = NonlinearDutchDecay(0, new int256[](0));
+        V3DutchOutput[] memory outputs = new V3DutchOutput[](1);
+        outputs[0] = V3DutchOutput(output, minimum, _expiryCurve(), trader, minimum, 0);
+        V3DutchOrder memory order;
+        order.info = OrderInfo(
+            IReactor(address(reactor)),
+            trader,
+            nonce,
+            block.timestamp + 1 days,
+            IValidationCallback(address(0)),
+            abi.encode(uint8(0), uint256(0)) // the signed condition: a limit order
+        );
+        order.cosigner = LOCAL_COSIGNER;
+        order.startingBaseFee = 0;
+        order.baseInput = V3DutchInput(XERC20(input), amount, flat, amount, 0);
+        order.baseOutputs = outputs;
+        order.cosignerData = CosignerData(0, address(0), 0, 0, new uint256[](1));
+        bytes32 h = order.hash();
+        return SignedOrder(abi.encode(order), _traderSig(input, amount, nonce, order.info.deadline, h));
     }
 }

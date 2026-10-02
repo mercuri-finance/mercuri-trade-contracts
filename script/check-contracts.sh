@@ -14,6 +14,12 @@ bash script/build-trade-router.sh
 forge fmt --check
 forge build
 python3 script/check-natspec.py
+# Runtime identity: the verifier must accept the rebuilt filler runtime and reject one flipped immutable byte.
+python3 script/verify-trade-filler.py --self-test
+if python3 script/verify-trade-filler.py --self-test-flipped >/dev/null; then
+  echo 'verify-trade-filler.py accepted a runtime with a flipped immutable byte' >&2
+  exit 1
+fi
 forge test --fuzz-seed 0x5042
 # The expiring-order vector is consumed by the backend and the web app. All three copies must be identical.
 if [[ -n ${TRADE_VECTOR_BACKEND:-} && -n ${TRADE_VECTOR_WEBUI:-} ]]; then

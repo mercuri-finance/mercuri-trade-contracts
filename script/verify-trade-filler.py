@@ -208,7 +208,8 @@ def required_fee_recipient(manifest, deployment):
     recipient = manifest.get('feeRecipient', '')
     if recipient == RECIPIENT_SENTINEL:
         raise SystemExit('manifest feeRecipient is still the sentinel; the owner choice has not been recorded')
-    if not (isinstance(recipient, str) and len(recipient) == 42 and recipient.startswith('0x')):
+    if not (isinstance(recipient, str) and len(recipient) == 42 and recipient.startswith('0x')
+            and all(c in '0123456789abcdefABCDEF' for c in recipient[2:])):
         raise SystemExit(f'manifest feeRecipient is not an address: {recipient!r}')
     if int(recipient, 16) == 0:
         raise SystemExit('manifest feeRecipient is the zero address')
@@ -249,7 +250,20 @@ def immutable_set_self_test():
     )
 
 
-def self_test(flip):
+def recipient_input_self_test():
+    """A non-hex recipient of the right length must be a clean refusal, not a traceback."""
+    ok = True
+    for bad in ('0x' + 'zz' * 20, '0x' + '1' * 39 + 'g', '0x' + '-1' + '0' * 38):
+        try:
+            required_fee_recipient({'feeRecipient': bad}, {'feeRecipient': bad})
+            print(f'feeRecipient {bad!r}: NOT refused')
+            ok = False
+        except SystemExit as error:
+            print(f'feeRecipient {bad!r}: refused ({error})')
+    return ok
+
+
+def self_test(flip, name='usdc'):
     manifest = load('deployments/manifest-5042002.json')
     filler = load('out/MercuriOrderFiller.sol/MercuriOrderFiller.json')
     fake_reactor = '0x00000000000000000000000000000000000000aa'
@@ -257,10 +271,10 @@ def self_test(flip):
     live, ranges = expected_runtime(filler, values, 'filler')
     live = bytearray(live)
     if flip:
-        # Flip one byte inside the usdc immutable, as a wrong constructor argument would.
-        start = next(s for s, e, n in ranges if n == 'usdc')
+        # Flip one byte inside the named immutable, as a wrong constructor argument would.
+        start = next(s for s, e, n in ranges if n == name)
         live[start + 31] ^= 0x01
-    ok = verify('filler self-test' + (' (one immutable byte flipped)' if flip else ''), 'filler', filler, values, bytes(live))
+    ok = verify('filler self-test' + (f' (one {name} byte flipped)' if flip else ''), 'filler', filler, values, bytes(live))
     return ok
 
 
@@ -322,23 +336,32 @@ def main():
     parser.add_argument('--manifest', default='deployments/manifest-5042002.json')
     parser.add_argument('--self-test', action='store_true', help='offline: unmodified bytes must match, a flipped immutable byte must not')
     parser.add_argument('--self-test-flipped', action='store_true', help='offline: verify with one immutable byte flipped; exits non-zero')
+    parser.add_argument('--self-test-flipped-fee', action='store_true', help='offline: verify with one executionFee byte flipped; exits non-zero')
+    parser.add_argument('--self-test-flipped-recipient', action='store_true', help='offline: verify with one feeRecipient byte flipped; exits non-zero')
     parser.add_argument('--self-test-reactor-flipped', action='store_true', help='offline: verify the reactor with one function-pointer byte flipped; exits non-zero')
     args = parser.parse_args()
 
     if args.self_test_flipped:
         sys.exit(0 if self_test(True) else 1)
+    if args.self_test_flipped_fee:
+        sys.exit(0 if self_test(True, 'executionFee') else 1)
+    if args.self_test_flipped_recipient:
+        sys.exit(0 if self_test(True, 'feeRecipient') else 1)
     if args.self_test_reactor_flipped:
         sys.exit(0 if reactor_self_test(True) else 1)
     if args.self_test:
         good = self_test(False)
-        bad = self_test(True)
+        bad = self_test(True) or self_test(True, 'executionFee') or self_test(True, 'feeRecipient')
+        if not recipient_input_self_test():
+            print('self-test FAILED: a non-hex feeRecipient was not refused cleanly')
+            sys.exit(1)
         sets = immutable_set_self_test()
         reactor_good = reactor_self_test(False)
         reactor_bad = reactor_self_test(True)
         if not good or bad or not sets or not reactor_good or reactor_bad:
             print('self-test FAILED: verifier did not behave as required')
             sys.exit(1)
-        print('self-test ok: unmodified runtimes match; a flipped filler immutable byte and a flipped reactor function-pointer byte are rejected')
+        print('self-test ok: unmodified runtimes match; a flipped filler usdc, executionFee or feeRecipient byte and a flipped reactor function-pointer byte are rejected')
         return
     if args.block is None or not args.deployment:
         parser.error('--block and --deployment are required')

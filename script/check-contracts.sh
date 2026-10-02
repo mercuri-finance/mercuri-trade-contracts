@@ -22,6 +22,14 @@ if flipped=$(python3 script/verify-trade-filler.py --self-test-flipped 2>&1); th
   exit 1
 fi
 grep -q 'MISMATCH at offsets' <<<"$flipped" || { echo "flipped-byte self-test failed without a mismatch report: $flipped" >&2; exit 1; }
+# The execution fee and its recipient are immutables too: a flipped byte in either must be reported against its own name.
+for pair in 'fee:executionFee' 'recipient:feeRecipient'; do
+  if flipped=$(python3 script/verify-trade-filler.py --self-test-flipped-${pair%%:*} 2>&1); then
+    echo "verify-trade-filler.py accepted a runtime with a flipped ${pair##*:} byte" >&2
+    exit 1
+  fi
+  grep -q "MISMATCH at offsets.*inside immutables: ${pair##*:}" <<<"$flipped" || { echo "flipped ${pair##*:} self-test failed without its mismatch report: $flipped" >&2; exit 1; }
+done
 # The reactor's via-IR function-pointer immutable comes from a constructor simulation; a flipped pointer byte must fail.
 if flipped=$(python3 script/verify-trade-filler.py --self-test-reactor-flipped 2>&1); then
   echo 'verify-trade-filler.py accepted a reactor runtime with a flipped function-pointer byte' >&2

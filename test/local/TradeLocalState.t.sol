@@ -18,7 +18,7 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 
 /// Offline state export for the Go/Anvil late-cosigning test. Never broadcast.
 /// Four trader-signed, uncosigned limit orders (buy and sell on a Launch pool
-/// and on a listed, hookless pool) carry the expiry curve and the signed
+/// and on a listed, hookless pool) carry the single-point expiry curve and the signed
 /// condition, exactly as the web app submits them. The backend keeper cosigns
 /// them at fill time with Anvil's second development key.
 contract TradeLocalStateTest is UniswapXFillerHarness {

@@ -29,6 +29,8 @@ import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol";
 import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {ResolvedOrder} from "../../lib/uniswapx/src/base/ReactorStructs.sol";
+import {ExclusivityLib} from "../../lib/uniswapx/src/lib/ExclusivityLib.sol";
+import {CallbackFiller} from "../utils/CallbackFiller.sol";
 
 abstract contract UniswapXFillerHarness is UniversalRouterHarness {
     using V3DutchOrderLib for V3DutchOrder;
@@ -100,11 +102,12 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
 
     uint256 internal constant EXPIRY_BLOCKS = 20;
 
+    /// The trader-signed output curve: one point, relative block 1 -> -2^128. Until the cosigned decay start
+    /// (head + 20) the output stays at its start amount; one block later it exceeds uint128 and cannot fill.
     function _expiryCurve() internal pure returns (NonlinearDutchDecay memory c) {
-        int256[] memory amounts = new int256[](2);
-        amounts[0] = 0;
-        amounts[1] = -int256(uint256(1) << 128);
-        c = NonlinearDutchDecay(EXPIRY_BLOCKS | ((EXPIRY_BLOCKS + 1) << 16), amounts);
+        int256[] memory amounts = new int256[](1);
+        amounts[0] = -int256(uint256(1) << 128);
+        c = NonlinearDutchDecay(1, amounts);
     }
 
     /// Re-cosigns and re-signs `order` after a test edits it, so the edit is the only change.
@@ -125,8 +128,23 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
         uint256 amount,
         uint256 minimum,
         uint256 nonce,
-        uint256 decayStart,
+        uint256 head,
         uint256 raised
+    ) internal view returns (SignedOrder memory signed) {
+        signed = _expiringOrderFor(input, output, amount, minimum, nonce, head, raised, address(filler));
+    }
+
+    /// Cosigned as the keeper does at block `head`: decay starts at head + 20 and, when `exclusive` is set,
+    /// only that filler may fill until then (strict: override 0).
+    function _expiringOrderFor(
+        address input,
+        address output,
+        uint256 amount,
+        uint256 minimum,
+        uint256 nonce,
+        uint256 head,
+        uint256 raised,
+        address exclusive
     ) internal view returns (SignedOrder memory signed) {
         NonlinearDutchDecay memory flat = NonlinearDutchDecay(0, new int256[](0));
         V3DutchOutput[] memory outputs = new V3DutchOutput[](1);
@@ -141,7 +159,7 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
         order.baseOutputs = outputs;
         uint256[] memory overrides = new uint256[](1);
         overrides[0] = raised;
-        order.cosignerData = CosignerData(decayStart, address(0), 0, 0, overrides);
+        order.cosignerData = CosignerData(head + EXPIRY_BLOCKS, exclusive, 0, 0, overrides);
         signed = _resign(order, input, amount, nonce);
     }
 
@@ -461,14 +479,90 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
     }
 
-    function testFuzz_expiryBoundary(uint8 offset) public {
+    /// A funded outside filler that would fill any order the reactor allows it to.
+    function _outsider() internal returns (CallbackFiller outsider) {
+        outsider = new CallbackFiller(IReactor(address(reactor)));
+        assertTrue(IERC20(USDC).transfer(address(outsider), 50_000e6));
+    }
+
+    function test_exclusiveWindowFillsThroughFiller() public {
+        Market memory m = _market(false, true);
+        uint256 gross = _quote(m, false, 1000000e18, abi.encode(uint256(uint160(trader))));
+        uint256 start = block.number;
+        SignedOrder memory signed = _expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 70, start, 0);
+        uint256 snap = vm.snapshotState();
+        for (uint256 offset = 1; offset <= EXPIRY_BLOCKS; ++offset) {
+            vm.roll(start + offset);
+            uint256 before = IERC20(USDC).balanceOf(trader);
+            filler.fill(signed, m.key);
+            assertGe(IERC20(USDC).balanceOf(trader) - before, gross / 2, "signed minimum");
+            assertTrue(vm.revertToState(snap));
+            snap = vm.snapshotState();
+        }
+    }
+
+    function test_thirdPartyFillerBlockedInsideWindow() public {
+        Market memory m = _market(false, true);
+        uint256 gross = _quote(m, false, 1000000e18, abi.encode(uint256(uint160(trader))));
+        uint256 start = block.number;
+        CallbackFiller outsider = _outsider();
+        // Control: the same order cosigned without an exclusive filler fills through the outsider.
+        SignedOrder memory open =
+            _expiringOrderFor(address(m.token), USDC, 1000000e18, gross / 2, 71, start, 0, address(0));
+        uint256 snap = vm.snapshotState();
+        vm.roll(start + 1);
+        uint256 before = IERC20(USDC).balanceOf(trader);
+        outsider.fill(open);
+        assertEq(IERC20(USDC).balanceOf(trader) - before, gross / 2, "outsider fills an open order");
+        assertTrue(vm.revertToState(snap));
+        SignedOrder memory signed = _expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 72, start, 0);
+        snap = vm.snapshotState();
+        // Each step restores the snapshot: under via-IR `start` re-reads block.number after a roll.
+        for (uint256 offset = 1; offset <= EXPIRY_BLOCKS; ++offset) {
+            vm.roll(start + offset);
+            vm.expectRevert(ExclusivityLib.NoExclusiveOverride.selector);
+            outsider.fill(signed);
+            assertEq(IERC20(USDC).balanceOf(trader), before, "outsider moved output");
+            assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0, "outsider used nonce");
+            if (offset == EXPIRY_BLOCKS) filler.fill(signed, m.key); // still open for our filler at the last block
+            assertTrue(vm.revertToState(snap));
+            snap = vm.snapshotState();
+        }
+    }
+
+    function test_thirdPartyFillerCannotFillAfterWindow() public {
+        Market memory m = _market(false, true);
+        uint256 gross = _quote(m, false, 1000000e18, abi.encode(uint256(uint160(trader))));
+        uint256 start = block.number;
+        CallbackFiller outsider = _outsider();
+        SignedOrder memory signed = _expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 73, start, 0);
+        vm.roll(start + EXPIRY_BLOCKS + 1);
+        uint256 beforeToken = IERC20(address(m.token)).balanceOf(trader);
+        uint256 beforeOutsider = IERC20(USDC).balanceOf(address(outsider));
+        vm.expectRevert(); // exclusivity has ended, but the output is now start + 2^128
+        outsider.fill(signed);
+        assertEq(IERC20(address(m.token)).balanceOf(trader), beforeToken);
+        assertEq(IERC20(USDC).balanceOf(address(outsider)), beforeOutsider);
+        assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
+    }
+
+    function testFuzz_exclusiveExpiryBoundary(uint8 offset) public {
         offset = uint8(bound(offset, 0, 40));
         Market memory m = _market(false, true);
         uint256 gross = _quote(m, false, 1000000e18, abi.encode(uint256(uint160(trader))));
         uint256 start = block.number;
+        CallbackFiller outsider = _outsider();
         SignedOrder memory signed = _expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 65, start, 0);
         uint256 snap = vm.snapshotState();
         vm.roll(start + offset);
+        try outsider.fill(signed) {
+            fail("outsider filled an exclusive order");
+        } catch (bytes memory err) {
+            if (offset <= EXPIRY_BLOCKS) {
+                assertEq(bytes4(err), ExclusivityLib.NoExclusiveOverride.selector, "window refusal");
+            }
+        }
+        assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0, "outsider used nonce");
         bool filled;
         try filler.fill(signed, m.key) {
             filled = true;

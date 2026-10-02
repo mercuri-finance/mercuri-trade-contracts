@@ -7,6 +7,9 @@ import {IPermit2 as XPermit2} from "../../lib/uniswapx/lib/permit2/src/interface
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MercuriOrderFiller} from "../../src/MercuriOrderFiller.sol";
 import {MockFeeController} from "../utils/MockFeeController.sol";
+import {CallbackFiller} from "../utils/CallbackFiller.sol";
+import {ExclusivityLib} from "../../lib/uniswapx/src/lib/ExclusivityLib.sol";
+import {IReactor} from "../../lib/uniswapx/src/interfaces/IReactor.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol";
@@ -67,6 +70,9 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
     uint256 internal inputFeeRejectionsBase;
     uint256 public expiredRejections;
     uint256 internal expiredRejectionsBase;
+    uint256 public exclusiveRejections;
+    uint256 internal exclusiveRejectionsBase;
+    CallbackFiller internal outsider;
     bool internal outputFeeOn;
     uint256 private beforeProtocolFee; // storage: `exercise` is at the stack limit
     address internal feeTo;
@@ -92,6 +98,7 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
             markets[i + 2] = m;
         }
         handler = new TradeSequenceHandler(ITradeExercise(address(this)));
+        outsider = new CallbackFiller(IReactor(address(reactor)));
         targetContract(address(handler));
         feeTo = makeAddr("uniswap fee");
         outputFee = new MockFeeController(feeTo, 5, false);
@@ -123,6 +130,7 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         feeFillsBase = feeFills;
         inputFeeRejectionsBase = inputFeeRejections;
         expiredRejectionsBase = expiredRejections;
+        exclusiveRejectionsBase = exclusiveRejections;
     }
 
     /// Runs one successful fill with the output-token protocol fee on, then restores the prior fee state.
@@ -140,8 +148,9 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         }
     }
 
-    /// Fills a late-cosigned expiring buy `offset` blocks (even seeds land inside the window, odd ones past it) after its decay start: it must fill through block +20 and
-    /// be refused as `InvalidOrder` from +21, leaving the filler empty and the nonce unused either way.
+    /// Fills a late-cosigned expiring buy `offset` blocks after the cosigning head (even seeds land inside the window, odd
+    /// ones past it). Inside the window an outside filler is refused as `NoExclusiveOverride` and ours fills through +20;
+    /// from +21 ours is refused as `InvalidOrder`. The filler stays empty and a refused order leaves the nonce unused.
     function exerciseExpiring(uint256 offset) external {
         require(msg.sender == address(handler) || msg.sender == address(this), "handler only");
         offset = offset % 2 == 0 ? offset / 2 % (EXPIRY_BLOCKS + 1) : EXPIRY_BLOCKS + 1 + offset / 2 % 20; // both sides of +20
@@ -160,6 +169,16 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         uint256 beforeBitmap = XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8);
         steps++;
         if (offset <= EXPIRY_BLOCKS) {
+            try outsider.fill(signed) {
+                fail("outsider filled an exclusive order");
+            } catch (bytes memory err) {
+                assertEq(
+                    bytes4(err), ExclusivityLib.NoExclusiveOverride.selector, "outsider refused for another reason"
+                );
+                exclusiveRejections++;
+            }
+            assertEq(IERC20(USDC).balanceOf(trader), beforeInput, "outsider spent input");
+            assertEq(XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8), beforeBitmap, "outsider used nonce");
             filler.fill(signed, m.key);
             assertEq(beforeInput - IERC20(USDC).balanceOf(trader), amount, "expiring exact input");
             assertGe(IERC20(address(m.token)).balanceOf(trader) - beforeOutput, minimum, "expiring output");
@@ -328,6 +347,7 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         assertGt(feeFills, feeFillsBase, "campaign never ran an output-fee fill");
         assertGt(inputFeeRejections, inputFeeRejectionsBase, "campaign never saw an input-fee rejection");
         assertGt(expiredRejections, expiredRejectionsBase, "campaign never saw an expired-order rejection");
+        assertGt(exclusiveRejections, exclusiveRejectionsBase, "campaign never saw an exclusivity rejection");
         assertGe(steps, 13);
     }
 }

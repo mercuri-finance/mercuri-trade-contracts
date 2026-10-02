@@ -17,6 +17,8 @@ import {IValidationCallback} from "../../lib/uniswapx/src/interfaces/IValidation
 import {OrderInfo, SignedOrder} from "../../lib/uniswapx/src/base/ReactorStructs.sol";
 import {ERC20 as XERC20} from "../../lib/uniswapx/lib/solmate/src/tokens/ERC20.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
+import {ExclusivityLib} from "../../lib/uniswapx/src/lib/ExclusivityLib.sol";
+import {CallbackFiller} from "../utils/CallbackFiller.sol";
 
 /// Local-only deployment: no reactor is assumed to exist on Arc testnet.
 contract UniswapXLocalTest is LaunchFixture {
@@ -98,17 +100,16 @@ contract UniswapXLocalTest is LaunchFixture {
 
     uint256 internal constant EXPIRING_START_AMOUNT = 50e6;
 
-    /// The order the app submits: expiry curve, take-profit condition data, no cosignature yet.
+    /// The order the app submits: single-point expiry curve, take-profit condition data, no cosignature yet.
     function _uncosignedExpiring(uint256 nonce, uint256 deadline) internal view returns (V3DutchOrder memory order) {
         NonlinearDutchDecay memory flat = NonlinearDutchDecay(0, new int256[](0));
-        int256[] memory amounts = new int256[](2);
-        amounts[0] = 0;
-        amounts[1] = -int256(uint256(1) << 128);
+        int256[] memory amounts = new int256[](1);
+        amounts[0] = -int256(uint256(1) << 128);
         V3DutchOutput[] memory outputs = new V3DutchOutput[](1);
         outputs[0] = V3DutchOutput(
             address(outputToken),
             EXPIRING_START_AMOUNT,
-            NonlinearDutchDecay(uint256(20) | (uint256(21) << 16), amounts),
+            NonlinearDutchDecay(1, amounts), // one point: relative block 1 -> -2^128
             swapper,
             EXPIRING_START_AMOUNT,
             0
@@ -161,16 +162,28 @@ contract UniswapXLocalTest is LaunchFixture {
         bytes32 uncosignedDigest = order.cosignerDigest(orderHash);
         bytes memory uncosigned = abi.encode(order);
 
-        order.cosignerData = CosignerData(1000, address(0), 0, 0, new uint256[](1));
+        // Cosigned as the keeper does at head 1000: decay starts at 1020 and only our filler may fill until then.
+        CallbackFiller exportFiller = new CallbackFiller(IReactor(address(reactor)));
+        order.cosignerData = CosignerData(1020, address(exportFiller), 0, 0, new uint256[](1));
         order.cosignerData.outputAmounts[0] = EXPIRING_START_AMOUNT + 1;
         bytes32 cosignedDigest = order.cosignerDigest(orderHash);
         (uint8 cv, bytes32 cr, bytes32 cs) = vm.sign(COSIGNER_KEY, cosignedDigest);
         order.cosignature = abi.encodePacked(cr, cs, cv);
         assertEq(order.hash(), orderHash, "cosigner data is outside the signed hash");
 
-        // The vector must be a real order: the cosigned copy fills at its decay start.
-        vm.roll(1000);
-        reactor.execute(SignedOrder(abi.encode(order), signature));
+        // The vector must be a real order: at the last valid block (1020) another filler is refused and the
+        // cosigned copy fills through the named filler.
+        SignedOrder memory cosigned = SignedOrder(abi.encode(order), signature);
+        vm.roll(1020);
+        vm.expectRevert(ExclusivityLib.NoExclusiveOverride.selector);
+        reactor.execute(cosigned);
+        outputToken.mint(address(exportFiller), EXPIRING_START_AMOUNT + 1);
+        uint256 snap = vm.snapshotState();
+        vm.roll(1021); // one block later the output is start + 2^128: dead for every filler
+        vm.expectRevert();
+        exportFiller.fill(cosigned);
+        assertTrue(vm.revertToState(snap));
+        exportFiller.fill(cosigned);
         assertEq(outputToken.balanceOf(swapper), EXPIRING_START_AMOUNT + 1);
 
         string memory key = "expiring";
@@ -181,6 +194,7 @@ contract UniswapXLocalTest is LaunchFixture {
         vm.serializeAddress(key, "permit2", address(permit2));
         vm.serializeAddress(key, "trader", swapper);
         vm.serializeAddress(key, "cosigner", order.cosigner);
+        vm.serializeAddress(key, "filler", address(exportFiller));
         vm.serializeUint(key, "chainId", block.chainid);
         vm.serializeBytes32(key, "hash", orderHash);
         vm.serializeBytes32(key, "cosignerDigest", uncosignedDigest);

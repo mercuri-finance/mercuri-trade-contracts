@@ -19,17 +19,17 @@ interface IOrderSwapRouter {
 }
 
 /// @notice Settles one signed UniswapX order through one Arc v4 USDC pool. The signed trader receives every output
-///         above what the reactor takes (its protocol fee) and, on a sell, above the execution fee. A fixed USDC
-///         execution fee is paid to `feeRecipient` (the keeper) on each successful fill, from the USDC side: a buy's
-///         input before the swap, a sell's output after it. The signed minimum is still enforced, so the fee only comes
-///         out of value above it. Tokens sent to this contract outside a fill never subsidize another order or the fee.
-/// @dev Immutable: no owner, pause, upgrade or rescue path. Orders are bound to their reactor and cosigner, not to
-///      this contract, so a replacement filler can settle orders that are already signed; the keeper switches by
-///      configuration. Only the configured keeper (`feeRecipient`) can call `fill`. The keeper cosigns each order
+///         above what the reactor takes (its protocol fee) and, on a sell, above the execution fee: a fixed USDC fee
+///         paid to `feeRecipient` (the keeper) on each successful fill, only out of value above the signed minimum.
+/// @dev Immutable: no owner, pause, upgrade or rescue path. `executionFee` documents which side of a buy or sell pays
+///      the fee. Tokens sent to this contract outside a fill never subsidize another order or the fee. Orders are bound
+///      to their reactor and cosigner, not to this contract, so a replacement filler can settle orders that are
+///      already signed. Only the configured keeper (`feeRecipient`) can call `fill`. The keeper cosigns each order
 ///      exclusive to this filler, and the caller of `fill` chooses the pool, so an open `fill` would let a copier
 ///      route a keeper-cosigned order through a pool of its choice (for example around Launch's hook fee) or race
 ///      the keeper for its own transaction. Restricting the caller keeps settlement and pool choice with the keeper.
-///      Rotating the keeper key therefore means deploying a new filler and switching by configuration.
+///      Replacing the filler, including rotating the keeper key, therefore means deploying a new filler and switching
+///      the keeper to it by configuration.
 contract MercuriOrderFiller is IReactorCallback {
     using SafeERC20 for IERC20;
     using V3DutchOrderLib for V3DutchOrder;
@@ -128,7 +128,7 @@ contract MercuriOrderFiller is IReactorCallback {
     ///      order is touched. The reactor enforces its signature, nonce and deadline; this call reverts atomically,
     ///      paying no fee, if the trader's signed net minimum is unmet.
     /// @param signed User-signed UniswapX V3 Dutch order and signature.
-    /// @param key The one USDC pool used for this fill.
+    /// @param key One USDC pool used for this fill.
     function fill(SignedOrder calldata signed, PoolKey calldata key) external {
         if (msg.sender != feeRecipient) revert NotKeeper();
         if (active) revert InvalidOrder();
@@ -167,7 +167,7 @@ contract MercuriOrderFiller is IReactorCallback {
     /// @dev Only the configured reactor can call this during an active fill. It leaves exactly `executionFee` USDC in
     ///      this contract for `fill` to pay: a buy swaps the input less the app and execution fees; a sell requires
     ///      the swap to yield the reactor's outputs plus the execution fee.
-    /// @param orders The reactor's resolved orders; exactly one is accepted, with output-token fee outputs allowed.
+    /// @param orders Reactor's resolved orders; exactly one is accepted, with output-token fee outputs allowed.
     /// @param callbackData ABI-encoded pool key supplied to `fill`.
     function reactorCallback(ResolvedOrder[] memory orders, bytes memory callbackData) external {
         if (msg.sender != address(reactor) || !active) revert ForbiddenCallback();
@@ -207,12 +207,12 @@ contract MercuriOrderFiller is IReactorCallback {
         IERC20(output).forceApprove(address(reactor), minimum);
     }
 
-    /// @dev The trader's output plus any reactor protocol fee. Fees must be in the output token: the whole input goes
-    ///      to the swap and fees, so an input-token fee cannot be paid and the fill is refused (the order stays open,
-    ///      no funds move).
-    /// @param order The resolved order; `outputs[0]` is the trader's.
-    /// @param output The output token.
-    /// @return owed The total the reactor will take from this contract.
+    /// @dev Returns the trader's output plus any reactor protocol fee. Fees must be in the output token: the whole
+    ///      input goes to the swap and fees, so an input-token fee cannot be paid and the fill is refused (the order
+    ///      stays open, no funds move).
+    /// @param order Resolved order; `outputs[0]` is the trader's.
+    /// @param output Output token.
+    /// @return owed Total the reactor will take from this contract.
     function _owed(ResolvedOrder memory order, address output) private pure returns (uint256 owed) {
         uint256 n = order.outputs.length;
         if (n == 0) revert InvalidOrder();
@@ -225,13 +225,13 @@ contract MercuriOrderFiller is IReactorCallback {
     /// @dev Builds the Universal Router call for one exact-input swap on `key`. Launch pools swap with the swap minimum
     ///      and pay Launch's hook fee; other pools pay the app fee from the USDC side (before a buy, as a portion of a
     ///      sell's output) and sweep the rest here.
-    /// @param key The pool to swap on.
-    /// @param input The token this contract spends.
-    /// @param output The token this contract receives.
+    /// @param key Pool to swap on.
+    /// @param input Token this contract spends.
+    /// @param output Token this contract receives.
     /// @param swapAmount Input swapped, after the app and execution fees on a buy.
-    /// @param appFee The app fee paid from a buy's USDC input; zero otherwise.
+    /// @param appFee App fee paid from a buy's USDC input; zero otherwise.
     /// @param required Least output this contract must receive: the reactor's outputs, plus the fee on a sell.
-    /// @param swapper The trader, credited by Launch's hook for referrals.
+    /// @param swapper Trader, credited by Launch's hook for referrals.
     /// @return commands Universal Router commands.
     /// @return inputs Universal Router inputs, one per command.
     function _recipe(

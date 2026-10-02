@@ -8,6 +8,7 @@ differing offsets and exits non-zero on any mismatch. No keys, no signing, no wr
   python3 script/verify-trade-filler.py --rpc URL --block N --deployment FILE   # FILE has reactor, filler,
                                                                                 # reactorFeeOwner
   python3 script/verify-trade-filler.py --self-test                             # offline, no network
+  python3 script/verify-trade-filler.py --self-test-reactor-flipped             # offline; must report MISMATCH
 """
 import argparse
 import json
@@ -228,6 +229,56 @@ def self_test(flip):
     return ok
 
 
+# A known via-IR function id for the reactor's _getBlockNumberish pointer. Offline there is no constructor to
+# simulate, so the self-test stands in for eth_call's returned runtime with this id written into the slots.
+KNOWN_POINTER_ID = 0x2A
+
+
+def simulated_reactor_runtime(artifact, permit2_word, pointer_id):
+    """The runtime a constructor simulation would return: permit2 filled in, each pointer slot set to the id."""
+    code = bytearray.fromhex(artifact['deployedBytecode']['object'].removeprefix('0x'))
+    names = immutable_names(artifact)
+    for key, refs in artifact['deployedBytecode']['immutableReferences'].items():
+        for ref in refs:
+            start, length = ref['start'], ref['length']
+            word = permit2_word if names[key] == 'permit2' else pointer_id.to_bytes(32, 'big')
+            code[start:start + length] = word
+    return bytes(code)
+
+
+def reactor_self_test(flip):
+    """Exercise the function-pointer path for every built reactor profile.
+
+    Unmodified, the live code equals the simulation and must MATCH. With flip, one byte of the pointer slot in the
+    live code differs from the simulation (a different compiler profile or a tampered runtime) and must MISMATCH.
+    A simulated pointer that is not a small id must be refused before any comparison.
+    """
+    manifest = load('deployments/manifest-5042002.json')
+    word = address_word(manifest['permit2'])
+    artifacts = reactor_artifacts()
+    if not artifacts:
+        raise SystemExit('no V3DutchOrderReactor artifacts in out/; run forge build')
+    ok = True
+    for path in artifacts:
+        artifact = json.loads(path.read_text())
+        simulated = simulated_reactor_runtime(artifact, word, KNOWN_POINTER_ID)
+        live = bytearray(simulated)
+        if flip:
+            _, ranges = expected_runtime(artifact, {'permit2': word}, 'reactor', simulated)
+            start = next(s for s, e, n in ranges if n == POINTER)
+            live[start + 31] ^= 0x01
+        label = f'reactor self-test ({path.name})' + (' (pointer byte flipped)' if flip else '')
+        ok &= verify(label, 'reactor', artifact, {'permit2': word}, bytes(live), simulated)
+        if not flip:
+            try:
+                expected_runtime(artifact, {'permit2': word}, 'reactor', simulated_reactor_runtime(artifact, word, 0x1FF))
+                print(f'{path.name}: a pointer id above 0xff was NOT rejected')
+                ok = False
+            except SystemExit as error:
+                print(f'{path.name}: large pointer id rejected ({error})')
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--rpc', default=DEFAULT_RPC)
@@ -236,18 +287,23 @@ def main():
     parser.add_argument('--manifest', default='deployments/manifest-5042002.json')
     parser.add_argument('--self-test', action='store_true', help='offline: unmodified bytes must match, a flipped immutable byte must not')
     parser.add_argument('--self-test-flipped', action='store_true', help='offline: verify with one immutable byte flipped; exits non-zero')
+    parser.add_argument('--self-test-reactor-flipped', action='store_true', help='offline: verify the reactor with one function-pointer byte flipped; exits non-zero')
     args = parser.parse_args()
 
     if args.self_test_flipped:
         sys.exit(0 if self_test(True) else 1)
+    if args.self_test_reactor_flipped:
+        sys.exit(0 if reactor_self_test(True) else 1)
     if args.self_test:
         good = self_test(False)
         bad = self_test(True)
         sets = immutable_set_self_test()
-        if not good or bad or not sets:
+        reactor_good = reactor_self_test(False)
+        reactor_bad = reactor_self_test(True)
+        if not good or bad or not sets or not reactor_good or reactor_bad:
             print('self-test FAILED: verifier did not behave as required')
             sys.exit(1)
-        print('self-test ok: unmodified runtime matches, flipped immutable byte is rejected')
+        print('self-test ok: unmodified runtimes match; a flipped filler immutable byte and a flipped reactor function-pointer byte are rejected')
         return
     if args.block is None or not args.deployment:
         parser.error('--block and --deployment are required')

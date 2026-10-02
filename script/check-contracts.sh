@@ -22,6 +22,12 @@ if flipped=$(python3 script/verify-trade-filler.py --self-test-flipped 2>&1); th
   exit 1
 fi
 grep -q 'MISMATCH at offsets' <<<"$flipped" || { echo "flipped-byte self-test failed without a mismatch report: $flipped" >&2; exit 1; }
+# The reactor's via-IR function-pointer immutable comes from a constructor simulation; a flipped pointer byte must fail.
+if flipped=$(python3 script/verify-trade-filler.py --self-test-reactor-flipped 2>&1); then
+  echo 'verify-trade-filler.py accepted a reactor runtime with a flipped function-pointer byte' >&2
+  exit 1
+fi
+grep -q 'MISMATCH at offsets.*inside immutables: _getBlockNumberish' <<<"$flipped" || { echo "reactor pointer self-test failed without a pointer mismatch report: $flipped" >&2; exit 1; }
 forge test --fuzz-seed 0x5042
 # The expiring-order vector is consumed by the backend and the web app. All three copies must be identical.
 if [[ -n ${TRADE_VECTOR_BACKEND:-} && -n ${TRADE_VECTOR_WEBUI:-} ]]; then

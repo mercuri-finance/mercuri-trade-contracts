@@ -27,6 +27,12 @@ interface IOrderSwapRouter {
 /// the USDC side: a buy's input before the swap, a sell's output after it. The signed
 /// minimum is enforced as before, so the fee only comes out of value above it. Tokens
 /// sent to this contract outside a fill never subsidize another order or the fee.
+/// Only the configured keeper (`feeRecipient`) can call `fill`. The keeper cosigns each
+/// order exclusive to this filler, and the caller of `fill` chooses the pool, so an open
+/// `fill` would let a copier route a keeper-cosigned order through a pool of its choice
+/// (for example around Launch's hook fee) or race the keeper for its own transaction.
+/// Restricting the caller keeps settlement and pool choice with the keeper. Rotating the
+/// keeper key therefore means deploying a new filler and switching by configuration.
 contract MercuriOrderFiller is IReactorCallback {
     using SafeERC20 for IERC20;
     using V3DutchOrderLib for V3DutchOrder;
@@ -51,7 +57,7 @@ contract MercuriOrderFiller is IReactorCallback {
     /// reduces the trader's signed minimum, and zero disables the transfer.
     uint256 public immutable executionFee;
     /// @notice Recipient of the execution fee: the keeper's transaction address, fixed for this filler's life.
-    /// @dev Never `msg.sender`, so copying a keeper transaction earns the copier nothing.
+    /// @dev Also the only address allowed to call `fill`.
     address public immutable feeRecipient;
     bool private active;
     uint256 private inputBaseline;
@@ -70,6 +76,8 @@ contract MercuriOrderFiller is IReactorCallback {
     error NetMinimumNotMet();
     /// @notice The constructor's execution fee is above `MAX_EXECUTION_FEE`.
     error ExecutionFeeTooHigh();
+    /// @notice `fill` was called by an address other than the configured keeper (`feeRecipient`).
+    error NotKeeper();
 
     /// @notice Sets the immutable settlement dependencies, fee recipients and execution fee.
     /// @param r Reactor that authenticates the signed order.
@@ -108,12 +116,14 @@ contract MercuriOrderFiller is IReactorCallback {
     /// @notice Fills one signed order: the trader receives every output above what the reactor
     /// takes; a fixed USDC execution fee is taken from the order's USDC side (the input on a
     /// buy, the output on a sell) and paid to `feeRecipient`.
-    /// @dev Anyone may submit a signed order; the caller earns nothing. The reactor enforces
-    /// its signature, nonce and deadline; this call reverts atomically, paying no fee, if the
-    /// trader's signed net minimum is unmet.
+    /// @dev Only the configured keeper (`feeRecipient`) may call this; any other caller reverts
+    /// `NotKeeper` before the order is touched. The reactor enforces its signature, nonce and
+    /// deadline; this call reverts atomically, paying no fee, if the trader's signed net minimum
+    /// is unmet.
     /// @param signed User-signed UniswapX V3 Dutch order and signature.
     /// @param key The one USDC pool used for this fill.
     function fill(SignedOrder calldata signed, PoolKey calldata key) external {
+        if (msg.sender != feeRecipient) revert NotKeeper();
         if (active) revert InvalidOrder();
         V3DutchOrder memory order = abi.decode(signed.order, (V3DutchOrder));
         if (order.baseOutputs.length != 1 || order.baseOutputs[0].recipient != order.info.swapper) {

@@ -6,6 +6,7 @@ import {SignedOrder} from "../../lib/uniswapx/src/base/ReactorStructs.sol";
 import {IPermit2 as XPermit2} from "../../lib/uniswapx/lib/permit2/src/interfaces/IPermit2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MercuriOrderFiller} from "../../src/MercuriOrderFiller.sol";
+import {V3DutchOrder} from "../../lib/uniswapx/src/lib/V3DutchOrderLib.sol";
 import {MockFeeController} from "../utils/MockFeeController.sol";
 import {CallbackFiller} from "../utils/CallbackFiller.sol";
 import {ExclusivityLib} from "../../lib/uniswapx/src/lib/ExclusivityLib.sol";
@@ -78,10 +79,11 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
     address internal feeTo;
     MockFeeController internal outputFee;
     MockFeeController internal inputFee;
-    /// Fills are submitted by these callers, none of whom is the trader, a fee recipient, the filler or the router.
+    /// Non-keeper callers, none of whom is the trader, a fee recipient, the filler or the router. Before every fill
+    /// one of them tries first and must be refused `NotKeeper` (spec D20); the keeper (`feeRecipient`) then fills.
     address[3] internal callers;
-    uint256[3] public callerFills;
-    uint256[3] internal callerFillsBase;
+    uint256[3] public notKeeperRejections;
+    uint256[3] internal notKeeperRejectionsBase;
     /// Ghost: the fee recipient's USDC gained across fills, measured per fill. Must equal fills x executionFee.
     uint256 public executionFeesPaid;
     uint256 internal executionFeesPaidBase;
@@ -152,20 +154,35 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         expiredRejectionsBase = expiredRejections;
         exclusiveRejectionsBase = exclusiveRejections;
         executionFeesPaidBase = executionFeesPaid;
-        callerFillsBase = callerFills;
+        notKeeperRejectionsBase = notKeeperRejections;
     }
 
-    /// Submits `signed` from one of the fixed callers (chosen by `salt`). A successful fill pays the fee recipient
-    /// exactly `executionFee`; a reverted one pays nothing; the caller's USDC never changes.
+    /// One of the fixed non-keeper callers (chosen by `salt`) submits `signed` first and must be refused `NotKeeper`
+    /// with nothing moved and the nonce unused; the keeper then submits it. A successful keeper fill pays the fee
+    /// recipient exactly `executionFee`; a reverted one pays nothing.
     function _tryFill(SignedOrder memory signed, PoolKey memory key, uint256 salt)
         internal
         returns (bool ok, bytes memory err)
     {
         uint256 i = uint256(keccak256(abi.encode(salt))) % 3;
         address caller = callers[i];
+        V3DutchOrder memory order = abi.decode(signed.order, (V3DutchOrder));
+        uint256 bitmapBefore = XPermit2(address(permit2)).nonceBitmap(trader, order.info.nonce >> 8);
         uint256 keeperBefore = IERC20(USDC).balanceOf(feeRecipient);
         uint256 callerBefore = IERC20(USDC).balanceOf(caller);
+        uint256 traderBefore = IERC20(USDC).balanceOf(trader);
         vm.prank(caller);
+        try filler.fill(signed, key) {
+            fail("a non-keeper filled");
+        } catch (bytes memory reason) {
+            assertEq(bytes4(reason), MercuriOrderFiller.NotKeeper.selector, "non-keeper refused for another reason");
+        }
+        assertEq(XPermit2(address(permit2)).nonceBitmap(trader, order.info.nonce >> 8), bitmapBefore, "nonce used");
+        assertEq(IERC20(USDC).balanceOf(feeRecipient), keeperBefore, "non-keeper attempt paid a fee");
+        assertEq(IERC20(USDC).balanceOf(caller), callerBefore, "non-keeper moved its USDC");
+        assertEq(IERC20(USDC).balanceOf(trader), traderBefore, "non-keeper moved trader USDC");
+        notKeeperRejections[i]++;
+        vm.prank(feeRecipient);
         try filler.fill(signed, key) {
             ok = true;
         } catch (bytes memory reason) {
@@ -173,11 +190,8 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         }
         uint256 paid = IERC20(USDC).balanceOf(feeRecipient) - keeperBefore;
         assertEq(paid, ok ? filler.executionFee() : 0, "execution fee once per fill, never on a revert");
-        assertEq(IERC20(USDC).balanceOf(caller), callerBefore, "the caller earns nothing");
-        if (ok) {
-            executionFeesPaid += paid;
-            callerFills[i]++;
-        }
+        assertEq(IERC20(USDC).balanceOf(caller), callerBefore, "a non-keeper earns nothing");
+        if (ok) executionFeesPaid += paid;
     }
 
     /// `_tryFill` for a fill that must succeed; bubbles the revert reason otherwise.
@@ -401,7 +415,7 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         assertGt(executionFeesPaid, executionFeesPaidBase, "campaign never paid an execution fee");
         assertEq(executionFeesPaid, successfulFills * filler.executionFee(), "ghost: fills x fee");
         for (uint256 i; i < 3; ++i) {
-            assertGt(callerFills[i], callerFillsBase[i], "campaign never filled through every caller");
+            assertGt(notKeeperRejections[i], notKeeperRejectionsBase[i], "campaign never refused every non-keeper");
         }
         assertGe(steps, 13);
     }

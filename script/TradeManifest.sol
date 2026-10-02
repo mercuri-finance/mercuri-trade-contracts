@@ -60,7 +60,7 @@ abstract contract TradeManifest is Script {
     }
 
     /// @dev `feeRecipient` (the keeper's transaction address, spec D13) is an owner choice made at the filler
-    /// deployment (D3) and ships as a sentinel string. The rehearsal guard is the same as for the reactor fee owner,
+    /// deployment (D3) and ships as a sentinel string. It is also the filler's only permitted `fill` caller (D20). The rehearsal guard is the same as for the reactor fee owner,
     /// with FEE_RECIPIENT_OVERRIDE as the override.
     function _feeRecipient(string memory manifest) internal returns (address) {
         bool rehearsal = vm.envOr("TRADE_LOCAL_REHEARSAL", false);

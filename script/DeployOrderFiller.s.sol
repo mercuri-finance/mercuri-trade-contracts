@@ -11,7 +11,8 @@ import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol"
 /// @notice Deploys the immutable MercuriOrderFiller against the reactor named in TRADE_REACTOR.
 /// Contains no key: pass --account or --ledger. The reactor fee owner must still parse as an address
 /// because the reactor deployment is part of the same release, and the execution fee recipient (the keeper's
-/// transaction address) must be chosen in the manifest. Also needs TRADE_REACTOR_CODEHASH.
+/// transaction address) must be chosen in the manifest. That address is also the only one allowed to call `fill`
+/// (spec D20), so it must be the keeper that will submit fills. Also needs TRADE_REACTOR_CODEHASH.
 contract DeployOrderFiller is TradeManifest {
     error ReactorMismatch(string what);
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 manifest = json.loads((root / 'source-manifest.json').read_text())
-if manifest.get('algorithm') != 'sha256' or set(manifest.get('sources', {})) != {'src/LocalOrderFiller.sol'}:
+if manifest.get('algorithm') != 'sha256' or set(manifest.get('sources', {})) != {'src/MercuriOrderFiller.sol'}:
     raise SystemExit('unexpected Trade production source manifest')
 for name, want in manifest['sources'].items():
     got = hashlib.sha256((root / name).read_bytes()).hexdigest()

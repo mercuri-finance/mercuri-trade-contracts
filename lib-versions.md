@@ -37,7 +37,7 @@ The two unscoped `openzeppelin-contracts/utils/math/` and
 `openzeppelin-contracts/security/` aliases support Solar lint's handling of
 context remappings; deployed Mercurifi imports use their existing prefixes.
 
-The reactor and `src/LocalOrderFiller.sol` are local test deployments.
+The reactor and `src/MercuriOrderFiller.sol` are local test deployments.
 They are absent from tracked deployment records and the release manifest.
 The filler builds typed single-pool R1–R4 swaps, enforces net output and full
 input consumption, and sends surplus to the signed trader. It is a local

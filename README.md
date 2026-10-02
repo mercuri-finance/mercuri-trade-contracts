@@ -20,7 +20,7 @@ What this repository holds:
 
 | Path | What it is | Status |
 | --- | --- | --- |
-| `src/LocalOrderFiller.sol` | The filler the keeper uses against the UniswapX reactor: builds a single-pool swap, enforces net output and full input consumption, hands all surplus to the signed trader | Local integration candidate. Not deployed, not reviewed, no release manifest entry |
+| `src/MercuriOrderFiller.sol` | The filler the keeper uses against the UniswapX reactor: builds a single-pool swap, enforces net output and full input consumption, hands all surplus to the signed trader | Local integration candidate. Not deployed, not reviewed, no release manifest entry |
 | `lib/uniswapx` | The 34-file compiler closure of Uniswap/UniswapX `eb7ce07` for `V3DutchOrderReactor` | Unchanged upstream sources, checksummed in `source-manifest.json` |
 | `lib/universal-router` | The 110-file closure of Uniswap/universal-router `999d561`, the revision behind Arc's router `0x4fcA…9Fb1` | Unchanged upstream sources, checksummed; builds separately with `script/build-trade-router.sh` |
 | `lib/mercuri-launch-contracts` | Launch's deployed sources and its pinned Uniswap v4, Permit2, OpenZeppelin and forge-std trees | Git submodule, pinned |
@@ -52,7 +52,7 @@ every pin and where each source came from.
 
 - Graduated tokens: Launch's hook fee, split by Launch's FeeManager, on every
   pool swap whichever app sent it.
-- Listed Arc assets: an app fee of at most 1% of the USDC side, paid to the
+- Listed Arc assets: a fixed 50 bps app fee on the USDC side, paid to the
   treasury inside the router plan; the API refuses to trade a listed pool while
   no recipient is configured.
 - Orders: the filler carries the same app recipient, so a fill pays the same

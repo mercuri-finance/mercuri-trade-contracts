@@ -4,7 +4,7 @@ pragma solidity ^0.8.26;
 import {IReactor} from "../lib/uniswapx/src/interfaces/IReactor.sol";
 import {IReactorCallback} from "../lib/uniswapx/src/interfaces/IReactorCallback.sol";
 import {SignedOrder, ResolvedOrder} from "../lib/uniswapx/src/base/ReactorStructs.sol";
-import {V3DutchOrder} from "../lib/uniswapx/src/lib/V3DutchOrderLib.sol";
+import {V3DutchOrder, V3DutchOrderLib} from "../lib/uniswapx/src/lib/V3DutchOrderLib.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
@@ -18,13 +18,14 @@ interface IOrderSwapRouter {
 }
 
 /// @notice Settles one signed UniswapX order through one Arc v4 USDC pool.
-/// @dev Local integration candidate only; there is no deployment or release record.
-/// The reactor verifies signatures and nonces. This immutable contract has no owner,
-/// pause or upgrade path; a replacement requires a new deployment and new orders.
+/// @dev Immutable: no owner, pause, upgrade or rescue path. Orders are bound to
+/// their reactor and cosigner, not to this contract, so a replacement filler can
+/// settle orders that are already signed; the keeper switches by configuration.
 /// The signed trader receives every output above the resolved minimum. Tokens sent
-/// to this contract outside a fill are not spent to subsidize another order.
-contract LocalOrderFiller is IReactorCallback {
+/// to this contract outside a fill are never spent to subsidize another order.
+contract MercuriOrderFiller is IReactorCallback {
     using SafeERC20 for IERC20;
+    using V3DutchOrderLib for V3DutchOrder;
     /// @notice Reactor that authenticates orders and invokes the callback.
     IReactor public immutable reactor;
     /// @notice Universal Router used for the v4 swap and app fee payment.
@@ -41,6 +42,12 @@ contract LocalOrderFiller is IReactorCallback {
     uint256 public constant APP_FEE_BPS = 50;
     bool private active;
     uint256 private inputBaseline;
+    /// @notice One order settled through this filler.
+    /// @param orderHash The trader-signed order hash, as the reactor's `Fill` event carries it.
+    /// @param swapper The trader who signed the order.
+    /// @param poolId `keccak256(abi.encode(key))` of the pool used.
+    event OrderFilled(bytes32 indexed orderHash, address indexed swapper, bytes32 indexed poolId);
+    error ZeroAddress();
     error InvalidOrder();
     error ForbiddenCallback();
     error NetMinimumNotMet();
@@ -53,10 +60,10 @@ contract LocalOrderFiller is IReactorCallback {
     /// @param hook Deployed Launch hook; its pools use the Launch fee path.
     /// @param recipient App fee recipient for other USDC pools.
     constructor(IReactor r, IOrderSwapRouter u, IAllowanceTransfer p, address usd, address hook, address recipient) {
-        require(
-            address(r) != address(0) && address(u) != address(0) && address(p) != address(0) && usd != address(0)
-                && recipient != address(0) && hook != address(0)
-        );
+        if (
+            address(r) == address(0) || address(u) == address(0) || address(p) == address(0) || usd == address(0)
+                || recipient == address(0) || hook == address(0)
+        ) revert ZeroAddress();
         reactor = r;
         router = u;
         permit2 = p;
@@ -93,6 +100,7 @@ contract LocalOrderFiller is IReactorCallback {
         if (output.balanceOf(order.info.swapper) < beforeBalance + order.baseOutputs[0].minAmount) {
             revert NetMinimumNotMet();
         }
+        emit OrderFilled(order.hash(), order.info.swapper, keccak256(abi.encode(key)));
         active = false;
         inputBaseline = 0;
     }

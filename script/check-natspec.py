@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CONTRACTS = ("LocalOrderFiller",)
+CONTRACTS = ("MercuriOrderFiller",)
 INHERITED = {
     "UPGRADE_INTERFACE_VERSION", "acceptOwnership", "owner", "pendingOwner",
     "proxiableUUID", "transferOwnership", "upgradeToAndCall", "paused",

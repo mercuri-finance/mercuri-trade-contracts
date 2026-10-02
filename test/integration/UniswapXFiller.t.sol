@@ -2,7 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {UniversalRouterHarness} from "./UniversalRouterSwap.t.sol";
-import {LocalOrderFiller, IOrderSwapRouter} from "../../src/LocalOrderFiller.sol";
+import {MercuriOrderFiller, IOrderSwapRouter} from "../../src/MercuriOrderFiller.sol";
 import {V3DutchOrderReactor} from "../../lib/uniswapx/src/reactors/V3DutchOrderReactor.sol";
 import {IPermit2 as XPermit2} from "../../lib/uniswapx/lib/permit2/src/interfaces/IPermit2.sol";
 import {
@@ -32,7 +32,7 @@ import {ResolvedOrder} from "../../lib/uniswapx/src/base/ReactorStructs.sol";
 abstract contract UniswapXFillerHarness is UniversalRouterHarness {
     using V3DutchOrderLib for V3DutchOrder;
     V3DutchOrderReactor internal reactor;
-    LocalOrderFiller internal filler;
+    MercuriOrderFiller internal filler;
     uint256 internal constant TRADER_KEY = 123456789;
     uint256 internal constant COSIGNER_KEY = 987654321;
 
@@ -45,7 +45,7 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
         trader = vm.addr(TRADER_KEY);
         super.setUp();
         reactor = new V3DutchOrderReactor(XPermit2(address(permit2)), address(this));
-        filler = new LocalOrderFiller(
+        filler = new MercuriOrderFiller(
             IReactor(address(reactor)), IOrderSwapRouter(address(router)), permit2, USDC, address(hook), appRecipient
         );
     }
@@ -141,6 +141,8 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
 }
 
 contract UniswapXFillerTest is UniswapXFillerHarness {
+    using V3DutchOrderLib for V3DutchOrder;
+
     function test_exportOrderFillReceipts() public {
         vm.createDir("test-export/trade-router", true);
         for (uint256 side; side < 2; ++side) {
@@ -171,14 +173,14 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
             vm.serializeAddress(key, "trader", trader);
             vm.serializeAddress(key, "currency0", Currency.unwrap(m.key.currency0));
             vm.serializeAddress(key, "currency1", Currency.unwrap(m.key.currency1));
-            vm.serializeBytes(key, "input", abi.encodeCall(LocalOrderFiller.fill, (signed, m.key)));
+            vm.serializeBytes(key, "input", abi.encodeCall(MercuriOrderFiller.fill, (signed, m.key)));
             string memory result = vm.serializeString(key, "logs", raw);
             vm.writeJson(result, string.concat("test-export/trade-router/", key, ".json"));
         }
     }
 
     function test_orderRejectsForeignCallbackAndWrongPool() public {
-        vm.expectRevert(LocalOrderFiller.ForbiddenCallback.selector);
+        vm.expectRevert(MercuriOrderFiller.ForbiddenCallback.selector);
         filler.reactorCallback(new ResolvedOrder[](0), "");
         Market memory m = _market(true, false);
         SignedOrder memory signed = _order(USDC, address(m.token), 100e6, 1, 3);
@@ -197,7 +199,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         filler.fill(sell, m.key);
         assertEq(token.balanceOf(trader), beforeBalance);
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
-        token.configure(0, address(filler), abi.encodeCall(LocalOrderFiller.fill, (sell, m.key)));
+        token.configure(0, address(filler), abi.encodeCall(MercuriOrderFiller.fill, (sell, m.key)));
         filler.fill(sell, m.key);
         assertTrue(token.attempted());
         assertFalse(token.callbackSucceeded());
@@ -221,7 +223,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         (Market memory m, AdversarialTradeToken token) = _adversarialMarket(true);
         SignedOrder memory sell = _order(address(token), USDC, 100e6, 1, 7);
         uint256 beforeBalance = token.balanceOf(trader);
-        vm.expectRevert(LocalOrderFiller.InvalidOrder.selector);
+        vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
         filler.fill(sell, m.key);
         assertEq(token.balanceOf(trader), beforeBalance);
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
@@ -281,7 +283,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         token.configure(1000, address(0), "");
         uint256 beforeBalance = token.balanceOf(trader);
         SignedOrder memory signed = _order(address(token), USDC, 100e6, 1, 31);
-        vm.expectRevert(LocalOrderFiller.InvalidOrder.selector);
+        vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
         filler.fill(signed, m.key);
         assertEq(token.balanceOf(address(filler)), 100e6);
         assertEq(token.balanceOf(trader), beforeBalance);
@@ -290,7 +292,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
 
     function test_orderRejectsZeroHookConfiguration() public {
         vm.expectRevert();
-        new LocalOrderFiller(
+        new MercuriOrderFiller(
             IReactor(address(reactor)), IOrderSwapRouter(address(router)), permit2, USDC, address(0), appRecipient
         );
     }
@@ -316,5 +318,24 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         assertEq(trader.balance, beforeBalance);
         assertEq(appRecipient.balance, 0);
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
+    }
+
+    function test_fillEmitsOrderFilled() public {
+        Market memory m = _market(true, false); // listed (non-Launch) pool; first arg is token ordering, not side
+        uint128 amount = 100e6;
+        uint128 netInput = amount - amount * 50 / 10000;
+        uint256 gross = _quote(m, true, netInput, "");
+        SignedOrder memory signed = _order(USDC, address(m.token), amount, gross, 41);
+        V3DutchOrder memory order = abi.decode(signed.order, (V3DutchOrder));
+        vm.expectEmit(true, true, true, true, address(filler));
+        emit MercuriOrderFiller.OrderFilled(order.hash(), trader, keccak256(abi.encode(m.key)));
+        filler.fill(signed, m.key);
+    }
+
+    function test_constructorRejectsZeroAddress() public {
+        vm.expectRevert(MercuriOrderFiller.ZeroAddress.selector);
+        new MercuriOrderFiller(
+            IReactor(address(0)), IOrderSwapRouter(address(router)), permit2, USDC, address(hook), appRecipient
+        );
     }
 }

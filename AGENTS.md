@@ -5,7 +5,7 @@ Launch's deployed contracts live in `lib/mercuri-launch-contracts` (a pinned
 submodule of the public repository) and in the canonical public
 `contracts/launch/deployments/` records; never change them here, and never change them for a Trade feature
 without flagging it to the owner as a live-contract change. Trade adds no
-deployed contract yet: `src/LocalOrderFiller.sol` is a local candidate, absent
+deployed contract yet: `src/MercuriOrderFiller.sol` is a local candidate, absent
 from every deployment record.
 
 Before any commit, push, PR or issue, follow the identity gate in

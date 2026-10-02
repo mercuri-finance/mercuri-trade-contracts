@@ -20,7 +20,9 @@ a contract transaction.
 ## What happens to a deployment
 
 A deployment is its own release: review, a deployment record under `deployments/`, evidence, and the owner's go.
-Security reports go through GitHub's private reporting; see [`SECURITY.md`](SECURITY.md).
+Security reports go privately through **Security → Report a vulnerability** on the public
+[mercuri-launch-contracts](https://github.com/mercuri-finance/mercuri-launch-contracts) repository, naming Trade and
+the filler; see [`SECURITY.md`](SECURITY.md).
 
 ## Building
 

@@ -1,8 +1,7 @@
 # mercurifi trade · contracts
 
-The Solidity source of **mercurifi trade**, the DEX on Arc for every USDC pool: the ones mercuri launch graduates into
-and the listed Arc assets. It is a separate product with a separate contract set, as decided on 28 September 2026:
-Launch's deployed contracts stay in
+The Solidity source of **mercurifi trade**, the DEX on Arc for every USDC pool: the ones mercurifi launch graduates into
+and the listed Arc assets. It is a separate product with a separate contract set: Launch's deployed contracts stay in
 [mercuri-launch-contracts](https://github.com/mercuri-finance/mercuri-launch-contracts) and are never changed for
 Trade; anything Trade needs on chain lives here.
 
@@ -27,10 +26,10 @@ to run until they are set.
 
 | Dependency | Address (testnet, chain 5042002) | Mutability |
 | --- | --- | --- |
-| Universal Router | `0x4fcA4a51Ab4F23A7447b3284fBd7D73289A89Fb1` | immutable, upstream |
-| Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` | immutable, upstream |
-| Launch hook | `0x87e6BaBAc4598F99f4A0717ad294934455Fe60cc` | immutable, mercuri launch |
-| USDC | `0x3600000000000000000000000000000000000000` | Arc's ERC-20 interface to the gas token |
+| Universal Router | [`0x4fcA4a51Ab4F23A7447b3284fBd7D73289A89Fb1`](https://explorer.testnet.arc.io/address/0x4fcA4a51Ab4F23A7447b3284fBd7D73289A89Fb1) | immutable, upstream |
+| Permit2 | [`0x000000000022D473030F116dDEE9F6B43aC78BA3`](https://explorer.testnet.arc.io/address/0x000000000022D473030F116dDEE9F6B43aC78BA3) | immutable, upstream |
+| Launch hook | [`0x87e6BaBAc4598F99f4A0717ad294934455Fe60cc`](https://explorer.testnet.arc.io/address/0x87e6BaBAc4598F99f4A0717ad294934455Fe60cc) | immutable, mercurifi launch |
+| USDC | [`0x3600000000000000000000000000000000000000`](https://explorer.testnet.arc.io/address/0x3600000000000000000000000000000000000000) | upstream, Arc system contract |
 
 ## How it works
 
@@ -91,8 +90,10 @@ event OrderFilled(bytes32 indexed orderHash, address indexed swapper, bytes32 in
 
 ```sh
 git submodule update --init --recursive
-python3 script/check-trade-sources.py   # the two upstream closures are unchanged
-bash script/build-trade-router.sh        # the pinned router, read by the tests from out/trade-router
+# The two upstream closures are unchanged:
+python3 script/check-trade-sources.py
+# The pinned router, read by the tests from out/trade-router:
+bash script/build-trade-router.sh
 forge build
 bash script/check-contracts.sh
 ```

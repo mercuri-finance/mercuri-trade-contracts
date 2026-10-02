@@ -21,8 +21,11 @@ interface IOrderSwapRouter {
 /// @dev Immutable: no owner, pause, upgrade or rescue path. Orders are bound to
 /// their reactor and cosigner, not to this contract, so a replacement filler can
 /// settle orders that are already signed; the keeper switches by configuration.
-/// The signed trader receives every output above the resolved minimum. Tokens sent
-/// to this contract outside a fill are never spent to subsidize another order.
+/// The signed trader receives every output above the resolved minimum. A fixed USDC
+/// execution fee is paid to `feeRecipient` (the keeper) on each successful fill, from
+/// the USDC side: a buy's input before the swap, a sell's output after it. The signed
+/// minimum is enforced as before, so the fee only comes out of value above it. Tokens
+/// sent to this contract outside a fill never subsidize another order or the fee.
 contract MercuriOrderFiller is IReactorCallback {
     using SafeERC20 for IERC20;
     using V3DutchOrderLib for V3DutchOrder;
@@ -40,6 +43,15 @@ contract MercuriOrderFiller is IReactorCallback {
     address public immutable appRecipient;
     /// @notice App fee in basis points of the USDC side, fixed at 50 bps.
     uint256 public constant APP_FEE_BPS = 50;
+    /// @notice Upper bound on `executionFee`: 0.10 USDC (6 decimals).
+    uint256 public constant MAX_EXECUTION_FEE = 100_000;
+    /// @notice USDC (6 decimals) paid to `feeRecipient` once per successful fill, on Launch and listed pools alike.
+    /// @dev A buy takes it from the USDC input before the swap; a sell from the USDC output after it. It never
+    /// reduces the trader's signed minimum, and zero disables the transfer.
+    uint256 public immutable executionFee;
+    /// @notice Recipient of the execution fee: the keeper's transaction address, fixed for this filler's life.
+    /// @dev Never `msg.sender`, so copying a keeper transaction earns the copier nothing.
+    address public immutable feeRecipient;
     bool private active;
     uint256 private inputBaseline;
     /// @notice One order settled through this filler.
@@ -55,30 +67,48 @@ contract MercuriOrderFiller is IReactorCallback {
     error ForbiddenCallback();
     /// @notice The trader's balance rose by less than the order's signed minimum output.
     error NetMinimumNotMet();
+    /// @notice The constructor's execution fee is above `MAX_EXECUTION_FEE`.
+    error ExecutionFeeTooHigh();
 
-    /// @notice Sets the immutable settlement dependencies and fee recipient.
+    /// @notice Sets the immutable settlement dependencies, fee recipients and execution fee.
     /// @param r Reactor that authenticates the signed order.
     /// @param u Universal Router used for the swap.
     /// @param p Permit2 allowance target used by the router.
     /// @param usd USDC token address.
     /// @param hook Deployed Launch hook; its pools use the Launch fee path.
     /// @param recipient App fee recipient for other USDC pools.
-    constructor(IReactor r, IOrderSwapRouter u, IAllowanceTransfer p, address usd, address hook, address recipient) {
+    /// @param fee Execution fee in USDC (6 decimals), at most `MAX_EXECUTION_FEE`; zero disables it.
+    /// @param recipient_ Execution fee recipient (the keeper's transaction address); must be non-zero.
+    constructor(
+        IReactor r,
+        IOrderSwapRouter u,
+        IAllowanceTransfer p,
+        address usd,
+        address hook,
+        address recipient,
+        uint256 fee,
+        address recipient_
+    ) {
         if (
             address(r) == address(0) || address(u) == address(0) || address(p) == address(0) || usd == address(0)
-                || recipient == address(0) || hook == address(0)
+                || recipient == address(0) || hook == address(0) || recipient_ == address(0)
         ) revert ZeroAddress();
+        if (fee > MAX_EXECUTION_FEE) revert ExecutionFeeTooHigh();
         reactor = r;
         router = u;
         permit2 = p;
         usdc = usd;
         launchHook = hook;
         appRecipient = recipient;
+        executionFee = fee;
+        feeRecipient = recipient_;
     }
 
-    /// @notice Fills one signed order and delivers its entire net output to the trader.
-    /// @dev Anyone may submit a signed order. The reactor enforces its signature,
-    /// nonce and deadline; this call reverts atomically if the net minimum is unmet.
+    /// @notice Fills one signed order, delivers its net output less the execution fee to the
+    /// trader, and pays the execution fee in USDC to `feeRecipient`.
+    /// @dev Anyone may submit a signed order; the caller earns nothing. The reactor enforces
+    /// its signature, nonce and deadline; this call reverts atomically, paying no fee, if the
+    /// trader's signed net minimum is unmet.
     /// @param signed User-signed UniswapX V3 Dutch order and signature.
     /// @param key The one USDC pool used for this fill.
     function fill(SignedOrder calldata signed, PoolKey calldata key) external {
@@ -95,8 +125,10 @@ contract MercuriOrderFiller is IReactorCallback {
         uint256 outputBaseline = output.balanceOf(address(this));
         reactor.executeWithCallback(signed, abi.encode(key));
         // Only this fill's surplus belongs to its signer. Unsolicited donations
-        // neither subsidize orders nor prevent the next user's fill.
-        uint256 leftover = output.balanceOf(address(this)) - outputBaseline;
+        // neither subsidize orders nor prevent the next user's fill. On a sell the
+        // callback kept the execution fee in USDC output; on a buy, in USDC input.
+        uint256 leftover =
+            output.balanceOf(address(this)) - outputBaseline - (address(output) == usdc ? executionFee : 0);
         if (leftover > 0) output.safeTransfer(order.info.swapper, leftover);
         input.forceApprove(address(permit2), 0);
         permit2.approve(address(input), address(router), 0, 0);
@@ -104,13 +136,14 @@ contract MercuriOrderFiller is IReactorCallback {
         if (output.balanceOf(order.info.swapper) < beforeBalance + order.baseOutputs[0].minAmount) {
             revert NetMinimumNotMet();
         }
+        if (executionFee > 0) IERC20(usdc).safeTransfer(feeRecipient, executionFee);
         emit OrderFilled(order.hash(), order.info.swapper, keccak256(abi.encode(key)));
         active = false;
         inputBaseline = 0;
     }
 
     /// @dev The trader's output plus any reactor protocol fee. Fees must be in the
-    /// output token: the whole input is spent on the swap, so an input-token fee
+    /// output token: the whole input goes to the swap and fees, so an input-token fee
     /// cannot be paid and the fill is refused (the order stays open, no funds move).
     /// @param order The resolved order; `outputs[0]` is the trader's.
     /// @param output The output token.
@@ -125,7 +158,10 @@ contract MercuriOrderFiller is IReactorCallback {
     }
 
     /// @notice Settles the reactor's resolved order against the supplied pool.
-    /// @dev Only the configured reactor can call this during an active fill.
+    /// @dev Only the configured reactor can call this during an active fill. It leaves
+    /// exactly `executionFee` USDC in this contract for `fill` to pay: a buy swaps the
+    /// input less the app and execution fees; a sell requires the swap to yield the
+    /// reactor's outputs plus the execution fee.
     /// @param orders The reactor's resolved orders; exactly one is accepted, with output-token fee outputs allowed.
     /// @param callbackData ABI-encoded pool key supplied to `fill`.
     function reactorCallback(ResolvedOrder[] memory orders, bytes memory callbackData) external {
@@ -141,37 +177,71 @@ contract MercuriOrderFiller is IReactorCallback {
         if (!((input == Currency.unwrap(key.currency0) && output == Currency.unwrap(key.currency1))
                     || (input == Currency.unwrap(key.currency1) && output == Currency.unwrap(key.currency0)))) revert InvalidOrder();
         if (input != usdc && output != usdc) revert InvalidOrder();
-        uint256 amount = order.input.amount;
-        uint256 minimum = _owed(order, output);
-        if (amount > type(uint128).max || minimum > type(uint128).max) revert InvalidOrder();
-        // A taxed input must not spend pre-existing donated funds to fill the gap.
-        if (IERC20(input).balanceOf(address(this)) != inputBaseline + amount) revert InvalidOrder();
-        IERC20(input).forceApprove(address(permit2), amount);
-        permit2.approve(input, address(router), uint160(amount), uint48(block.timestamp));
         bool app = address(key.hooks) != launchHook;
         bool buy = input == usdc;
-        uint256 fee = app && buy ? amount * APP_FEE_BPS / 10000 : 0;
-        bytes memory hookData = app ? bytes("") : abi.encode(uint256(uint160(order.info.swapper)));
+        uint256 amount = order.input.amount;
+        uint256 minimum = _owed(order, output);
+        // A sell's swap must also yield the execution fee on top of the reactor's outputs.
+        uint256 required = buy ? minimum : minimum + executionFee;
+        if (amount > type(uint128).max || required > type(uint128).max) revert InvalidOrder();
+        uint256 appFee = app && buy ? amount * APP_FEE_BPS / 10000 : 0;
+        // A buy keeps the execution fee from its USDC input, so the input must exceed both fees.
+        uint256 kept = buy ? executionFee : 0;
+        if (buy && amount <= appFee + executionFee) revert InvalidOrder();
+        // A taxed input must not spend pre-existing donated funds to fill the gap.
+        if (IERC20(input).balanceOf(address(this)) != inputBaseline + amount) revert InvalidOrder();
+        IERC20(input).forceApprove(address(permit2), amount - kept);
+        permit2.approve(input, address(router), uint160(amount - kept), uint48(block.timestamp));
+        (bytes memory commands, bytes[] memory inputs) =
+            _recipe(key, input, output, amount - appFee - kept, appFee, required, order.info.swapper);
+        router.execute(commands, inputs, order.info.deadline);
+        // Fixed input orders reject liquidity exhaustion instead of refunding a partial fill.
+        if (IERC20(input).balanceOf(address(this)) != inputBaseline + kept) revert InvalidOrder();
+        IERC20(output).forceApprove(address(reactor), minimum);
+    }
+
+    /// @dev Builds the Universal Router call for one exact-input swap on `key`. Launch pools
+    /// swap with the swap minimum and pay Launch's hook fee; other pools pay the app fee from
+    /// the USDC side (before a buy, as a portion of a sell's output) and sweep the rest here.
+    /// @param key The pool to swap on.
+    /// @param input The token this contract spends.
+    /// @param output The token this contract receives.
+    /// @param swapAmount Input swapped, after the app and execution fees on a buy.
+    /// @param appFee The app fee paid from a buy's USDC input; zero otherwise.
+    /// @param required Least output this contract must receive: the reactor's outputs, plus the fee on a sell.
+    /// @param swapper The trader, credited by Launch's hook for referrals.
+    /// @return commands Universal Router commands.
+    /// @return inputs Universal Router inputs, one per command.
+    function _recipe(
+        PoolKey memory key,
+        address input,
+        address output,
+        uint256 swapAmount,
+        uint256 appFee,
+        uint256 required,
+        address swapper
+    ) private view returns (bytes memory commands, bytes[] memory inputs) {
+        bool app = address(key.hooks) != launchHook;
+        bool buy = input == usdc;
+        bytes memory hookData = app ? bytes("") : abi.encode(uint256(uint160(swapper)));
         bytes[] memory swapParams = new bytes[](3);
         swapParams[0] = abi.encode(
             IV4Router.ExactInputSingleParams(
                 key,
                 input == Currency.unwrap(key.currency0),
-                uint128(amount - fee),
-                uint128(app && !buy ? 0 : minimum),
+                uint128(swapAmount),
+                uint128(app && !buy ? 0 : required),
                 0,
                 hookData
             )
         );
-        swapParams[1] = abi.encode(Currency.wrap(input), amount - fee);
+        swapParams[1] = abi.encode(Currency.wrap(input), swapAmount);
         // Keep sell output in the router until PAY_PORTION and SWEEP have run.
         swapParams[2] = abi.encode(Currency.wrap(output), app && !buy ? address(2) : address(this), uint256(0));
         bytes memory swapInput = abi.encode(
             abi.encodePacked(uint8(Actions.SWAP_EXACT_IN_SINGLE), uint8(Actions.SETTLE_ALL), uint8(Actions.TAKE)),
             swapParams
         );
-        bytes memory commands;
-        bytes[] memory inputs;
         if (!app) {
             commands = hex"10";
             inputs = new bytes[](1);
@@ -179,18 +249,14 @@ contract MercuriOrderFiller is IReactorCallback {
         } else if (buy) {
             commands = hex"0210";
             inputs = new bytes[](2);
-            inputs[0] = abi.encode(usdc, appRecipient, uint160(fee));
+            inputs[0] = abi.encode(usdc, appRecipient, uint160(appFee));
             inputs[1] = swapInput;
         } else {
             commands = hex"100604";
             inputs = new bytes[](3);
             inputs[0] = swapInput;
             inputs[1] = abi.encode(usdc, appRecipient, APP_FEE_BPS);
-            inputs[2] = abi.encode(usdc, address(this), minimum);
+            inputs[2] = abi.encode(usdc, address(this), required);
         }
-        router.execute(commands, inputs, order.info.deadline);
-        // Fixed input orders reject liquidity exhaustion instead of refunding a partial fill.
-        if (IERC20(input).balanceOf(address(this)) != inputBaseline) revert InvalidOrder();
-        IERC20(output).forceApprove(address(reactor), minimum);
     }
 }

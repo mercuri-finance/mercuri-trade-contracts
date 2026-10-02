@@ -30,8 +30,13 @@ abstract contract TradeManifest is Script {
     }
 
     error ReactorFeeOwnerNotChosen();
+    error FeeRecipientNotChosen();
+    error ExecutionFeeTooHigh(uint256 fee);
     error RehearsalNeedsAnvil();
     error RehearsalOwnerNotAnvilAccount(address owner);
+
+    /// @dev Mirrors MercuriOrderFiller.MAX_EXECUTION_FEE so a bad manifest fails before any broadcast.
+    uint256 internal constant MAX_EXECUTION_FEE = 100_000;
 
     /// @dev `reactorFeeOwner` is an owner choice made at deployment time and ships as a sentinel string.
     /// TRADE_LOCAL_REHEARSAL=true swaps in REACTOR_FEE_OWNER_OVERRIDE for a loopback fork rehearsal only. Because
@@ -50,17 +55,56 @@ abstract contract TradeManifest is Script {
         view
         returns (address owner)
     {
+        owner = _resolveChoice(manifest, ".reactorFeeOwner", rehearsal, override_, clientVersion);
+        if (owner == address(0)) revert ReactorFeeOwnerNotChosen();
+    }
+
+    /// @dev `feeRecipient` (the keeper's transaction address, spec D13) is an owner choice made at the filler
+    /// deployment (D3) and ships as a sentinel string. The rehearsal guard is the same as for the reactor fee owner,
+    /// with FEE_RECIPIENT_OVERRIDE as the override.
+    function _feeRecipient(string memory manifest) internal returns (address) {
+        bool rehearsal = vm.envOr("TRADE_LOCAL_REHEARSAL", false);
+        address override_ = rehearsal ? vm.envAddress("FEE_RECIPIENT_OVERRIDE") : address(0);
+        bytes memory client = rehearsal ? vm.rpc("web3_clientVersion", "[]") : bytes("");
+        return _resolveFeeRecipient(manifest, rehearsal, override_, client);
+    }
+
+    /// @dev Pure decision logic, parameterised so tests need no environment variables.
+    function _resolveFeeRecipient(
+        string memory manifest,
+        bool rehearsal,
+        address override_,
+        bytes memory clientVersion
+    ) internal view returns (address recipient) {
+        recipient = _resolveChoice(manifest, ".feeRecipient", rehearsal, override_, clientVersion);
+        if (recipient == address(0)) revert FeeRecipientNotChosen();
+    }
+
+    /// @dev The execution fee (USDC, 6 decimals) is fixed for the filler's life; refuse a value the filler would.
+    function _executionFee(string memory manifest) internal pure returns (uint256 fee) {
+        fee = vm.parseJsonUint(manifest, ".executionFee");
+        if (fee > MAX_EXECUTION_FEE) revert ExecutionFeeTooHigh(fee);
+    }
+
+    /// @dev An address chosen at deployment time: the manifest value, or under the rehearsal guard the override.
+    /// Returns zero when the manifest still holds a sentinel or anything that is not an address.
+    function _resolveChoice(
+        string memory manifest,
+        string memory key,
+        bool rehearsal,
+        address override_,
+        bytes memory clientVersion
+    ) internal view returns (address chosen) {
         if (rehearsal) {
             if (!_contains(clientVersion, bytes("anvil"))) revert RehearsalNeedsAnvil();
             if (!_isAnvilDefaultAccount(override_)) revert RehearsalOwnerNotAnvilAccount(override_);
-            owner = override_;
-            console2.log("WARNING: LOCAL REHEARSAL on anvil. reactorFeeOwner overridden with a public dev account");
-        } else {
-            string memory text = vm.parseJsonString(manifest, ".reactorFeeOwner");
-            if (!_isAddressString(text)) revert ReactorFeeOwnerNotChosen();
-            owner = vm.parseAddress(text);
+            console2.log(
+                string.concat("WARNING: LOCAL REHEARSAL on anvil. ", key, " overridden with a public dev account")
+            );
+            return override_;
         }
-        if (owner == address(0)) revert ReactorFeeOwnerNotChosen();
+        string memory text = vm.parseJsonString(manifest, key);
+        if (_isAddressString(text)) chosen = vm.parseAddress(text);
     }
 
     /// @dev Checked in Solidity because `vm.parseAddress` reverts uncatchably without an external call, and a

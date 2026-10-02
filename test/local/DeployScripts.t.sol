@@ -18,6 +18,18 @@ contract FillerHarness is DeployOrderFiller {
         return _resolveFeeOwner(manifest, rehearsal, override_, client);
     }
 
+    function resolveRecipient(string memory manifest, bool rehearsal, address override_, bytes memory client)
+        external
+        view
+        returns (address)
+    {
+        return _resolveFeeRecipient(manifest, rehearsal, override_, client);
+    }
+
+    function fee(string memory manifest) external pure returns (uint256) {
+        return _executionFee(manifest);
+    }
+
     function requireReactor(address reactor, address permit2, address feeOwner, bytes32 codeHash) external view {
         _requireReactor(reactor, permit2, feeOwner, codeHash);
     }
@@ -38,6 +50,32 @@ contract DeployScriptsTest is Test {
     function test_manifestShipsSentinel() public view {
         string memory manifest = vm.readFile("deployments/manifest-5042002.json");
         assertEq(vm.parseJsonString(manifest, ".reactorFeeOwner"), "REQUIRED_AT_D2_OWNER_GO");
+        assertEq(vm.parseJsonString(manifest, ".feeRecipient"), "REQUIRED_AT_D3_OWNER_GO");
+        assertEq(vm.parseJsonUint(manifest, ".executionFee"), 30_000);
+    }
+
+    function test_feeRecipientSentinelRefused() public {
+        FillerHarness h = new FillerHarness();
+        string memory manifest = vm.readFile("deployments/manifest-5042002.json");
+        vm.expectRevert(TradeManifest.FeeRecipientNotChosen.selector);
+        h.resolveRecipient(manifest, false, address(0), "");
+        vm.expectRevert(TradeManifest.FeeRecipientNotChosen.selector);
+        h.resolveRecipient('{"feeRecipient":"0x0000000000000000000000000000000000000000"}', false, address(0), "");
+        assertEq(
+            h.resolveRecipient('{"feeRecipient":"0x00000000000000000000000000000000000000dd"}', false, address(0), ""),
+            address(0xdd)
+        );
+        // The rehearsal override is held to the same anvil-only guard as the reactor fee owner.
+        vm.expectRevert(TradeManifest.RehearsalNeedsAnvil.selector);
+        h.resolveRecipient(manifest, true, ANVIL_1, bytes('"Arc/v1.0"'));
+        assertEq(h.resolveRecipient(manifest, true, ANVIL_1, bytes('"anvil/v1.4.3"')), ANVIL_1);
+    }
+
+    function test_executionFeeAboveMaxRefused() public {
+        FillerHarness h = new FillerHarness();
+        assertEq(h.fee('{"executionFee":100000}'), 100_000);
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.ExecutionFeeTooHigh.selector, 100_001));
+        h.fee('{"executionFee":100001}');
     }
 
     // The scripts read TRADE_LOCAL_REHEARSAL; no test in this contract sets it, so an unset variable means false.

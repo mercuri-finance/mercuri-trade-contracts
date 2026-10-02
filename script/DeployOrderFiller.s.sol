@@ -10,7 +10,8 @@ import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol"
 
 /// @notice Deploys the immutable MercuriOrderFiller against the reactor named in TRADE_REACTOR.
 /// Contains no key: pass --account or --ledger. The reactor fee owner must still parse as an address
-/// because the reactor deployment is part of the same release. Also needs TRADE_REACTOR_CODEHASH.
+/// because the reactor deployment is part of the same release, and the execution fee recipient (the keeper's
+/// transaction address) must be chosen in the manifest. Also needs TRADE_REACTOR_CODEHASH.
 contract DeployOrderFiller is TradeManifest {
     error ReactorMismatch(string what);
 
@@ -35,6 +36,8 @@ contract DeployOrderFiller is TradeManifest {
         address usdc = _address(manifest, ".usdc");
         address launchHook = _address(manifest, ".launchHook");
         address appRecipient = _address(manifest, ".appRecipient");
+        uint256 executionFee = _executionFee(manifest);
+        address feeRecipient = _feeRecipient(manifest);
         _requireReactor(reactor, permit2, feeOwner, vm.envBytes32("TRADE_REACTOR_CODEHASH"));
         _requireCode("router", router);
         _requireCode("permit2", permit2);
@@ -43,7 +46,14 @@ contract DeployOrderFiller is TradeManifest {
 
         vm.startBroadcast();
         filler = new MercuriOrderFiller(
-            IReactor(reactor), IOrderSwapRouter(router), IAllowanceTransfer(permit2), usdc, launchHook, appRecipient
+            IReactor(reactor),
+            IOrderSwapRouter(router),
+            IAllowanceTransfer(permit2),
+            usdc,
+            launchHook,
+            appRecipient,
+            executionFee,
+            feeRecipient
         );
         vm.stopBroadcast();
 
@@ -54,6 +64,8 @@ contract DeployOrderFiller is TradeManifest {
         console2.log("usdc", usdc);
         console2.log("launchHook", launchHook);
         console2.log("appRecipient", appRecipient);
+        console2.log("executionFee", executionFee);
+        console2.log("feeRecipient", feeRecipient);
         console2.log("filler", address(filler));
     }
 }

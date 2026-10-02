@@ -31,6 +31,7 @@ import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.so
 import {ResolvedOrder} from "../../lib/uniswapx/src/base/ReactorStructs.sol";
 import {ExclusivityLib} from "../../lib/uniswapx/src/lib/ExclusivityLib.sol";
 import {CallbackFiller} from "../utils/CallbackFiller.sol";
+import {FillCaller} from "../utils/FillCaller.sol";
 
 abstract contract UniswapXFillerHarness is UniversalRouterHarness {
     using V3DutchOrderLib for V3DutchOrder;
@@ -38,6 +39,13 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
     MercuriOrderFiller internal filler;
     uint256 internal constant TRADER_KEY = 123456789;
     uint256 internal constant COSIGNER_KEY = 987654321;
+    /// The keeper's transaction address: the fixed execution-fee recipient.
+    address internal feeRecipient = makeAddr("keeper");
+
+    /// The execution fee of the filler under test (spec D13 default). Suites override it to rerun at another fee.
+    function _executionFee() internal view virtual returns (uint256) {
+        return 30_000;
+    }
 
     function _orderChainID() internal view virtual returns (uint256) {
         return 5042002;
@@ -48,9 +56,31 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
         trader = vm.addr(TRADER_KEY);
         super.setUp();
         reactor = new V3DutchOrderReactor(XPermit2(address(permit2)), address(this));
-        filler = new MercuriOrderFiller(
-            IReactor(address(reactor)), IOrderSwapRouter(address(router)), permit2, USDC, address(hook), appRecipient
+        filler = _newFiller(_executionFee());
+    }
+
+    function _newFiller(uint256 fee) internal returns (MercuriOrderFiller) {
+        return new MercuriOrderFiller(
+            IReactor(address(reactor)),
+            IOrderSwapRouter(address(router)),
+            permit2,
+            USDC,
+            address(hook),
+            appRecipient,
+            fee,
+            feeRecipient
         );
+    }
+
+    /// Spec D14: what the trader signs is net of the execution fee. A buy is priced from the input less the app
+    /// fee (listed pools) and the execution fee; a sell's minimum is the net quote less the execution fee.
+    function _netQuote(Market memory m, bool buy, uint256 amount, uint256 fee) internal returns (uint256) {
+        bool launch = address(m.key.hooks) == address(hook);
+        uint256 swapIn = buy ? amount - (launch ? 0 : amount * 50 / 10000) - fee : amount;
+        uint256 gross = _quote(m, buy, uint128(swapIn), launch ? abi.encode(uint256(uint160(trader))) : bytes(""));
+        if (buy) return gross;
+        uint256 net = launch ? gross : gross - gross * 50 / 10000;
+        return net - fee;
     }
 
     function _order(address input, address output, uint256 amount, uint256 minimum, uint256 nonce)
@@ -166,16 +196,15 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
     function _fillPath(bool mercuri, bool buy) internal {
         Market memory m = _market(buy, mercuri);
         uint128 amount = buy || !mercuri ? 100e6 : 1000000e18;
-        uint128 netInput = !mercuri && buy ? amount - amount * 50 / 10000 : amount;
-        bytes memory data = mercuri ? abi.encode(uint256(uint160(trader))) : bytes("");
-        uint256 gross = _quote(m, buy, netInput, data);
-        uint256 net = !mercuri && !buy ? gross - gross * 50 / 10000 : gross;
+        uint256 net = _netQuote(m, buy, amount, _executionFee());
         address input = buy ? USDC : address(m.token);
         address output = buy ? address(m.token) : USDC;
         uint256 beforeOut = IERC20(output).balanceOf(trader);
+        uint256 beforeKeeper = IERC20(USDC).balanceOf(feeRecipient);
         SignedOrder memory signed = _order(input, output, amount, net, 1);
         filler.fill(signed, m.key);
         assertEq(IERC20(output).balanceOf(trader) - beforeOut, net);
+        assertEq(IERC20(USDC).balanceOf(feeRecipient) - beforeKeeper, _executionFee(), "execution fee");
         assertEq(IERC20(input).balanceOf(address(filler)), 0);
         assertEq(IERC20(output).balanceOf(address(filler)), 0);
         assertEq(IERC20(input).allowance(address(filler), address(permit2)), 0);
@@ -217,7 +246,7 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
 contract UniswapXFillerTest is UniswapXFillerHarness {
     using V3DutchOrderLib for V3DutchOrder;
 
-    function test_exportOrderFillReceipts() public {
+    function test_exportOrderFillReceipts() public virtual {
         vm.createDir("test-export/trade-router", true);
         for (uint256 side; side < 2; ++side) {
             bool buy = side == 0;
@@ -241,6 +270,8 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
             vm.serializeAddress(key, "filler", address(filler));
             vm.serializeAddress(key, "reactor", address(reactor));
             vm.serializeAddress(key, "keeper", address(this));
+            vm.serializeAddress(key, "feeRecipient", feeRecipient);
+            vm.serializeUint(key, "executionFee", _executionFee());
             vm.serializeAddress(key, "poolManager", address(poolManager));
             vm.serializeAddress(key, "usdc", USDC);
             vm.serializeAddress(key, "recipient", appRecipient);
@@ -282,8 +313,9 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
 
     function test_orderTaxedOutputCannotMeetGrossMinimum() public {
         (Market memory m, AdversarialTradeToken token) = _adversarialMarket(false);
-        uint256 quoted = _quote(m, true, 99500000, "");
+        uint256 quoted = _netQuote(m, true, 100e6, _executionFee());
         SignedOrder memory buy = _order(USDC, address(token), 100e6, quoted, 5);
+        uint256 beforeKeeper = IERC20(USDC).balanceOf(feeRecipient);
         token.configure(1000, address(0), "");
         uint256 beforeUsdc = IERC20(USDC).balanceOf(trader);
         vm.expectRevert();
@@ -291,6 +323,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         assertEq(IERC20(USDC).balanceOf(trader), beforeUsdc);
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
         assertEq(appRecipient.balance, 0);
+        assertEq(IERC20(USDC).balanceOf(feeRecipient), beforeKeeper, "no execution fee on a revert");
     }
 
     function test_orderRejectsPartialFillWhenLiquidityRunsOut() public {
@@ -317,8 +350,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         // Both directions must work while unrelated donated balances stay put.
         for (uint256 side; side < 2; ++side) {
             bool buy = side == 0;
-            uint256 gross = _quote(m, buy, buy ? 99500000 : 100e6, "");
-            uint256 net = buy ? gross : gross - gross * 50 / 10000;
+            uint256 net = _netQuote(m, buy, 100e6, _executionFee());
             SignedOrder memory signed =
                 _order(buy ? USDC : address(m.token), buy ? address(m.token) : USDC, 100e6, net, 20 + side);
             filler.fill(signed, m.key);
@@ -339,9 +371,10 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         vm.stopPrank();
         uint256 beforeInput = IERC20(input).balanceOf(trader);
         uint256 beforeOutput = IERC20(output).balanceOf(trader);
-        uint256 gross = _quote(m, buy, buy ? uint128(amount - uint256(amount) * 50 / 10000) : amount, "");
-        uint256 net = buy ? gross : gross - gross * 50 / 10000;
+        uint256 net = _netQuote(m, buy, amount, _executionFee());
+        uint256 beforeKeeper = IERC20(USDC).balanceOf(feeRecipient);
         filler.fill(_order(input, output, amount, net, 30), m.key);
+        assertEq(IERC20(USDC).balanceOf(feeRecipient) - beforeKeeper, _executionFee(), "fee from this fill only");
         assertEq(beforeInput - IERC20(input).balanceOf(trader), amount);
         assertEq(IERC20(output).balanceOf(trader) - beforeOutput, net);
         assertEq(IERC20(input).balanceOf(address(filler)), dust);
@@ -367,7 +400,14 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
     function test_orderRejectsZeroHookConfiguration() public {
         vm.expectRevert();
         new MercuriOrderFiller(
-            IReactor(address(reactor)), IOrderSwapRouter(address(router)), permit2, USDC, address(0), appRecipient
+            IReactor(address(reactor)),
+            IOrderSwapRouter(address(router)),
+            permit2,
+            USDC,
+            address(0),
+            appRecipient,
+            _executionFee(),
+            feeRecipient
         );
     }
 
@@ -396,10 +436,8 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
 
     function test_fillEmitsOrderFilled() public {
         Market memory m = _market(true, false); // listed (non-Launch) pool; first arg is token ordering, not side
-        uint128 amount = 100e6;
-        uint128 netInput = amount - amount * 50 / 10000;
-        uint256 gross = _quote(m, true, netInput, "");
-        SignedOrder memory signed = _order(USDC, address(m.token), amount, gross, 41);
+        uint256 gross = _netQuote(m, true, 100e6, _executionFee());
+        SignedOrder memory signed = _order(USDC, address(m.token), 100e6, gross, 41);
         V3DutchOrder memory order = abi.decode(signed.order, (V3DutchOrder));
         vm.expectEmit(true, true, true, true, address(filler));
         emit MercuriOrderFiller.OrderFilled(order.hash(), trader, keccak256(abi.encode(m.key)));
@@ -411,18 +449,17 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         reactor.setProtocolFeeController(address(new MockFeeController(feeTo, bps, false)));
         Market memory m = _market(buy, mercuri);
         uint128 amount = buy || !mercuri ? 100e6 : 1000000e18;
-        uint128 netInput = !mercuri && buy ? amount - amount * 50 / 10000 : amount;
-        bytes memory data = mercuri ? abi.encode(uint256(uint160(trader))) : bytes("");
-        uint256 gross = _quote(m, buy, netInput, data);
-        uint256 net = !mercuri && !buy ? gross - gross * 50 / 10000 : gross;
+        uint256 net = _netQuote(m, buy, amount, _executionFee());
         uint256 minimum = net * 10_000 / (10_000 + bps); // room for the protocol fee
         address input = buy ? USDC : address(m.token);
         address output = buy ? address(m.token) : USDC;
         uint256 beforeOut = IERC20(output).balanceOf(trader);
         uint256 beforeFee = IERC20(output).balanceOf(feeTo);
+        uint256 beforeKeeper = IERC20(USDC).balanceOf(feeRecipient);
         filler.fill(_order(input, output, amount, minimum, 51), m.key);
         assertGe(IERC20(output).balanceOf(trader) - beforeOut, minimum);
         assertEq(IERC20(output).balanceOf(feeTo) - beforeFee, minimum * bps / 10_000);
+        assertEq(IERC20(USDC).balanceOf(feeRecipient) - beforeKeeper, _executionFee(), "execution fee");
         assertEq(IERC20(input).balanceOf(address(filler)), 0);
         assertEq(IERC20(output).balanceOf(address(filler)), 0);
         assertEq(IERC20(input).allowance(address(filler), address(permit2)), 0);
@@ -583,17 +620,18 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
     function test_raisedOutputAboveMarketReverts() public {
         Market memory m = _market(false, true);
         uint256 gross = _quote(m, false, 1000000e18, abi.encode(uint256(uint160(trader))));
+        uint256 netQuote = gross - _executionFee(); // what the keeper may raise the output to (spec D14)
         uint256 before = IERC20(USDC).balanceOf(trader);
         SignedOrder memory signed =
-            _expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 63, block.number, gross + 1);
-        // The router refuses a swap that yields one unit less than the raised output.
+            _expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 63, block.number, netQuote + 1);
+        // The router refuses a swap that yields one unit less than the raised output plus the execution fee.
         vm.expectRevert(abi.encodeWithSignature("V4TooLittleReceived(uint256,uint256)", gross + 1, gross));
         filler.fill(signed, m.key);
         assertEq(IERC20(USDC).balanceOf(trader), before);
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
-        // The same order at the market quote itself still fills.
-        filler.fill(_expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 66, block.number, gross), m.key);
-        assertEq(IERC20(USDC).balanceOf(trader) - before, gross);
+        // The same order at the net-of-fee market quote itself still fills.
+        filler.fill(_expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 66, block.number, netQuote), m.key);
+        assertEq(IERC20(USDC).balanceOf(trader) - before, netQuote);
     }
 
     function test_cosignerCannotLowerOutput() public {
@@ -613,6 +651,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         filler.fill(_expiringOrder(address(m.token), USDC, 1000000e18, raised / 2, 67, block.number, raised), m.key);
         assertGe(IERC20(USDC).balanceOf(trader) - before, raised);
         assertEq(IERC20(USDC).balanceOf(feeTo), raised * 5 / 10_000);
+        assertEq(IERC20(USDC).balanceOf(feeRecipient), _executionFee(), "execution fee");
         assertEq(IERC20(USDC).balanceOf(address(filler)), 0);
         assertEq(IERC20(address(m.token)).balanceOf(address(filler)), 0);
         assertEq(IERC20(USDC).allowance(address(filler), address(reactor)), 0);
@@ -651,7 +690,667 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
     function test_constructorRejectsZeroAddress() public {
         vm.expectRevert(MercuriOrderFiller.ZeroAddress.selector);
         new MercuriOrderFiller(
-            IReactor(address(0)), IOrderSwapRouter(address(router)), permit2, USDC, address(hook), appRecipient
+            IReactor(address(0)),
+            IOrderSwapRouter(address(router)),
+            permit2,
+            USDC,
+            address(hook),
+            appRecipient,
+            _executionFee(),
+            feeRecipient
         );
+    }
+}
+
+/// Reruns every `UniswapXFillerTest` case against a filler with no execution fee. With a zero fee the D14 quote
+/// math reduces to the pre-fee math, so each case proves that a zero fee behaves exactly as before.
+contract UniswapXFillerZeroFeeTest is UniswapXFillerTest {
+    function _executionFee() internal pure override returns (uint256) {
+        return 0;
+    }
+
+    /// The receipt export is written once, by the default (fee-on) suite.
+    function test_exportOrderFillReceipts() public override {
+        vm.skip(true);
+    }
+}
+
+/// Execution fee (spec D13/D14): paid once per successful fill, in USDC, to the fixed `feeRecipient`.
+contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
+    using V3DutchOrderLib for V3DutchOrder;
+
+    uint256 internal constant MAX_FEE = 100_000;
+
+    /// Balances that a fill may move, read before and after.
+    struct Snap {
+        uint256 traderUsdc;
+        uint256 traderToken;
+        uint256 keeper;
+        uint256 app;
+        uint256 caller;
+        uint256 fillerUsdc;
+        uint256 fillerToken;
+    }
+
+    function _snap(Market memory m, MercuriOrderFiller f, address caller) internal view returns (Snap memory s) {
+        s.traderUsdc = IERC20(USDC).balanceOf(trader);
+        s.traderToken = IERC20(address(m.token)).balanceOf(trader);
+        s.keeper = IERC20(USDC).balanceOf(feeRecipient);
+        s.app = IERC20(USDC).balanceOf(appRecipient);
+        s.caller = IERC20(USDC).balanceOf(caller);
+        s.fillerUsdc = IERC20(USDC).balanceOf(address(f));
+        s.fillerToken = IERC20(address(m.token)).balanceOf(address(f));
+    }
+
+    function _assertUnchanged(Snap memory a, Snap memory b, string memory what) internal pure {
+        assertEq(a.traderUsdc, b.traderUsdc, string.concat(what, ": trader USDC"));
+        assertEq(a.traderToken, b.traderToken, string.concat(what, ": trader token"));
+        assertEq(a.keeper, b.keeper, string.concat(what, ": fee recipient"));
+        assertEq(a.app, b.app, string.concat(what, ": app recipient"));
+        assertEq(a.caller, b.caller, string.concat(what, ": caller"));
+        assertEq(a.fillerUsdc, b.fillerUsdc, string.concat(what, ": filler USDC"));
+        assertEq(a.fillerToken, b.fillerToken, string.concat(what, ": filler token"));
+    }
+
+    /// Filler holds nothing of either token and has no live approval anywhere, including Permit2's router allowance.
+    function _assertFillerClean(Market memory m, MercuriOrderFiller f) internal view {
+        address[2] memory tokens = [USDC, address(m.token)];
+        for (uint256 i; i < 2; ++i) {
+            assertEq(IERC20(tokens[i]).balanceOf(address(f)), 0, "filler balance");
+            assertEq(IERC20(tokens[i]).allowance(address(f), address(permit2)), 0, "permit2 approval");
+            assertEq(IERC20(tokens[i]).allowance(address(f), address(reactor)), 0, "reactor approval");
+            (uint160 allowed,,) = permit2.allowance(address(f), tokens[i], address(router));
+            assertEq(allowed, 0, "permit2 router allowance");
+        }
+    }
+
+    function _nonceUsed(uint256 nonce) internal view returns (bool) {
+        return XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8) & (1 << (nonce & 255)) != 0;
+    }
+
+    function _amount(bool launch, bool buy) internal pure returns (uint128) {
+        return buy || !launch ? 100e6 : 1000000e18;
+    }
+
+    function _io(Market memory m, bool buy) internal pure returns (address input, address output) {
+        (input, output) = buy ? (USDC, address(m.token)) : (address(m.token), USDC);
+    }
+
+    /// The app fee a listed-pool fill pays: 50 bps of a buy's input or of a sell's gross USDC output.
+    function _appFee(Market memory m, bool buy, uint256 amount) internal returns (uint256) {
+        if (address(m.key.hooks) == address(hook)) return 0;
+        return buy ? amount * 50 / 10000 : _quote(m, false, uint128(amount), "") * 50 / 10000;
+    }
+
+    function test_execFeeConstructorRejectsFeeAboveMax() public {
+        vm.expectRevert(MercuriOrderFiller.ExecutionFeeTooHigh.selector);
+        _newFiller(MAX_FEE + 1);
+        vm.expectRevert(MercuriOrderFiller.ExecutionFeeTooHigh.selector);
+        _newFiller(type(uint256).max);
+        MercuriOrderFiller atMax = _newFiller(MAX_FEE);
+        assertEq(atMax.MAX_EXECUTION_FEE(), MAX_FEE);
+        assertEq(atMax.executionFee(), MAX_FEE);
+        assertEq(atMax.feeRecipient(), feeRecipient);
+        assertEq(_newFiller(0).executionFee(), 0);
+        assertEq(filler.executionFee(), 30_000, "harness default (spec D13)");
+    }
+
+    function test_execFeeConstructorRejectsZeroRecipient() public {
+        for (uint256 fee; fee <= MAX_FEE; fee += MAX_FEE) {
+            vm.expectRevert(MercuriOrderFiller.ZeroAddress.selector);
+            new MercuriOrderFiller(
+                IReactor(address(reactor)),
+                IOrderSwapRouter(address(router)),
+                permit2,
+                USDC,
+                address(hook),
+                appRecipient,
+                fee,
+                address(0)
+            );
+        }
+    }
+
+    /// A zero-fee filler pays the pre-fee amounts exactly on all four routes (see also UniswapXFillerZeroFeeTest).
+    function test_execFeeZeroBehavesAsBefore() public {
+        MercuriOrderFiller f = _newFiller(0);
+        for (uint256 route; route < 4; ++route) {
+            bool launch = route < 2;
+            bool buy = route % 2 == 0;
+            Market memory m = _market(buy, launch);
+            uint128 amount = _amount(launch, buy);
+            // The pre-fee formulas, written out as they were before the fee existed.
+            uint128 netInput = !launch && buy ? amount - amount * 50 / 10000 : amount;
+            uint256 gross = _quote(m, buy, netInput, launch ? abi.encode(uint256(uint160(trader))) : bytes(""));
+            uint256 net = !launch && !buy ? gross - gross * 50 / 10000 : gross;
+            (address input, address output) = _io(m, buy);
+            Snap memory before = _snap(m, f, address(this));
+            uint256 appFee = _appFee(m, buy, amount);
+            f.fill(_order(input, output, amount, net, 100 + route), m.key);
+            Snap memory afterFill = _snap(m, f, address(this));
+            assertEq(
+                buy ? afterFill.traderToken - before.traderToken : afterFill.traderUsdc - before.traderUsdc,
+                net,
+                "pre-fee net"
+            );
+            assertEq(afterFill.keeper, before.keeper, "no fee transfer");
+            assertEq(afterFill.app - before.app, appFee, "app fee");
+            _assertFillerClean(m, f);
+        }
+    }
+
+    function test_execFeePaidOnEachRoute() public {
+        uint256 fee = filler.executionFee();
+        for (uint256 route; route < 4; ++route) {
+            bool launch = route < 2;
+            bool buy = route % 2 == 0;
+            Market memory m = _market(buy, launch);
+            uint128 amount = _amount(launch, buy);
+            uint256 net = _netQuote(m, buy, amount, fee);
+            uint256 appFee = _appFee(m, buy, amount);
+            (address input, address output) = _io(m, buy);
+            Snap memory before = _snap(m, filler, address(this));
+            filler.fill(_order(input, output, amount, net, 110 + route), m.key);
+            Snap memory afterFill = _snap(m, filler, address(this));
+            if (buy) {
+                assertEq(afterFill.traderToken - before.traderToken, net, "trader output");
+                assertEq(before.traderUsdc - afterFill.traderUsdc, amount, "trader input");
+            } else {
+                assertEq(afterFill.traderUsdc - before.traderUsdc, net, "trader output");
+                assertEq(before.traderToken - afterFill.traderToken, amount, "trader input");
+            }
+            assertEq(afterFill.keeper - before.keeper, fee, "fee recipient paid exactly the fee");
+            assertEq(afterFill.app - before.app, appFee, "app fee");
+            assertEq(afterFill.caller, before.caller, "the caller earns nothing");
+            _assertFillerClean(m, filler);
+            _assertEmpty(m);
+        }
+    }
+
+    /// The input amount `a` at which a buy's input exactly equals its app fee plus the execution fee.
+    function _exactFeeInput(bool launch, uint256 fee) internal pure returns (uint256 a) {
+        a = fee;
+        while (a != (launch ? 0 : a * 50 / 10000) + fee) ++a;
+    }
+
+    function test_execFeeBuyInputTooSmall() public {
+        uint256 fee = filler.executionFee();
+        for (uint256 route; route < 2; ++route) {
+            bool launch = route == 0;
+            Market memory m = _market(true, launch);
+            uint256 exact = _exactFeeInput(launch, fee);
+            for (uint256 under; under < 2; ++under) {
+                uint256 amount = exact - under; // equal to app fee + fee, then one below
+                uint256 nonce = 120 + route * 2 + under;
+                SignedOrder memory signed = _order(USDC, address(m.token), amount, 1, nonce);
+                Snap memory before = _snap(m, filler, address(this));
+                vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+                filler.fill(signed, m.key);
+                _assertUnchanged(before, _snap(m, filler, address(this)), "too-small buy");
+                assertFalse(_nonceUsed(nonce), "nonce unused");
+            }
+        }
+    }
+
+    function _expectShortSell(Market memory m, uint256 needed, uint256 got) internal {
+        if (address(m.key.hooks) == address(hook)) {
+            vm.expectRevert(abi.encodeWithSignature("V4TooLittleReceived(uint256,uint256)", needed, got));
+        } else {
+            vm.expectRevert(abi.encodeWithSignature("InsufficientToken()"));
+        }
+    }
+
+    function _sellBoundary(MercuriOrderFiller f, bool launch, uint256 nonce) internal {
+        uint256 fee = f.executionFee();
+        Market memory m = _market(false, launch);
+        uint128 amount = _amount(launch, false);
+        uint256 net = _netQuote(m, false, amount, 0); // USDC the filler receives after any app fee
+        Snap memory before = _snap(m, f, address(this));
+        // One unit short of owed + fee: refused, nothing moves.
+        SignedOrder memory shortOrder = _order(address(m.token), USDC, amount, net - fee + 1, nonce);
+        _expectShortSell(m, net + 1, net);
+        f.fill(shortOrder, m.key);
+        _assertUnchanged(before, _snap(m, f, address(this)), "short sell");
+        assertFalse(_nonceUsed(nonce));
+        // Exactly owed + fee: fills with no leftover; the trader gets exactly the signed minimum.
+        f.fill(_order(address(m.token), USDC, amount, net - fee, nonce + 1), m.key);
+        Snap memory afterFill = _snap(m, f, address(this));
+        assertEq(afterFill.traderUsdc - before.traderUsdc, net - fee, "trader gets exactly the minimum");
+        assertEq(afterFill.keeper - before.keeper, fee, "fee");
+        _assertFillerClean(m, f);
+    }
+
+    function test_execFeeSellExactBoundary() public {
+        _sellBoundary(filler, true, 130);
+        _sellBoundary(filler, false, 132);
+        MercuriOrderFiller atMax = _newFiller(MAX_FEE);
+        _sellBoundary(atMax, true, 134);
+        _sellBoundary(atMax, false, 136);
+    }
+
+    /// The trader submits its own order: it gets at least its minimum, and the fee still goes to feeRecipient.
+    function test_execFeeSelfFill() public {
+        uint256 fee = filler.executionFee();
+        for (uint256 route; route < 4; ++route) {
+            bool launch = route < 2;
+            bool buy = route % 2 == 0;
+            Market memory m = _market(buy, launch);
+            uint128 amount = _amount(launch, buy);
+            uint256 net = _netQuote(m, buy, amount, fee);
+            (address input, address output) = _io(m, buy);
+            SignedOrder memory signed = _order(input, output, amount, net, 140 + route);
+            Snap memory before = _snap(m, filler, trader);
+            vm.prank(trader);
+            filler.fill(signed, m.key);
+            Snap memory afterFill = _snap(m, filler, trader);
+            if (buy) {
+                assertGe(afterFill.traderToken - before.traderToken, net, "trader minimum");
+                assertEq(before.traderUsdc - afterFill.traderUsdc, amount, "no fee credited to the trader");
+            } else {
+                assertGe(afterFill.traderUsdc - before.traderUsdc, net, "trader minimum");
+                assertEq(afterFill.traderUsdc - before.traderUsdc, net, "no fee credited to the trader");
+            }
+            assertEq(afterFill.keeper - before.keeper, fee, "fee to feeRecipient");
+            _assertFillerClean(m, filler);
+        }
+    }
+
+    function test_execFeeContractCaller() public {
+        FillCaller caller = new FillCaller(filler, USDC);
+        uint256 fee = filler.executionFee();
+        for (uint256 side; side < 2; ++side) {
+            bool buy = side == 0;
+            Market memory m = _market(buy, false);
+            uint256 net = _netQuote(m, buy, 100e6, fee);
+            (address input, address output) = _io(m, buy);
+            Snap memory before = _snap(m, filler, address(caller));
+            caller.fill(_order(input, output, 100e6, net, 150 + side), m.key);
+            Snap memory afterFill = _snap(m, filler, address(caller));
+            assertEq(afterFill.caller, before.caller, "contract caller earns nothing");
+            assertEq(IERC20(address(m.token)).balanceOf(address(caller)), 0);
+            assertEq(afterFill.keeper - before.keeper, fee);
+            _assertFillerClean(m, filler);
+        }
+        assertEq(caller.reentries(), 0);
+    }
+
+    /// A contract caller whose receive / fallback / `reenter` runs mid-fill (from the output token's transfer hook,
+    /// while the router holds the filler's allowance) cannot re-enter fill, the callback, the reactor or the router,
+    /// cannot pull the filler's USDC, and the fee is paid exactly once.
+    function test_execFeeReentrantCallerCannotDoublePay() public {
+        bytes[3] memory hooks = [bytes(""), bytes(hex"deadbeef"), abi.encodeCall(FillCaller.reenter, ())];
+        uint256 fee = filler.executionFee();
+        for (uint256 i; i < 3; ++i) {
+            (Market memory m, AdversarialTradeToken token) = _adversarialMarket(false);
+            FillCaller caller = new FillCaller(filler, USDC);
+            uint256 net = _netQuote(m, true, 100e6, fee);
+            SignedOrder memory first = _order(USDC, address(token), 100e6, net / 2, 160 + i * 2);
+            uint256 secondNet = net / 4;
+            SignedOrder memory second = _order(USDC, address(token), 100e6, secondNet, 161 + i * 2);
+            caller.arm(second, m.key);
+            // The hook fires on the token's first transfer: the pool paying the filler inside the router call.
+            token.configure(0, address(caller), hooks[i]);
+            Snap memory before = _snap(m, filler, address(caller));
+            caller.fill(first, m.key);
+            Snap memory afterFill = _snap(m, filler, address(caller));
+            assertTrue(token.attempted(), "hook ran");
+            assertEq(caller.reentries(), 1, "re-entry attempted once");
+            assertEq(caller.attempts(), 5);
+            assertEq(caller.successes(), 0, "every re-entry refused");
+            assertEq(afterFill.keeper - before.keeper, fee, "fee paid exactly once");
+            assertEq(afterFill.caller, before.caller, "caller gained nothing");
+            assertEq(before.traderUsdc - afterFill.traderUsdc, 100e6, "only the first order spent input");
+            assertFalse(_nonceUsed(161 + i * 2), "second order untouched");
+            _assertFillerClean(m, filler);
+            // The second order was valid all along: it fills normally afterwards and pays its own fee once.
+            filler.fill(second, m.key);
+            assertEq(IERC20(USDC).balanceOf(feeRecipient) - afterFill.keeper, fee);
+        }
+    }
+
+    function test_execFeeWithProtocolFeeOutputs() public {
+        address feeTo = makeAddr("uniswap fee");
+        reactor.setProtocolFeeController(address(new MockFeeController(feeTo, 5, false)));
+        uint256 fee = filler.executionFee();
+        for (uint256 route; route < 4; ++route) {
+            bool launch = route < 2;
+            bool buy = route % 2 == 0;
+            Market memory m = _market(buy, launch);
+            uint128 amount = _amount(launch, buy);
+            uint256 net = _netQuote(m, buy, amount, fee); // trader's share of the swap after app and execution fees
+            uint256 minimum = net * 10_000 / 10_005;
+            uint256 protocolFee = minimum * 5 / 10_000;
+            uint256 appFee = _appFee(m, buy, amount);
+            (address input, address output) = _io(m, buy);
+            Snap memory before = _snap(m, filler, address(this));
+            uint256 beforeFeeTo = IERC20(output).balanceOf(feeTo);
+            filler.fill(_order(input, output, amount, minimum, 170 + route), m.key);
+            Snap memory afterFill = _snap(m, filler, address(this));
+            uint256 traderDelta =
+                buy ? afterFill.traderToken - before.traderToken : afterFill.traderUsdc - before.traderUsdc;
+            assertEq(traderDelta, net - protocolFee, "trader: everything but the fees");
+            assertGe(traderDelta, minimum, "trader minimum");
+            assertEq(IERC20(output).balanceOf(feeTo) - beforeFeeTo, protocolFee, "protocol fee");
+            assertEq(afterFill.app - before.app, appFee, "app fee");
+            assertEq(afterFill.keeper - before.keeper, fee, "execution fee");
+            _assertFillerClean(m, filler);
+        }
+    }
+
+    /// The keeper raises the cosigned output to the net-of-fee quote (spec D14): that fills; one unit more reverts.
+    function test_execFeeWithExpiringOrderAndRaisedOutput() public {
+        uint256 fee = filler.executionFee();
+        for (uint256 route; route < 4; ++route) {
+            bool launch = route < 2;
+            bool buy = route % 2 == 0;
+            Market memory m = _market(buy, launch);
+            uint128 amount = _amount(launch, buy);
+            uint256 raised = _netQuote(m, buy, amount, fee);
+            (address input, address output) = _io(m, buy);
+            uint256 nonce = 180 + route * 2;
+            Snap memory before = _snap(m, filler, address(this));
+            SignedOrder memory above =
+                _expiringOrder(input, output, amount, raised / 2, nonce, block.number, raised + 1);
+            if (buy) {
+                vm.expectRevert(abi.encodeWithSignature("V4TooLittleReceived(uint256,uint256)", raised + 1, raised));
+            } else {
+                _expectShortSell(m, raised + fee + 1, raised + fee);
+            }
+            filler.fill(above, m.key);
+            _assertUnchanged(before, _snap(m, filler, address(this)), "raised above the net quote");
+            assertFalse(_nonceUsed(nonce));
+            filler.fill(_expiringOrder(input, output, amount, raised / 2, nonce + 1, block.number, raised), m.key);
+            Snap memory afterFill = _snap(m, filler, address(this));
+            assertEq(
+                buy ? afterFill.traderToken - before.traderToken : afterFill.traderUsdc - before.traderUsdc,
+                raised,
+                "trader gets the raised output"
+            );
+            assertEq(afterFill.keeper - before.keeper, fee);
+            _assertFillerClean(m, filler);
+        }
+    }
+
+    /// USDC and tokens donated to the filler never pay the fee, never reach the trader and never rescue a short fill.
+    function test_execFeeDonationIsolation() public {
+        uint256 fee = filler.executionFee();
+        for (uint256 route; route < 4; ++route) {
+            bool launch = route < 2;
+            bool buy = route % 2 == 0;
+            Market memory m = _market(buy, launch);
+            vm.startPrank(trader);
+            IERC20(USDC).transfer(address(filler), 7e6); // far more than the fee
+            IERC20(address(m.token)).transfer(address(filler), 11e18);
+            vm.stopPrank();
+            uint128 amount = _amount(launch, buy);
+            uint256 net = _netQuote(m, buy, amount, fee);
+            (address input, address output) = _io(m, buy);
+            uint256 nonce = 190 + route * 3;
+            // A fill one unit short of its fee is not completed from the donation.
+            Snap memory before = _snap(m, filler, address(this));
+            // Orders are signed before vm.expectRevert: signing reads Permit2, which would be the "next call".
+            if (buy) {
+                SignedOrder memory small = _order(USDC, address(m.token), _exactFeeInput(launch, fee), 1, nonce);
+                vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+                filler.fill(small, m.key);
+            } else {
+                uint256 got = _netQuote(m, false, amount, 0);
+                SignedOrder memory shortOrder = _order(input, output, amount, net + 1, nonce);
+                _expectShortSell(m, got + 1, got);
+                filler.fill(shortOrder, m.key);
+            }
+            _assertUnchanged(before, _snap(m, filler, address(this)), "donation cannot rescue a short fill");
+            filler.fill(_order(input, output, amount, net, nonce + 1), m.key);
+            Snap memory afterFill = _snap(m, filler, address(this));
+            assertEq(
+                buy ? afterFill.traderToken - before.traderToken : afterFill.traderUsdc - before.traderUsdc,
+                net,
+                "trader gets this fill's output only"
+            );
+            assertEq(afterFill.keeper - before.keeper, fee, "fee from this fill, not the donation");
+            assertEq(afterFill.fillerUsdc, 7e6, "USDC donation untouched");
+            assertEq(afterFill.fillerToken, 11e18, "token donation untouched");
+            vm.startPrank(address(filler));
+            IERC20(USDC).transfer(address(0xdead), 7e6);
+            IERC20(address(m.token)).transfer(address(0xdead), 11e18);
+            vm.stopPrank();
+        }
+    }
+
+    /// Every revert path leaves the fee recipient (and everyone else) unchanged.
+    function test_execFeeNotPaidOnRevert() public {
+        Market memory m = _market(true, false);
+        Market memory launchSell = _market(false, true);
+        uint256 fee = filler.executionFee();
+        uint256 net = _netQuote(m, true, 100e6, fee);
+        Snap memory before = _snap(m, filler, address(this));
+        uint256 keeper = before.keeper;
+
+        // Orders are signed before vm.expectRevert: signing reads Permit2, which would be the "next call".
+        // Slippage: a minimum the pool cannot meet.
+        SignedOrder memory signed = _order(USDC, address(m.token), 100e6, type(uint128).max, 200);
+        vm.expectRevert(abi.encodeWithSignature("V4TooLittleReceived(uint256,uint256)", type(uint128).max, net));
+        filler.fill(signed, m.key);
+        // Too small for the app fee plus the execution fee.
+        signed = _order(USDC, address(m.token), _exactFeeInput(false, fee), 1, 201);
+        vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+        filler.fill(signed, m.key);
+        // A sell one unit short of owed + fee.
+        uint256 got = _netQuote(launchSell, false, 1000000e18, 0);
+        signed = _order(address(launchSell.token), USDC, 1000000e18, got - fee + 1, 202);
+        _expectShortSell(launchSell, got + 1, got);
+        filler.fill(signed, launchSell.key);
+        // Cancelled nonce.
+        SignedOrder memory cancelled = _order(USDC, address(m.token), 100e6, net, 203);
+        vm.prank(trader);
+        XPermit2(address(permit2)).invalidateUnorderedNonces(0, 1 << 203);
+        vm.expectRevert();
+        filler.fill(cancelled, m.key);
+        // Wrong pool.
+        PoolKey memory wrong = PoolKey(m.key.currency0, m.key.currency1, 500, m.key.tickSpacing, m.key.hooks);
+        signed = _order(USDC, address(m.token), 100e6, net, 204);
+        vm.expectRevert();
+        filler.fill(signed, wrong);
+        // Input-token protocol fee.
+        reactor.setProtocolFeeController(address(new MockFeeController(makeAddr("uniswap fee"), 5, true)));
+        signed = _order(USDC, address(m.token), 100e6, net, 205);
+        vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+        filler.fill(signed, m.key);
+        reactor.setProtocolFeeController(address(0));
+        // Dead expiring order (+21).
+        SignedOrder memory dead = _expiringOrder(USDC, address(m.token), 100e6, net / 2, 206, block.number, 0);
+        uint256 head = block.number;
+        SignedOrder memory expired = _order(USDC, address(m.token), 100e6, net, 207);
+        vm.roll(head + EXPIRY_BLOCKS + 1);
+        vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+        filler.fill(dead, m.key);
+        // Past the deadline.
+        vm.warp(block.timestamp + 1 days + 1);
+        vm.expectRevert();
+        filler.fill(expired, m.key);
+        _assertUnchanged(before, _snap(m, filler, address(this)), "revert paths");
+        for (uint256 nonce = 200; nonce < 208; ++nonce) {
+            if (nonce != 203) assertFalse(_nonceUsed(nonce), "refused order left open");
+        }
+        // Replay: the first fill pays once; the replay pays nothing.
+        vm.warp(block.timestamp - 1 days - 1);
+        SignedOrder memory once = _order(USDC, address(m.token), 100e6, net / 2, 208);
+        filler.fill(once, m.key);
+        assertEq(IERC20(USDC).balanceOf(feeRecipient) - keeper, fee);
+        vm.expectRevert();
+        filler.fill(once, m.key);
+        assertEq(IERC20(USDC).balanceOf(feeRecipient) - keeper, fee, "replay paid nothing");
+    }
+
+    /// The trader's output falls short after a transfer tax: NetMinimumNotMet, and no fee.
+    function test_execFeeNotPaidWhenNetMinimumUnmet() public {
+        (Market memory m, AdversarialTradeToken token) = _adversarialMarket(false);
+        uint256 net = _netQuote(m, true, 100e6, filler.executionFee());
+        // A 10% tax: the filler keeps 90% of the swap, enough to pay the reactor 85%, but the trader's two taxed
+        // receipts come to 81%, below the 85% minimum.
+        SignedOrder memory signed = _order(USDC, address(token), 100e6, net * 85 / 100, 210);
+        token.configure(1000, address(0), "");
+        Snap memory before = _snap(m, filler, address(this));
+        vm.expectRevert(MercuriOrderFiller.NetMinimumNotMet.selector);
+        filler.fill(signed, m.key);
+        _assertUnchanged(before, _snap(m, filler, address(this)), "net minimum unmet");
+        assertFalse(_nonceUsed(210));
+    }
+
+    /// The smallest sell whose USDC output covers a 10 USDC signed minimum plus the maximum fee.
+    function _smallestViableSell(Market memory m, uint256 needed) internal returns (uint256 lo) {
+        uint256 hi = _amount(address(m.key.hooks) == address(hook), false) * 4;
+        lo = 1;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) / 2;
+            if (_netQuote(m, false, mid, 0) >= needed) hi = mid;
+            else lo = mid + 1;
+        }
+    }
+
+    /// Fee at its maximum with the minimum order (spec D15: 10 USDC on the USDC side).
+    function test_execFeeAtMaxWithMinimumOrder() public {
+        MercuriOrderFiller f = _newFiller(MAX_FEE);
+        for (uint256 route; route < 4; ++route) {
+            bool launch = route < 2;
+            bool buy = route % 2 == 0;
+            Market memory m = _market(buy, launch);
+            Snap memory before = _snap(m, f, address(this));
+            if (buy) {
+                uint256 net = _netQuote(m, true, 10e6, MAX_FEE);
+                f.fill(_order(USDC, address(m.token), 10e6, net, 220 + route), m.key);
+                assertEq(IERC20(address(m.token)).balanceOf(trader) - before.traderToken, net);
+                assertEq(before.traderUsdc - IERC20(USDC).balanceOf(trader), 10e6);
+            } else {
+                uint256 amount = _smallestViableSell(m, 10e6 + MAX_FEE);
+                uint256 got = _netQuote(m, false, amount, 0);
+                assertLt(_netQuote(m, false, amount - 1, 0), 10e6 + MAX_FEE, "one unit less is not viable");
+                f.fill(_order(address(m.token), USDC, amount, 10e6, 220 + route), m.key);
+                assertEq(IERC20(USDC).balanceOf(trader) - before.traderUsdc, got - MAX_FEE);
+                assertGe(got - MAX_FEE, 10e6);
+            }
+            assertEq(IERC20(USDC).balanceOf(feeRecipient) - before.keeper, MAX_FEE);
+            _assertFillerClean(m, f);
+        }
+    }
+
+    /// Orders bind the reactor and cosigner, not the filler, so an order signed before the fee existed (same
+    /// format) fills through the fee-charging filler when it has room above its minimum, and is refused with
+    /// nothing moved when its minimum leaves no room for the fee.
+    function test_execFeePreFeeOrderFillsThroughNewFiller() public {
+        MercuriOrderFiller old = _newFiller(0);
+        uint256 fee = filler.executionFee();
+        Market memory m = _market(false, true);
+        uint256 gross = _netQuote(m, false, 1000000e18, 0);
+        // Signed at the exact pre-fee quote: the old filler fills it; the new one refuses (V4TooLittleReceived).
+        SignedOrder memory exact = _order(address(m.token), USDC, 1000000e18, gross, 230);
+        uint256 snap = vm.snapshotState();
+        old.fill(exact, m.key);
+        assertTrue(vm.revertToState(snap));
+        Snap memory before = _snap(m, filler, address(this));
+        _expectShortSell(m, gross + fee, gross);
+        filler.fill(exact, m.key);
+        _assertUnchanged(before, _snap(m, filler, address(this)), "pre-fee exact quote");
+        assertFalse(_nonceUsed(230));
+        // A standing order with room above its minimum: same trader signature, fills through the new filler.
+        SignedOrder memory forOld =
+            _expiringOrderFor(address(m.token), USDC, 1000000e18, gross / 2, 231, block.number, 0, address(old));
+        SignedOrder memory forNew =
+            _expiringOrderFor(address(m.token), USDC, 1000000e18, gross / 2, 231, block.number, 0, address(filler));
+        assertEq(forOld.sig, forNew.sig, "the trader's signature does not name the filler");
+        filler.fill(forNew, m.key);
+        assertEq(IERC20(USDC).balanceOf(trader) - before.traderUsdc, gross - fee);
+        assertEq(IERC20(USDC).balanceOf(feeRecipient) - before.keeper, fee);
+        _assertFillerClean(m, filler);
+    }
+
+    /// Fee on vs fee off on the same signed order: the trader's result differs by the fee and nothing else.
+    function test_execFeeTraderSurplusMatchesZeroFeeExceptFee() public {
+        MercuriOrderFiller off = _newFiller(0);
+        uint256 fee = filler.executionFee();
+        for (uint256 route; route < 4; ++route) {
+            bool launch = route < 2;
+            bool buy = route % 2 == 0;
+            Market memory m = _market(buy, launch);
+            uint128 amount = _amount(launch, buy);
+            (address input, address output) = _io(m, buy);
+            SignedOrder memory signed = _order(input, output, amount, _netQuote(m, buy, amount, fee) / 2, 240 + route);
+            uint256 expectedOn = _netQuote(m, buy, amount, fee);
+            uint256 expectedOff = _netQuote(m, buy, amount, 0);
+            Snap memory before = _snap(m, filler, address(this));
+            uint256 snap = vm.snapshotState();
+            off.fill(signed, m.key);
+            Snap memory withoutFee = _snap(m, off, address(this));
+            assertTrue(vm.revertToState(snap));
+            filler.fill(signed, m.key);
+            Snap memory withFee = _snap(m, filler, address(this));
+            if (buy) {
+                assertEq(withFee.traderUsdc, withoutFee.traderUsdc, "same input spent");
+                assertEq(withFee.traderToken - before.traderToken, expectedOn, "output priced from input less fee");
+                assertEq(withoutFee.traderToken - before.traderToken, expectedOff, "fee-off output");
+            } else {
+                assertEq(withoutFee.traderUsdc - before.traderUsdc, expectedOff, "fee-off output");
+                assertEq(withoutFee.traderUsdc - withFee.traderUsdc, fee, "sell: exactly the fee less");
+                assertEq(withFee.traderToken, withoutFee.traderToken, "same input spent");
+            }
+            assertEq(withFee.app, withoutFee.app, "same app fee");
+            assertEq(withFee.keeper - withoutFee.keeper, fee, "the fee is the only difference");
+        }
+    }
+
+    function testFuzz_executionFeeConservation(uint256 amountSeed, uint256 feeSeed, bool buy, bool launch) public {
+        uint256 fee = bound(feeSeed, 0, MAX_FEE);
+        MercuriOrderFiller f = _newFiller(fee);
+        Market memory m = _market(buy, launch);
+        uint256 amount = buy || !launch ? bound(amountSeed, 1, 100e6) : bound(amountSeed, 1e12, 1e24);
+        (address input, address output) = _io(m, buy);
+        uint256 appFee = _appFee(m, buy, amount);
+        Snap memory before = _snap(m, f, address(this));
+        // Signed before vm.expectRevert: signing reads Permit2, which would be the "next call".
+        SignedOrder memory tiny = _order(input, output, amount, 1, 250);
+        if (buy && amount <= appFee + fee) {
+            vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+            f.fill(tiny, m.key);
+            _assertUnchanged(before, _snap(m, f, address(this)), "too-small buy");
+            assertFalse(_nonceUsed(250));
+            return;
+        }
+        uint256 got = _netQuote(m, buy, amount, buy ? fee : 0); // buy: tokens out; sell: USDC after any app fee
+        if (!buy && got < fee + 1) {
+            // Output cannot cover a 1-unit minimum plus the fee.
+            if (launch) {
+                vm.expectRevert(abi.encodeWithSignature("V4TooLittleReceived(uint256,uint256)", fee + 1, got));
+            } else {
+                vm.expectRevert(abi.encodeWithSignature("InsufficientToken()"));
+            }
+            f.fill(tiny, m.key);
+            _assertUnchanged(before, _snap(m, f, address(this)), "sell below the fee");
+            assertFalse(_nonceUsed(250));
+            return;
+        }
+        uint256 minimum = buy ? got : got - fee;
+        f.fill(_order(input, output, amount, minimum, 250), m.key);
+        Snap memory afterFill = _snap(m, f, address(this));
+        assertEq(afterFill.keeper - before.keeper, fee, "fee recipient gets exactly the fee");
+        assertEq(afterFill.app - before.app, appFee, "app fee");
+        assertEq(afterFill.caller, before.caller, "caller earns nothing");
+        if (buy) {
+            // The output is the quote for exactly amount - appFee - fee, so that much was swapped; the trader's
+            // input is that swap input plus the app fee and the execution fee, and nothing else.
+            assertEq(afterFill.traderToken - before.traderToken, got, "trader gets the whole swap output");
+            assertEq(
+                before.traderUsdc - afterFill.traderUsdc,
+                (amount - appFee - fee) + (afterFill.app - before.app) + (afterFill.keeper - before.keeper),
+                "conservation"
+            );
+        } else {
+            uint256 traderDelta = afterFill.traderUsdc - before.traderUsdc;
+            // USDC side: swap output = trader + execution fee + app fee (no protocol fee here).
+            assertEq(traderDelta + fee + appFee, got + appFee, "conservation");
+            assertEq(traderDelta, minimum);
+            assertEq(before.traderToken - afterFill.traderToken, amount);
+        }
+        _assertFillerClean(m, f);
+        assertTrue(_nonceUsed(250));
     }
 }

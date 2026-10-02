@@ -78,9 +78,21 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
     address internal feeTo;
     MockFeeController internal outputFee;
     MockFeeController internal inputFee;
+    /// Fills are submitted by these callers, none of whom is the trader, a fee recipient, the filler or the router.
+    address[3] internal callers;
+    uint256[3] public callerFills;
+    uint256[3] internal callerFillsBase;
+    /// Ghost: the fee recipient's USDC gained across fills, measured per fill. Must equal fills x executionFee.
+    uint256 public executionFeesPaid;
+    uint256 internal executionFeesPaidBase;
+    uint256 internal keeperStart;
 
     function setUp() public virtual override {
         super.setUp();
+        keeperStart = IERC20(USDC).balanceOf(feeRecipient);
+        for (uint256 i; i < 3; ++i) {
+            callers[i] = makeAddr(string.concat("fill caller ", vm.toString(i)));
+        }
         markets[0] = _market(true, true);
         markets[1] = _market(false, true);
         for (uint256 i; i < 2; ++i) {
@@ -101,6 +113,14 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         outsider = new CallbackFiller(IReactor(address(reactor)));
         targetContract(address(handler));
         feeTo = makeAddr("uniswap fee");
+        for (uint256 i; i < 3; ++i) {
+            address c = callers[i];
+            require(
+                c != trader && c != appRecipient && c != feeRecipient && c != feeTo && c != address(filler)
+                    && c != address(router),
+                "caller set must exclude every paid party"
+            );
+        }
         outputFee = new MockFeeController(feeTo, 5, false);
         inputFee = new MockFeeController(feeTo, 5, true);
         bytes4[] memory selectors = new bytes4[](5);
@@ -131,6 +151,43 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         inputFeeRejectionsBase = inputFeeRejections;
         expiredRejectionsBase = expiredRejections;
         exclusiveRejectionsBase = exclusiveRejections;
+        executionFeesPaidBase = executionFeesPaid;
+        callerFillsBase = callerFills;
+    }
+
+    /// Submits `signed` from one of the fixed callers (chosen by `salt`). A successful fill pays the fee recipient
+    /// exactly `executionFee`; a reverted one pays nothing; the caller's USDC never changes.
+    function _tryFill(SignedOrder memory signed, PoolKey memory key, uint256 salt)
+        internal
+        returns (bool ok, bytes memory err)
+    {
+        uint256 i = uint256(keccak256(abi.encode(salt))) % 3;
+        address caller = callers[i];
+        uint256 keeperBefore = IERC20(USDC).balanceOf(feeRecipient);
+        uint256 callerBefore = IERC20(USDC).balanceOf(caller);
+        vm.prank(caller);
+        try filler.fill(signed, key) {
+            ok = true;
+        } catch (bytes memory reason) {
+            err = reason;
+        }
+        uint256 paid = IERC20(USDC).balanceOf(feeRecipient) - keeperBefore;
+        assertEq(paid, ok ? filler.executionFee() : 0, "execution fee once per fill, never on a revert");
+        assertEq(IERC20(USDC).balanceOf(caller), callerBefore, "the caller earns nothing");
+        if (ok) {
+            executionFeesPaid += paid;
+            callerFills[i]++;
+        }
+    }
+
+    /// `_tryFill` for a fill that must succeed; bubbles the revert reason otherwise.
+    function _fill(SignedOrder memory signed, PoolKey memory key, uint256 salt) internal {
+        (bool ok, bytes memory err) = _tryFill(signed, key, salt);
+        if (!ok) {
+            assembly {
+                revert(add(err, 32), mload(err))
+            }
+        }
     }
 
     /// Runs one successful fill with the output-token protocol fee on, then restores the prior fee state.
@@ -157,8 +214,7 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         Market memory m = markets[offset % 4];
         uint128 amount = 1e6 + uint128(offset) * 1e5;
         bool app = address(m.key.hooks) == address(0);
-        uint128 netInput = app ? uint128(amount - uint256(amount) * 50 / 10000) : amount;
-        uint256 minimum = _quote(m, true, netInput, app ? bytes("") : abi.encode(uint256(uint160(trader))));
+        uint256 minimum = _netQuote(m, true, amount, filler.executionFee()); // spec D14
         if (outputFeeOn) minimum = minimum * 10_000 / 10_005; // room for the 5 bps protocol fee
         uint256 nonce = nextNonce++;
         uint256 start = block.number;
@@ -179,7 +235,7 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
             }
             assertEq(IERC20(USDC).balanceOf(trader), beforeInput, "outsider spent input");
             assertEq(XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8), beforeBitmap, "outsider used nonce");
-            filler.fill(signed, m.key);
+            _fill(signed, m.key, nonce);
             assertEq(beforeInput - IERC20(USDC).balanceOf(trader), amount, "expiring exact input");
             assertGe(IERC20(address(m.token)).balanceOf(trader) - beforeOutput, minimum, "expiring output");
             assertEq(
@@ -189,12 +245,10 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
             );
             successfulFills++;
         } else {
-            try filler.fill(signed, m.key) {
-                fail("expired order filled");
-            } catch (bytes memory err) {
-                assertEq(bytes4(err), MercuriOrderFiller.InvalidOrder.selector, "expiry reverted for another reason");
-                expiredRejections++;
-            }
+            (bool ok, bytes memory err) = _tryFill(signed, m.key, nonce);
+            assertFalse(ok, "expired order filled");
+            assertEq(bytes4(err), MercuriOrderFiller.InvalidOrder.selector, "expiry reverted for another reason");
+            expiredRejections++;
             assertEq(IERC20(USDC).balanceOf(trader), beforeInput, "expired fill spent input");
             assertEq(
                 XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8), beforeBitmap, "expired fill used nonce"
@@ -224,14 +278,10 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         reactor.setProtocolFeeController(address(inputFee));
         uint256 beforeUSDC = IERC20(USDC).balanceOf(trader);
         uint256 beforeBitmap = XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8);
-        try filler.fill(signed, m.key) {
-            fail("input-fee fill succeeded");
-        } catch (bytes memory err) {
-            assertEq(
-                bytes4(err), MercuriOrderFiller.InvalidOrder.selector, "input-fee fill reverted for another reason"
-            );
-            inputFeeRejections++;
-        }
+        (bool ok, bytes memory err) = _tryFill(signed, m.key, nonce);
+        assertFalse(ok, "input-fee fill succeeded");
+        assertEq(bytes4(err), MercuriOrderFiller.InvalidOrder.selector, "input-fee fill reverted for another reason");
+        inputFeeRejections++;
         assertEq(IERC20(USDC).balanceOf(trader), beforeUSDC, "input-fee fill spent input");
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8), beforeBitmap, "input-fee nonce used");
         reactor.setProtocolFeeController(outputFeeOn ? address(outputFee) : address(0));
@@ -259,11 +309,9 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         if (action == 4) {
             require(lastOrder.length > 0, "warmup needs a fill");
             uint256 beforeUSDC = IERC20(USDC).balanceOf(trader);
-            try filler.fill(SignedOrder(lastOrder, lastSignature), lastPool) {
-                fail("replay succeeded");
-            } catch {
-                expectedFailures++;
-            }
+            (bool replayed,) = _tryFill(SignedOrder(lastOrder, lastSignature), lastPool, nonce);
+            assertFalse(replayed, "replay succeeded");
+            expectedFailures++;
             assertEq(IERC20(USDC).balanceOf(trader), beforeUSDC, "replay spent USDC");
             return;
         }
@@ -271,10 +319,8 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         uint256 expectedAppFee;
         if (action <= 1) {
             bool app = address(m.key.hooks) == address(0);
-            uint128 netInput = app && buy ? uint128(amount - uint256(amount) * 50 / 10000) : amount;
-            minimum = _quote(m, buy, netInput, app ? bytes("") : abi.encode(uint256(uint160(trader))));
-            expectedAppFee = app ? (buy ? uint256(amount) * 50 / 10000 : minimum * 50 / 10000) : 0;
-            if (app && !buy) minimum -= minimum * 50 / 10000;
+            expectedAppFee = app ? (buy ? uint256(amount) * 50 / 10000 : _quote(m, false, amount, "") * 50 / 10000) : 0;
+            minimum = _netQuote(m, buy, amount, filler.executionFee()); // spec D14: net of app and execution fees
             if (outputFeeOn) minimum = minimum * 10_000 / 10_005; // room for the 5 bps protocol fee
             assertGt(minimum, 0, "meaningful quote");
         }
@@ -292,11 +338,9 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         if (action == 6) vm.warp(block.timestamp + 1 days + 1);
         uint256 beforeBitmap = XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8);
         if (action >= 2) {
-            try filler.fill(signed, m.key) {
-                fail("invalid order succeeded");
-            } catch {
-                expectedFailures++;
-            }
+            (bool ok,) = _tryFill(signed, m.key, nonce);
+            assertFalse(ok, "invalid order succeeded");
+            expectedFailures++;
             assertEq(IERC20(input).balanceOf(trader), beforeInput, "failed fill spent input");
             assertEq(IERC20(output).balanceOf(trader), beforeOutput, "failed fill changed output");
             assertEq(IERC20(USDC).balanceOf(appRecipient), beforeFee, "failed fill charged fee");
@@ -304,7 +348,7 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
                 XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8), beforeBitmap, "failed fill consumed nonce"
             );
         } else {
-            filler.fill(signed, m.key);
+            _fill(signed, m.key, nonce);
             successfulFills++;
             assertEq(beforeInput - IERC20(input).balanceOf(trader), amount, "exact input");
             if (outputFeeOn) {
@@ -324,6 +368,12 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
             lastSignature = signed.sig;
             lastPool = m.key;
         }
+    }
+
+    /// The fee recipient's USDC grew by exactly one execution fee per successful fill, and by nothing else.
+    function invariant_executionFeePerFill() public view {
+        assertEq(executionFeesPaid, successfulFills * filler.executionFee(), "ghost: fills x fee");
+        assertEq(IERC20(USDC).balanceOf(feeRecipient) - keeperStart, executionFeesPaid, "fee recipient balance");
     }
 
     function invariant_tradeCustodyAndApprovals() public view {
@@ -348,6 +398,11 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         assertGt(inputFeeRejections, inputFeeRejectionsBase, "campaign never saw an input-fee rejection");
         assertGt(expiredRejections, expiredRejectionsBase, "campaign never saw an expired-order rejection");
         assertGt(exclusiveRejections, exclusiveRejectionsBase, "campaign never saw an exclusivity rejection");
+        assertGt(executionFeesPaid, executionFeesPaidBase, "campaign never paid an execution fee");
+        assertEq(executionFeesPaid, successfulFills * filler.executionFee(), "ghost: fills x fee");
+        for (uint256 i; i < 3; ++i) {
+            assertGt(callerFills[i], callerFillsBase[i], "campaign never filled through every caller");
+        }
         assertGe(steps, 13);
     }
 }

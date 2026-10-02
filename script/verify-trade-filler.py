@@ -6,7 +6,7 @@ deployment immutables substituted, then compares byte for byte with eth_getCode.
 differing offsets and exits non-zero on any mismatch. No keys, no signing, no writes.
 
   python3 script/verify-trade-filler.py --rpc URL --block N --deployment FILE   # FILE has reactor, filler,
-                                                                                # reactorFeeOwner
+                                                                                # reactorFeeOwner, feeRecipient
   python3 script/verify-trade-filler.py --self-test                             # offline, no network
   python3 script/verify-trade-filler.py --self-test-reactor-flipped             # offline; must report MISMATCH
 """
@@ -20,10 +20,12 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[1]
 DEFAULT_RPC = 'https://rpc.testnet.arc.network'
 SENTINEL = 'REQUIRED_AT_D2_OWNER_GO'
+RECIPIENT_SENTINEL = 'REQUIRED_AT_D3_OWNER_GO'
+MAX_EXECUTION_FEE = 100_000
 POINTER = '_getBlockNumberish'
 # The only immutables each contract may carry. A different set in either direction is a reviewed-source change.
 EXPECTED_IMMUTABLES = {
-    'filler': {'reactor', 'router', 'permit2', 'usdc', 'launchHook', 'appRecipient'},
+    'filler': {'reactor', 'router', 'permit2', 'usdc', 'launchHook', 'appRecipient', 'executionFee', 'feeRecipient'},
     'reactor': {'permit2', POINTER},
 }
 
@@ -141,7 +143,19 @@ def reactor_artifacts():
     return sorted((root / 'out/V3DutchOrderReactor.sol').glob('V3DutchOrderReactor.*.json'))
 
 
-def manifest_values(manifest, reactor):
+def uint_word(value):
+    return value.to_bytes(32, 'big')
+
+
+def execution_fee(manifest):
+    """The manifest fee as the filler stores it: an integer in USDC units, at most MAX_EXECUTION_FEE."""
+    fee = manifest.get('executionFee')
+    if type(fee) is not int or not 0 <= fee <= MAX_EXECUTION_FEE:
+        raise SystemExit(f'manifest executionFee is not an integer in [0, {MAX_EXECUTION_FEE}]: {fee!r}')
+    return fee
+
+
+def manifest_values(manifest, reactor, fee_recipient):
     return {
         'reactor': address_word(reactor),
         'router': address_word(manifest['router']),
@@ -149,6 +163,8 @@ def manifest_values(manifest, reactor):
         'usdc': address_word(manifest['usdc']),
         'launchHook': address_word(manifest['launchHook']),
         'appRecipient': address_word(manifest['appRecipient']),
+        'executionFee': uint_word(execution_fee(manifest)),
+        'feeRecipient': address_word(fee_recipient),
     }
 
 
@@ -187,6 +203,25 @@ def required_owner(manifest, deployment):
     return owner
 
 
+def required_fee_recipient(manifest, deployment):
+    """The execution fee recipient is mandatory: an address in the manifest, never the sentinel, equal to the record."""
+    recipient = manifest.get('feeRecipient', '')
+    if recipient == RECIPIENT_SENTINEL:
+        raise SystemExit('manifest feeRecipient is still the sentinel; the owner choice has not been recorded')
+    if not (isinstance(recipient, str) and len(recipient) == 42 and recipient.startswith('0x')):
+        raise SystemExit(f'manifest feeRecipient is not an address: {recipient!r}')
+    if int(recipient, 16) == 0:
+        raise SystemExit('manifest feeRecipient is the zero address')
+    recorded = deployment.get('feeRecipient')
+    if recorded is None or recorded.lower() != recipient.lower():
+        raise SystemExit(f'deployment feeRecipient {recorded!r} != manifest {recipient}')
+    return recipient
+
+
+# Offline self-tests stand in for the owner's D3 choice with this placeholder recipient.
+SELF_TEST_RECIPIENT = '0x00000000000000000000000000000000000000bb'
+
+
 def expect_rejected(label, artifact, values, kind):
     try:
         expected_runtime(artifact, values, kind)
@@ -201,7 +236,7 @@ def immutable_set_self_test():
     import copy
     manifest = load('deployments/manifest-5042002.json')
     filler = load('out/MercuriOrderFiller.sol/MercuriOrderFiller.json')
-    values = manifest_values(manifest, '0x00000000000000000000000000000000000000aa')
+    values = manifest_values(manifest, '0x00000000000000000000000000000000000000aa', SELF_TEST_RECIPIENT)
     extra = copy.deepcopy(filler)
     extra['deployedBytecode']['immutableReferences']['999999999'] = [{'start': 0, 'length': 32}]
     extra.setdefault('ast', {}).setdefault('nodes', []).append(
@@ -218,7 +253,7 @@ def self_test(flip):
     manifest = load('deployments/manifest-5042002.json')
     filler = load('out/MercuriOrderFiller.sol/MercuriOrderFiller.json')
     fake_reactor = '0x00000000000000000000000000000000000000aa'
-    values = manifest_values(manifest, fake_reactor)
+    values = manifest_values(manifest, fake_reactor, SELF_TEST_RECIPIENT)
     live, ranges = expected_runtime(filler, values, 'filler')
     live = bytearray(live)
     if flip:
@@ -283,7 +318,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--rpc', default=DEFAULT_RPC)
     parser.add_argument('--block', type=int)
-    parser.add_argument('--deployment', help='JSON with reactor, filler and reactorFeeOwner')
+    parser.add_argument('--deployment', help='JSON with reactor, filler, reactorFeeOwner and feeRecipient')
     parser.add_argument('--manifest', default='deployments/manifest-5042002.json')
     parser.add_argument('--self-test', action='store_true', help='offline: unmodified bytes must match, a flipped immutable byte must not')
     parser.add_argument('--self-test-flipped', action='store_true', help='offline: verify with one immutable byte flipped; exits non-zero')
@@ -321,9 +356,10 @@ def main():
         return bytes.fromhex(rpc_call(args.rpc, 'eth_getCode', [address, tag]).removeprefix('0x'))
 
     owner = required_owner(manifest, deployment)
+    fee_recipient = required_fee_recipient(manifest, deployment)
     ok = verify_reactor(args, manifest, owner, tag, code(deployment['reactor']))
     filler = load('out/MercuriOrderFiller.sol/MercuriOrderFiller.json')
-    ok &= verify('filler', 'filler', filler, manifest_values(manifest, deployment['reactor']), code(deployment['filler']))
+    ok &= verify('filler', 'filler', filler, manifest_values(manifest, deployment['reactor'], fee_recipient), code(deployment['filler']))
     onchain = rpc_call(args.rpc, 'eth_call', [{'to': deployment['reactor'], 'data': '0x8da5cb5b'}, tag])
     onchain = '0x' + onchain[-40:]
     if onchain.lower() != owner.lower():

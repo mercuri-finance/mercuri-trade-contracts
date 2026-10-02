@@ -71,6 +71,8 @@ contract TradeLocalStateTest is UniswapXFillerHarness {
         vm.serializeAddress(KEY, "launchHook", address(hook));
         vm.serializeAddress(KEY, "cosigner", LOCAL_COSIGNER);
         vm.serializeAddress(KEY, "trader", trader);
+        vm.serializeAddress(KEY, "feeRecipient", feeRecipient);
+        vm.serializeUint(KEY, "executionFee", filler.executionFee());
         string memory output = vm.serializeAddress(KEY, "usdc", USDC);
         vm.createDir("test-export/trade-orders", true);
         vm.writeJson(output, "test-export/trade-orders/anvil-order.json");

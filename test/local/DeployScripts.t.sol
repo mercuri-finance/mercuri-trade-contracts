@@ -4,6 +4,9 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {DeployTestnetReactor} from "../../script/DeployTestnetReactor.s.sol";
 import {DeployOrderFiller} from "../../script/DeployOrderFiller.s.sol";
+import {MercuriOrderFiller, IOrderSwapRouter} from "../../src/MercuriOrderFiller.sol";
+import {IReactor} from "../../lib/uniswapx/src/interfaces/IReactor.sol";
+import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import {TradeManifest} from "../../script/TradeManifest.sol";
 import {V3DutchOrderReactor} from "../../lib/uniswapx/src/reactors/V3DutchOrderReactor.sol";
 import {IPermit2} from "../../lib/uniswapx/lib/permit2/src/interfaces/IPermit2.sol";
@@ -28,6 +31,10 @@ contract FillerHarness is DeployOrderFiller {
 
     function fee(string memory manifest) external pure returns (uint256) {
         return _executionFee(manifest);
+    }
+
+    function maxFee() external pure returns (uint256) {
+        return MAX_EXECUTION_FEE;
     }
 
     function requireReactor(address reactor, address permit2, address feeOwner, bytes32 codeHash) external view {
@@ -92,6 +99,23 @@ contract DeployScriptsTest is Test {
         DeployOrderFiller script = new DeployOrderFiller();
         vm.expectRevert(TradeManifest.ReactorFeeOwnerNotChosen.selector);
         script.run();
+    }
+
+    /// The script's copy of the bound must never drift from the filler's, or a manifest could pass here and fail
+    /// the constructor (or the reverse) at deployment time.
+    function test_scriptMaxExecutionFeeMatchesFiller() public {
+        // IReactor, IOrderSwapRouter and IAllowanceTransfer are never called by the constructor; any non-zero address works.
+        MercuriOrderFiller filler = new MercuriOrderFiller(
+            IReactor(address(1)),
+            IOrderSwapRouter(address(2)),
+            IAllowanceTransfer(address(3)),
+            address(4),
+            address(5),
+            address(6),
+            0,
+            address(7)
+        );
+        assertEq(new FillerHarness().maxFee(), filler.MAX_EXECUTION_FEE());
     }
 
     function test_sentinelResolverRefuses() public {

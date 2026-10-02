@@ -21,7 +21,8 @@ interface IOrderSwapRouter {
 /// @dev Immutable: no owner, pause, upgrade or rescue path. Orders are bound to
 /// their reactor and cosigner, not to this contract, so a replacement filler can
 /// settle orders that are already signed; the keeper switches by configuration.
-/// The signed trader receives every output above the resolved minimum. A fixed USDC
+/// The signed trader receives every output above what the reactor takes (its protocol
+/// fee) and, on a sell, above the execution fee. A fixed USDC
 /// execution fee is paid to `feeRecipient` (the keeper) on each successful fill, from
 /// the USDC side: a buy's input before the swap, a sell's output after it. The signed
 /// minimum is enforced as before, so the fee only comes out of value above it. Tokens
@@ -104,8 +105,9 @@ contract MercuriOrderFiller is IReactorCallback {
         feeRecipient = recipient_;
     }
 
-    /// @notice Fills one signed order, delivers its net output less the execution fee to the
-    /// trader, and pays the execution fee in USDC to `feeRecipient`.
+    /// @notice Fills one signed order: the trader receives every output above what the reactor
+    /// takes; a fixed USDC execution fee is taken from the order's USDC side (the input on a
+    /// buy, the output on a sell) and paid to `feeRecipient`.
     /// @dev Anyone may submit a signed order; the caller earns nothing. The reactor enforces
     /// its signature, nonce and deadline; this call reverts atomically, paying no fee, if the
     /// trader's signed net minimum is unmet.

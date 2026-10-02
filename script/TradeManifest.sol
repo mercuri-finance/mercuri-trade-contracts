@@ -1,16 +1,24 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Script} from "forge-std/Script.sol";
-import {console2} from "forge-std/console2.sol";
+import {Script, console2} from "forge-std/Script.sol";
 
 /// @notice Shared manifest reader for the Trade testnet deployment scripts. Holds no key and never broadcasts.
+/// @dev Owner choices (`reactorFeeOwner`, `feeRecipient`) ship as sentinel strings and are refused until replaced
+///      with an address; the loopback rehearsal override is honoured only on anvil (see `_resolveChoice`).
 abstract contract TradeManifest is Script {
     uint256 internal constant TESTNET_CHAIN_ID = 5042002;
     string internal constant MANIFEST_PATH = "deployments/manifest-5042002.json";
+    /// @dev Mirrors MercuriOrderFiller.MAX_EXECUTION_FEE so a bad manifest fails before any broadcast.
+    uint256 internal constant MAX_EXECUTION_FEE = 100_000;
 
     error WrongChain(uint256 chainId);
     error NoCode(string name, address account);
+    error ReactorFeeOwnerNotChosen();
+    error FeeRecipientNotChosen();
+    error ExecutionFeeTooHigh(uint256 fee);
+    error RehearsalNeedsAnvil();
+    error RehearsalOwnerNotAnvilAccount(address owner);
 
     /// @dev Refuses any chain other than Arc testnet. A local fork must keep chain id 5042002.
     function _requireTestnet() internal view {
@@ -29,19 +37,10 @@ abstract contract TradeManifest is Script {
         if (account.code.length == 0) revert NoCode(name, account);
     }
 
-    error ReactorFeeOwnerNotChosen();
-    error FeeRecipientNotChosen();
-    error ExecutionFeeTooHigh(uint256 fee);
-    error RehearsalNeedsAnvil();
-    error RehearsalOwnerNotAnvilAccount(address owner);
-
-    /// @dev Mirrors MercuriOrderFiller.MAX_EXECUTION_FEE so a bad manifest fails before any broadcast.
-    uint256 internal constant MAX_EXECUTION_FEE = 100_000;
-
     /// @dev `reactorFeeOwner` is an owner choice made at deployment time and ships as a sentinel string.
-    /// TRADE_LOCAL_REHEARSAL=true swaps in REACTOR_FEE_OWNER_OVERRIDE for a loopback fork rehearsal only. Because
-    /// the real testnet shares chain id 5042002, the override additionally needs an RPC that reports itself as
-    /// anvil and an owner that is one of anvil's public default accounts.
+    ///      TRADE_LOCAL_REHEARSAL=true swaps in REACTOR_FEE_OWNER_OVERRIDE for a loopback fork rehearsal only. Because
+    ///      the real testnet shares chain id 5042002, the override additionally needs an RPC that reports itself as
+    ///      anvil and an owner that is one of anvil's public default accounts.
     function _reactorFeeOwner(string memory manifest) internal returns (address) {
         bool rehearsal = vm.envOr("TRADE_LOCAL_REHEARSAL", false);
         address override_ = rehearsal ? vm.envAddress("REACTOR_FEE_OWNER_OVERRIDE") : address(0);
@@ -60,8 +59,8 @@ abstract contract TradeManifest is Script {
     }
 
     /// @dev `feeRecipient` (the keeper's transaction address, spec D13) is an owner choice made at the filler
-    /// deployment (D3) and ships as a sentinel string. It is also the filler's only permitted `fill` caller (D20). The rehearsal guard is the same as for the reactor fee owner,
-    /// with FEE_RECIPIENT_OVERRIDE as the override.
+    ///      deployment (D3) and ships as a sentinel string. It is also the filler's only permitted `fill` caller (D20).
+    ///      The rehearsal guard is the same as for the reactor fee owner, with FEE_RECIPIENT_OVERRIDE as the override.
     function _feeRecipient(string memory manifest) internal returns (address) {
         bool rehearsal = vm.envOr("TRADE_LOCAL_REHEARSAL", false);
         address override_ = rehearsal ? vm.envAddress("FEE_RECIPIENT_OVERRIDE") : address(0);
@@ -87,7 +86,7 @@ abstract contract TradeManifest is Script {
     }
 
     /// @dev An address chosen at deployment time: the manifest value, or under the rehearsal guard the override.
-    /// Returns zero when the manifest still holds a sentinel or anything that is not an address.
+    ///      Returns zero when the manifest still holds a sentinel or anything that is not an address.
     function _resolveChoice(
         string memory manifest,
         string memory key,
@@ -108,7 +107,7 @@ abstract contract TradeManifest is Script {
     }
 
     /// @dev Checked in Solidity because `vm.parseAddress` reverts uncatchably without an external call, and a
-    /// script may not call itself.
+    ///      script may not call itself.
     function _isAddressString(string memory text) internal pure returns (bool) {
         bytes memory b = bytes(text);
         if (b.length != 42 || b[0] != "0" || (b[1] != "x" && b[1] != "X")) return false;

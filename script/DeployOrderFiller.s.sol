@@ -2,23 +2,24 @@
 pragma solidity ^0.8.26;
 
 import {console2} from "forge-std/console2.sol";
-import {TradeManifest} from "./TradeManifest.sol";
-import {MercuriOrderFiller, IOrderSwapRouter} from "../src/MercuriOrderFiller.sol";
+import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import {IReactor} from "../lib/uniswapx/src/interfaces/IReactor.sol";
 import {V3DutchOrderReactor} from "../lib/uniswapx/src/reactors/V3DutchOrderReactor.sol";
-import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
+import {TradeManifest} from "./TradeManifest.sol";
+import {MercuriOrderFiller, IOrderSwapRouter} from "../src/MercuriOrderFiller.sol";
 
-/// @notice Deploys the immutable MercuriOrderFiller against the reactor named in TRADE_REACTOR.
-/// Contains no key: pass --account or --ledger. The reactor fee owner must still parse as an address
-/// because the reactor deployment is part of the same release, and the execution fee recipient (the keeper's
-/// transaction address) must be chosen in the manifest. That address is also the only one allowed to call `fill`
-/// (spec D20), so it must be the keeper that will submit fills. Also needs TRADE_REACTOR_CODEHASH.
+/// @notice Deploys the immutable MercuriOrderFiller against the reactor named in TRADE_REACTOR. Contains no key: pass
+///         --account or --ledger.
+/// @dev The reactor fee owner must still parse as an address because the reactor deployment is part of the same
+///      release, and the execution fee recipient (the keeper's transaction address) must be chosen in the manifest.
+///      That address is also the only one allowed to call `fill` (spec D20), so it must be the keeper that will
+///      submit fills. Also needs TRADE_REACTOR_CODEHASH.
 contract DeployOrderFiller is TradeManifest {
     error ReactorMismatch(string what);
 
     /// @dev TRADE_REACTOR is operator input, so prove it is the reactor from the reactor step: same permit2, same fee
-    /// owner, and runtime code hash equal to TRADE_REACTOR_CODEHASH (the runtime keccak that
-    /// `verify-trade-filler.py` prints for the reactor, copied by the operator).
+    ///      owner, and runtime code hash equal to TRADE_REACTOR_CODEHASH (the runtime keccak that
+    ///      `verify-trade-filler.py` prints for the reactor, copied by the operator).
     function _requireReactor(address reactor, address permit2, address feeOwner, bytes32 codeHash) internal view {
         if (reactor.code.length == 0) revert NoCode("reactor", reactor);
         if (reactor.codehash != codeHash) revert ReactorMismatch("codehash");

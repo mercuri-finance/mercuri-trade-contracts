@@ -2,9 +2,9 @@
 pragma solidity ^0.8.26;
 
 import {console2} from "forge-std/console2.sol";
-import {TradeManifest} from "./TradeManifest.sol";
 import {V3DutchOrderReactor} from "../lib/uniswapx/src/reactors/V3DutchOrderReactor.sol";
 import {IPermit2} from "../lib/uniswapx/lib/permit2/src/interfaces/IPermit2.sol";
+import {TradeManifest} from "./TradeManifest.sol";
 
 /// @notice Deploys the pinned UniswapX V3 Dutch reactor on Arc testnet. Contains no key: pass --account or --ledger.
 contract DeployTestnetReactor is TradeManifest {

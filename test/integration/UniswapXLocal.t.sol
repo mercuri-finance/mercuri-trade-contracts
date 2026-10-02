@@ -180,7 +180,9 @@ contract UniswapXLocalTest is LaunchFixture {
         outputToken.mint(address(exportFiller), EXPIRING_START_AMOUNT + 1);
         uint256 snap = vm.snapshotState();
         vm.roll(1021); // one block later the output is start + 2^128: dead for every filler
-        vm.expectRevert();
+        // Not NoExclusiveOverride: exclusivity has lapsed and the reactor resolves the order, then cannot take
+        // start + 2^128 of output from the named filler (solmate MockERC20 underflow, wrapped by SafeTransferLib).
+        vm.expectRevert(bytes("TRANSFER_FROM_FAILED"));
         exportFiller.fill(cosigned);
         assertTrue(vm.revertToState(snap));
         exportFiller.fill(cosigned);

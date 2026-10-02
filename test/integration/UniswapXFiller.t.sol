@@ -539,7 +539,9 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         vm.roll(start + EXPIRY_BLOCKS + 1);
         uint256 beforeToken = IERC20(address(m.token)).balanceOf(trader);
         uint256 beforeOutsider = IERC20(USDC).balanceOf(address(outsider));
-        vm.expectRevert(); // exclusivity has ended, but the output is now start + 2^128
+        // Exclusivity has ended (not NoExclusiveOverride): the reactor resolves the order and then cannot take
+        // start + 2^128 of output from the outsider, whatever its balance.
+        vm.expectRevert(bytes("TRANSFER_FROM_FAILED"));
         outsider.fill(signed);
         assertEq(IERC20(address(m.token)).balanceOf(trader), beforeToken);
         assertEq(IERC20(USDC).balanceOf(address(outsider)), beforeOutsider);
@@ -560,6 +562,9 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         } catch (bytes memory err) {
             if (offset <= EXPIRY_BLOCKS) {
                 assertEq(bytes4(err), ExclusivityLib.NoExclusiveOverride.selector, "window refusal");
+            } else {
+                // Exclusivity lapsed; the curve, not the window, kills the order.
+                assertEq(err, abi.encodeWithSignature("Error(string)", "TRANSFER_FROM_FAILED"), "dead-order refusal");
             }
         }
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0, "outsider used nonce");

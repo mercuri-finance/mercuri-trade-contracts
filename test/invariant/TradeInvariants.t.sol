@@ -5,6 +5,7 @@ import {UniswapXFillerHarness} from "../integration/UniswapXFiller.t.sol";
 import {SignedOrder} from "../../lib/uniswapx/src/base/ReactorStructs.sol";
 import {IPermit2 as XPermit2} from "../../lib/uniswapx/lib/permit2/src/interfaces/IPermit2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {MercuriOrderFiller} from "../../src/MercuriOrderFiller.sol";
 import {MockFeeController} from "../utils/MockFeeController.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
@@ -15,6 +16,7 @@ interface ITradeExercise {
     function exercise(uint256 seed) external;
     function toggleOutputFee() external;
     function inputFeeAttempt(uint256 seed) external;
+    function feeFill(uint256 seed) external;
 }
 
 contract TradeSequenceHandler {
@@ -35,6 +37,10 @@ contract TradeSequenceHandler {
     function inputFeeAttempt(uint256 seed) external {
         suite.inputFeeAttempt(seed);
     }
+
+    function feeFill(uint256 seed) external {
+        suite.feeFill(seed);
+    }
 }
 
 /// Sequence properties for the new Trade filler, separate from Launch invariants.
@@ -52,6 +58,8 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
     uint256 public steps;
     uint256 public feeFills;
     uint256 public inputFeeRejections;
+    uint256 internal feeFillsBase;
+    uint256 internal inputFeeRejectionsBase;
     bool internal outputFeeOn;
     uint256 private beforeProtocolFee; // storage: `exercise` is at the stack limit
     address internal feeTo;
@@ -81,10 +89,11 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         feeTo = makeAddr("uniswap fee");
         outputFee = new MockFeeController(feeTo, 5, false);
         inputFee = new MockFeeController(feeTo, 5, true);
-        bytes4[] memory selectors = new bytes4[](3);
+        bytes4[] memory selectors = new bytes4[](4);
         selectors[0] = handler.step.selector;
         selectors[1] = handler.toggleOutputFee.selector;
         selectors[2] = handler.inputFeeAttempt.selector;
+        selectors[3] = handler.feeFill.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         // Warm each branch, including every pool/direction, before random sequences.
         for (uint256 i; i < 4; ++i) {
@@ -100,6 +109,24 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         this.exercise(1);
         this.inputFeeAttempt(0);
         this.toggleOutputFee();
+        // Reachability is judged on campaign activity only, not on this warm-up.
+        feeFillsBase = feeFills;
+        inputFeeRejectionsBase = inputFeeRejections;
+    }
+
+    /// Runs one successful fill with the output-token protocol fee on, then restores the prior fee state.
+    function feeFill(uint256 seed) external {
+        require(msg.sender == address(handler) || msg.sender == address(this), "handler only");
+        bool previous = outputFeeOn;
+        if (!previous) {
+            outputFeeOn = true;
+            reactor.setProtocolFeeController(address(outputFee));
+        }
+        this.exercise(seed / 7 * 7 + seed % 2); // action 0 or 1: a fill that must succeed
+        if (!previous) {
+            outputFeeOn = false;
+            reactor.setProtocolFeeController(address(0));
+        }
     }
 
     /// Switches the reactor's protocol fee (5 bps of the trader output) on or off.
@@ -120,7 +147,10 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         uint256 beforeBitmap = XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8);
         try filler.fill(signed, m.key) {
             fail("input-fee fill succeeded");
-        } catch {
+        } catch (bytes memory err) {
+            assertEq(
+                bytes4(err), MercuriOrderFiller.InvalidOrder.selector, "input-fee fill reverted for another reason"
+            );
             inputFeeRejections++;
         }
         assertEq(IERC20(USDC).balanceOf(trader), beforeUSDC, "input-fee fill spent input");
@@ -235,8 +265,8 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         assertGe(successfulFills, 8, "warmup did not exercise all routes");
         assertGt(cancellations, 0);
         assertGt(expectedFailures, 0);
-        assertGt(feeFills, 0, "output-fee fills unreachable");
-        assertGt(inputFeeRejections, 0, "input-fee rejections unreachable");
+        assertGt(feeFills, feeFillsBase, "campaign never ran an output-fee fill");
+        assertGt(inputFeeRejections, inputFeeRejectionsBase, "campaign never saw an input-fee rejection");
         assertGe(steps, 13);
     }
 }

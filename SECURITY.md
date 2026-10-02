@@ -12,17 +12,18 @@ the fix moves.
 
 ## Scope
 
-The contracts in `src/` as deployed at the addresses in [`deployments/5042.json`](deployments/5042.json). The
-vendored dependencies under `lib/` are upstream code; report defects in them upstream as well.
+The contract in `src/`, `MercuriOrderFiller`, and the deployment scripts in `script/`. Nothing is deployed yet; once
+it is, the scope is the addresses in the deployment records under `deployments/`. The vendored dependencies under
+`lib/` are upstream code, and Launch's contracts are in their own public repository; report defects in them there as
+well.
 
-Out of scope: the web app, the read API and the hosting, which are not in this repository; and findings that require
-a compromised governance signer, which the security model already treats as a trust boundary rather than a
-defect.
+Out of scope: the web app, the API, the keeper and the hosting, which are not in this repository. Report keeper or
+cosigner behaviour that lets a fill break the filler's guarantees, since that is in scope.
 
 ## What already exists
 
-- Two review passes before deployment, with remediation completed; reports available on request.
-- Reproducible bytecode: `python3 script/verify-runtime.py` after `forge build`.
-- Every configuration change goes through a 48-hour timelock; the only emergency lever is pausing new launches.
+- Release evidence for the filler candidate: `docs/reports/2026-10-02-order-filler-release.md`.
+- Reproducible bytecode: `python3 script/verify-trade-filler.py` after `forge build`.
+- The filler is immutable, with no owner, pause, upgrade or rescue path; only the configured keeper can call `fill`.
 
-No professional third-party audit has been performed yet.
+No independent review or professional third-party audit has been performed yet.

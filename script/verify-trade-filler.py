@@ -537,6 +537,24 @@ def run_preflight(manifest, allowed_pending, rehearsal=False):
     return not problems and not blocked
 
 
+ANVIL_ACCOUNTS = {a.lower() for a in (
+    '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266', '0x70997970C51812dc3A010C7d01b50e0d17dc79C8',
+    '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC', '0x90F79bf6EB2c4f870365E785982E1f101E93b906',
+    '0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65', '0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc',
+    '0x976EA74026E726554dB657fA54763abd0C3a0aa9', '0x14dC79964da2C08b23698B3D3cc7Ca32193d9955',
+    '0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f', '0xa0Ee7A142d267C1f36714E4a8F75612F20a79720',
+)}
+
+
+def rehearsal_choice(deployment, key):
+    """Under --rehearsal an owner choice is the record's value, and it must be one of anvil's public accounts."""
+    value = deployment.get(key)
+    if not is_address(value) or value.lower() not in ANVIL_ACCOUNTS:
+        raise SystemExit(f'rehearsal {key} {value!r} is not one of anvil\'s default accounts')
+    print(f'WARNING: LOCAL REHEARSAL; {key} is the anvil account {value}')
+    return value
+
+
 def required_reactor_fields(deployment, reactor_only):
     """The deployment record keys a live run needs."""
     keys = ['reactor', 'reactorFeeOwner', 'reactorFeeController'] + ([] if reactor_only else ['filler', 'feeRecipient'])
@@ -595,6 +613,14 @@ def preflight_self_test():
             print(f'deployment record (reactor-only={reactor_only}) refused: {error}')
             accepted = False
         ok &= accepted == good
+    # A rehearsal owner choice must be one of anvil's public accounts, never another address.
+    try:
+        rehearsal_choice({'feeRecipient': '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC'}, 'feeRecipient')
+        rehearsal_choice({'reactorFeeOwner': base['reactorFeeOwner']}, 'reactorFeeOwner')
+        print('rehearsal owner that is not an anvil account: NOT refused')
+        ok = False
+    except SystemExit as error:
+        print(f'rehearsal owner that is not an anvil account: refused ({error})')
     return ok
 
 
@@ -652,12 +678,15 @@ def main():
     manifest = load(args.manifest)
     deployment = json.loads(Path(args.deployment).read_text())
     required_reactor_fields(deployment, args.reactor_only)
-    # The reactor step comes before the keeper is chosen (D2 before D3), so only its own choice must be made.
     if args.rehearsal:
         client = rpc_call(args.rpc, 'web3_clientVersion', [])
         if 'anvil' not in client.lower():
             raise SystemExit(f'--rehearsal needs a loopback anvil RPC; {args.rpc} reports {client!r}')
-    if not run_preflight(manifest, ('executionFee', 'feeRecipient') if args.reactor_only else (), args.rehearsal):
+    # The reactor step precedes the keeper choice (D2 before D3); a rehearsal takes both owner choices from the record.
+    allowed = ('executionFee', 'feeRecipient') if args.reactor_only else ()
+    if args.rehearsal:
+        allowed += ('reactorFeeOwner', 'feeRecipient')
+    if not run_preflight(manifest, allowed, args.rehearsal):
         raise SystemExit('preflight failed; nothing was read from the chain')
     chain = int(rpc_call(args.rpc, 'eth_chainId', []), 16)
     if chain != manifest['chainId']:
@@ -669,10 +698,13 @@ def main():
     def code(address):
         return bytes.fromhex(rpc_call(args.rpc, 'eth_getCode', [address, tag]).removeprefix('0x'))
 
-    owner = required_owner(manifest, deployment)
+    owner = rehearsal_choice(deployment, 'reactorFeeOwner') if args.rehearsal else required_owner(manifest, deployment)
     ok = verify_reactor(args, manifest, owner, tag, code(deployment['reactor']))
     if not args.reactor_only:
-        fee_recipient = required_fee_recipient(manifest, deployment)
+        if args.rehearsal:
+            fee_recipient = rehearsal_choice(deployment, 'feeRecipient')
+        else:
+            fee_recipient = required_fee_recipient(manifest, deployment)
         filler = load('out/MercuriOrderFiller.sol/MercuriOrderFiller.json')
         values = manifest_values(manifest, deployment['reactor'], fee_recipient)
         ok &= verify('filler', 'filler', filler, values, code(deployment['filler']))
@@ -683,7 +715,7 @@ def main():
         print(f'reactor owner {onchain} != manifest reactorFeeOwner {owner}')
         ok = False
     else:
-        print(f'reactor owner {onchain} matches the manifest')
+        print(f'reactor owner {onchain} matches the expected owner')
     word = rpc_call(args.rpc, 'eth_call', [{'to': deployment['reactor'], 'data': FEE_CONTROLLER_SELECTOR}, tag])
     ok &= check_fee_controller(word, manifest, deployment)
     sys.exit(0 if ok else 1)

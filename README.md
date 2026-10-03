@@ -73,8 +73,10 @@ refuses to run until it is set.
    until it is filled.
 2. **Cosign.** At fill time the keeper cosigns the order, exclusive to this filler, and calls `fill` with the one
    USDC pool to use. Only the configured keeper can call `fill`.
-3. **Settle.** The reactor checks the signature, nonce and deadline and calls back. The filler swaps on that pool
-   through the Universal Router: a Launch pool pays Launch's hook fee, any other USDC pool pays the app fee.
+3. **Settle.** The filler first refuses, with a typed error and before the reactor runs, an order the trader has
+   made unfillable since the keeper checked it: a passed deadline, a used nonce, or too little input balance or
+   Permit2 allowance. The reactor then checks the signature, nonce and deadline and calls back. The filler swaps on
+   that pool through the Universal Router: a Launch pool pays Launch's hook fee, any other USDC pool pays the app fee.
 4. **Pay out.** The trader receives every output above what the reactor takes; a fixed USDC execution fee goes to
    the keeper. If the trader's balance did not rise by the signed minimum, the whole fill reverts and no fee is paid.
 
@@ -82,7 +84,7 @@ refuses to run until it is set.
 
 | File | Role | Mutability |
 | --- | --- | --- |
-| [`MercuriOrderFiller.sol`](src/MercuriOrderFiller.sol) | The filler the keeper uses against the UniswapX reactor. Builds a single-pool swap, enforces net output and full input consumption, hands all surplus to the signed trader and pays the execution fee. No owner, pause, upgrade or rescue path. | immutable, not deployed |
+| [`MercuriOrderFiller.sol`](src/MercuriOrderFiller.sol) | The filler the keeper uses against the UniswapX reactor. Refuses an order the trader has made unfillable before the reactor runs, builds a single-pool swap, enforces net output and full input consumption, hands all surplus to the signed trader and pays the execution fee. No owner, pause, upgrade or rescue path. | immutable, not deployed |
 
 The one Universal Router entry point the filler calls is in [`interfaces/IOrderSwapRouter.sol`](src/interfaces/IOrderSwapRouter.sol).
 

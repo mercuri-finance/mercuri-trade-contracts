@@ -8,7 +8,7 @@ The 29 Sep report `docs/reports/2026-09-29-filler-assurance.md` predates the ren
 
 | Requirement | Baseline | Candidate | Command / artifact | Result | Open gap |
 | --- | --- | --- | --- | --- | --- |
-| Source revision | `d84519d3e451146ef3b53fe32358db226c588ac3` (29 Sep candidate; `LocalOrderFiller`) | branch `orders/late-cosign`, HEAD `25beac0c06967d3fea486147e1d6f1c13ea2c5ca`, clean tree at the gate run, local only (not pushed). This report row was updated in the commit after `25beac0`; no code changed in that commit | `git rev-parse HEAD`, `git status --short` (empty), `git log --oneline d84519d..HEAD` | Commits through `4be3452` as reviewed in this packet (bc4047b rename, d43c0b5 output-token fees, c3371ea invariant reachability, ea78ad8 expiry curve, b794a9c deploy package, 4be3452 deploy guards), then `74cfb76` (local keeper test export, test-only), `c52acb4` (NatSpec on the four custom errors; runtime and creation bytecode unchanged with `bytecode_hash = none`, gas snapshot unchanged) and `25beac0` (verifier reactor function-pointer self-test, script-only) | The final tag/SHA to deploy is PENDING; any further commit invalidates this packet. Revision update (self-funding round): `01d4edb` adds the execution fee (section 15); `48bbf65` is a NatSpec-only fix; later E2 commits are tests, verifier and report only. Final review fix (R39, section 16): `81cd88c` restricts `fill` to the keeper; this report was updated in the commit after `81cd88c` (docs only). Final code HEAD for review: `81cd88c`. Style conformance (section 17): `a59eabb` (filler NatSpec and layout, bytecode byte-identical), `19f5bf4` (scripts), `fcf70c0` (test headers), `cea3257` (docs), then fix round 1 `dfbbf30` (filler NatSpec, bytecode byte-identical), `61d033a` (scripts), `0a95f2a` (docs), then polish `cecc15d` (one filler comment, SECURITY reflow, bytecode byte-identical); this report was updated in the commit after `cecc15d`. The filler `src/` sha256 was `0f11784d154599cd20664a6f888e2c2bc6bbd25fc1d6faa3f2676659528f5b78` at `cecc15d` (`f728729c…f0ad` at `dfbbf30`, `1b7aa366…4514` at `a59eabb`, `9ce08495…3820` at `81cd88c`). Audit fix round (section 18), from `2873bf3`: `a21cb41` (F1 native refund), `653826e` (TRD-07 errors), `0000950` (TRD-08 interface), `e6fadd9` (F2 fee controller), `b613a07` (TRD-01 timelock owner), `6f2db4a` (ECON-02 fee), `8ce9f66` (F5 cross-checks, mainnet manifest), `7689e35` (TRD-04 record writer), `a6e648f` (rehearsal verification), `dad40b3` (TRD-06 invariant), `0db36d2` (docs); this report was updated in the commit after `0db36d2`. Final code HEAD for review: `0db36d2`. Sources now: `src/MercuriOrderFiller.sol` sha256 `0550d570d79be40bdc38019e6b51a752e980a007aebb09ecdcdae210051efa75`, `src/interfaces/IOrderSwapRouter.sol` sha256 `a8cffdb5307ab46c5fe166d5a291971835cc73af2cb6813458bb2aad5a96019b` |
+| Source revision | `d84519d3e451146ef3b53fe32358db226c588ac3` (29 Sep candidate; `LocalOrderFiller`) | branch `orders/late-cosign`, HEAD `25beac0c06967d3fea486147e1d6f1c13ea2c5ca`, clean tree at the gate run, local only (not pushed). This report row was updated in the commit after `25beac0`; no code changed in that commit | `git rev-parse HEAD`, `git status --short` (empty), `git log --oneline d84519d..HEAD` | Commits through `4be3452` as reviewed in this packet (bc4047b rename, d43c0b5 output-token fees, c3371ea invariant reachability, ea78ad8 expiry curve, b794a9c deploy package, 4be3452 deploy guards), then `74cfb76` (local keeper test export, test-only), `c52acb4` (NatSpec on the four custom errors; runtime and creation bytecode unchanged with `bytecode_hash = none`, gas snapshot unchanged) and `25beac0` (verifier reactor function-pointer self-test, script-only) | The final tag/SHA to deploy is PENDING; any further commit invalidates this packet. Revision update (self-funding round): `01d4edb` adds the execution fee (section 15); `48bbf65` is a NatSpec-only fix; later E2 commits are tests, verifier and report only. Final review fix (R39, section 16): `81cd88c` restricts `fill` to the keeper; this report was updated in the commit after `81cd88c` (docs only). Final code HEAD for review: `81cd88c`. Style conformance (section 17): `a59eabb` (filler NatSpec and layout, bytecode byte-identical), `19f5bf4` (scripts), `fcf70c0` (test headers), `cea3257` (docs), then fix round 1 `dfbbf30` (filler NatSpec, bytecode byte-identical), `61d033a` (scripts), `0a95f2a` (docs), then polish `cecc15d` (one filler comment, SECURITY reflow, bytecode byte-identical); this report was updated in the commit after `cecc15d`. The filler `src/` sha256 was `0f11784d154599cd20664a6f888e2c2bc6bbd25fc1d6faa3f2676659528f5b78` at `cecc15d` (`f728729c…f0ad` at `dfbbf30`, `1b7aa366…4514` at `a59eabb`, `9ce08495…3820` at `81cd88c`). Audit fix round (section 18), from `2873bf3`: `a21cb41` (F1 native refund), `653826e` (TRD-07 errors), `0000950` (TRD-08 interface), `e6fadd9` (F2 fee controller), `b613a07` (TRD-01 timelock owner), `6f2db4a` (ECON-02 fee), `8ce9f66` (F5 cross-checks, mainnet manifest), `7689e35` (TRD-04 record writer), `a6e648f` (rehearsal verification), `dad40b3` (TRD-06 invariant), `0db36d2` (docs); this report was updated in the commit after `0db36d2`. Final code HEAD for review: `0db36d2`. Sources now: `src/MercuriOrderFiller.sol` sha256 `0550d570d79be40bdc38019e6b51a752e980a007aebb09ecdcdae210051efa75`, `src/interfaces/IOrderSwapRouter.sol` sha256 `a8cffdb5307ab46c5fe166d5a291971835cc73af2cb6813458bb2aad5a96019b`. Early guard (section 19): `63c1f11` (code, tests, gas snapshot, manifest), then docs and this report in the commit after it; `src/MercuriOrderFiller.sol` sha256 now `14149bd68af46a7282e8849d53107432e5ad453a52d5939b586e90438ee12bf9`, isolated re-audit pending |
 | Compiler and settings | solc 0.8.26, cancun, via-IR, optimizer, `bytecode_hash=none`; `src/**` compiled at optimizer_runs 200 | Unchanged except `fs_permissions` gained `read ./deployments` | `foundry.toml`; forge 1.4.3-Homebrew | Same compiler, EVM and optimizer settings as baseline; the only `foundry.toml` diff is the `./deployments` read permission (needed by deploy-script tests) | None |
 | Filler runtime size | 7,542 bytes (29 Sep report) | 10,569 bytes (below EIP-170 limit of 24,576) | `script/verify-trade-filler.py --self-test` | 10,602 bytes, keccak `0x0c151c4de9dab6d48929bba85283709a4c26ce01611edb301dc788caace454a5` in the self-test (`81cd88c`, with the keeper-only check); 10,569 bytes at `48dd683` and 9,838 bytes before the execution fee. The fork-rehearsal keccak in section 9 predates the fee and is stale | Growth from 7,542 bytes (+3,027) is not individually attributed; PENDING |
 | Filler source hash | recorded for `LocalOrderFiller.sol` | `src/MercuriOrderFiller.sol` sha256 `0f11784d154599cd20664a6f888e2c2bc6bbd25fc1d6faa3f2676659528f5b78` at `cecc15d` (the current `source-manifest.json` value; comment and layout only, section 17; `f728729c…f0ad` at `dfbbf30`; `1b7aa366…4514` at `a59eabb`; `9ce084954969d3a876385e7ec278eeb1204bb7dfc5ceeb7d15208577a3b63820` at `81cd88c`; `c0d2ff5e…2116` at `48dd683`; earlier `459538fa742b3d4f1569ea3546a8f6eb9f02220b09d309703cdb9b52f4af24f1` at `c52acb4`, before the execution fee) | `source-manifest.json`, `python3 script/check-local-source.py` | Pass inside gate | None |
@@ -431,3 +431,146 @@ embed the filler); snapshot check 105 passed, 1 skipped. The `--stress` run was 
 
 Open for the go step, unchanged except as stated: the owner chooses `feeRecipient` (D3); the mainnet manifest's
 `executionFee` and `feeRecipient`; the real deployment, record and verification; real-chain fill gas.
+
+## 19. Addendum: early guard (hybrid griefing defence)
+
+The owner approved a two-part ("hybrid") defence against traders who make a keeper's fill revert on chain after the
+keeper simulated it: an early guard in the filler (this section) and revert classification with trust lanes in the
+keeper (backend code, not in this repository). The guard is commit `63c1f11` on `orders/late-cosign`, from `a2062a3`.
+Nothing was broadcast and no transaction was sent to any network; `deployments/5042002.json` still does not exist.
+**An isolated re-audit of this change is pending**; the independent review of section 18 does not cover it.
+
+### The change
+
+Before calling `reactor.executeWithCallback`, `fill` runs `_requireFundable` on the order it already decodes with the
+pinned `V3DutchOrder` ABI (no hand-rolled offsets). It reverts with a new typed error when:
+
+| Error | Guard condition | Condition the reactor or Permit2 already refuses |
+| --- | --- | --- |
+| `OrderExpired()` | `order.info.deadline < block.timestamp` | `V3DutchOrderReactor._validateOrder`: `DeadlineReached` on the same comparison (Permit2's `SignatureExpired` is `block.timestamp > deadline`, the same set) |
+| `NonceUsed()` | `nonceBitmap(swapper, nonce >> 8) & (1 << (nonce & 0xff)) != 0` on the filler's `permit2` | Permit2 `_useUnorderedNonce`: `InvalidNonce` when that bit is already set. `DeployOrderFiller._requireReactor` requires `reactor.permit2()` to be the filler's `permit2` |
+| `SwapperBalanceTooLow()` | `input.balanceOf(swapper) < amount` | Permit2 transfers `requestedAmount = order.input.amount` with solmate `safeTransferFrom`; an ERC-20 refuses a transfer above the balance |
+| `SwapperAllowanceTooLow()` | `input.allowance(swapper, permit2) < amount` | The same transfer is refused above the trader's allowance to Permit2 |
+
+`amount` is the input the reactor resolves for this block, computed by `_inputAmount` as `V3DutchOrderReactor._resolve`
+does: the cosigned `inputAmount` when nonzero (a cosigned input above the signed start is left for the reactor's
+`InvalidCosignerInput`), the base-fee adjustment (`_computeDelta`'s rounding with solmate `mulDivDown`/`mulDivUp`, then
+`MathExt.boundedAdd(…, 0, maxAmount)`), then `NonlinearDutchDecayLib.decay(V3DutchInput, decayStartBlock, block.number)`.
+The decay, bounded arithmetic and mulDiv are the upstream library functions from the pinned 34-file closure; the two
+reactor-internal steps (cosigned override and base-fee delta) are re-stated in the filler because they are not library
+functions, and their equivalence is tested differentially (below). `block.number` is the reactor's block number on
+every chain but Arbitrum's (`BlockNumberish`), Arc included. On Mercurifi's own order shape (fixed input: start = max,
+no input curve, no adjustment, no cosigned input; the backend refuses any other) `amount` is the signed input.
+
+What does not change: the guard reads only the order's info and input side and never writes or mutates the decoded
+order (the emitted `orderHash` is unchanged, `test_fillEmitsOrderFilled`). Fee, signed minimum, exclusivity, output
+override, surplus and `NetMinimumNotMet` rules are untouched. It runs on every fill: `fill` is the only entry point and
+the guard sits after `NotKeeper`, `Reentered` and `InvalidOutputs`, before `active` is set.
+
+Only earlier, never looser: every guard revert is a condition under which the reactor or Permit2 would revert anyway at
+the same bound, and the guard adds no path to success. Its external calls are static (`view`): the trusted Permit2's
+bitmap and the input token's `balanceOf` and `allowance`. A malicious input token can (a) overstate its views: the
+guard passes and Permit2's transfer fails as before; (b) understate them or revert: the fill reverts earlier, which
+blocks only that token's own orders, and `fill` already called the token's `balanceOf` before this change; (c) burn gas
+in a view: bounded by the gas limit the keeper sets for a transaction it chose to send after simulating it. No gas-capped
+low-level call was added; the keeper's choice of order and gas limit is the bound, as for the existing `balanceOf`.
+
+### Tests
+
+New `test/integration/UniswapXFillerGuard.t.sol` (9 tests) and the test-only `test/utils/InputProbe.sol` and
+`test/utils/MisreportingTradeToken.sol`:
+
+| Test | What it shows |
+| --- | --- |
+| `test_guardRefusesEachGriefOnEveryPath` | Launch and listed pool, buy and sell (4 paths) x 4 griefs: the keeper's simulation fills; after the grief (balance or allowance left exactly one unit short, nonce cancelled, deadline passed) `fill` reverts with the typed error, trader input and output, keeper and app fee balances are unchanged, and the nonce is untouched unless the grief cancelled it |
+| `test_guardMovedBalance`, `test_guardRevokedAllowance`, `test_guardInvalidatedNonce`, `test_guardExpiredOrder` | One griefing path each, on different routes |
+| `test_guardExactBoundariesStillFill` | On all 4 paths, balance and allowance exactly the input and a fill at the deadline's own second still fill and take exactly the input: the guard is not stricter than the reactor |
+| `test_guardRefusesReplay` | A filled order's replay reverts `NonceUsed` |
+| `testFuzz_guardAmountMatchesReactor` | Differential: fuzzed start, max, cosigned input, base-fee adjustment, starting and current base fee, a two-point input curve, decay start and elapsed blocks. `InputProbe` lets the reactor resolve the order and reverts from the callback with the resolved input `R`. Then allowance `R - 1` reverts `SwapperAllowanceTooLow`, balance `R - 1` reverts `SwapperBalanceTooLow`, and exactly `R` of each fills and takes exactly `R`. So the guard's amount equals the reactor's. 513 runs at seed `0x5042`; an instrumented 300-run sample (seed `0x77`) resolved 322 orders, rejected 21 below the 1 USDC floor, and had 292 where the curve, adjustment or cosigned input moved the amount off the signed start (212 above it, 150 with a nonzero adjustment) |
+| `test_guardMisreportingTokenNeverFillsWrongly` | Overstated balance with nothing held and overstated allowance with the approval revoked: the guard passes and the reactor refuses (`TRANSFER_FROM_FAILED`), nonce unused. Understated views: `SwapperBalanceTooLow`, nothing moves. Reverting views: the fill reverts. The honest control fills |
+
+Existing tests need no change: those that cancel a nonce, pass the deadline or replay used a bare `vm.expectRevert()`.
+The invariant handler's cancellation, expiry and replay actions still see a failed fill with no movement.
+
+### Gas
+
+`test/integration/UniswapXFillerGriefGas.t.sol` measures the same order on the listed pool, ungriefed and after each
+grief, with one low-level call from the keeper and `vm.lastCallGas().gasTotalUsed`, under `forge test --isolate`. In
+isolation forge runs that call as its own transaction with cold accounts and slots, and `gasTotalUsed` is the whole
+transaction: intrinsic 21,000, calldata and execution. Checked with a 4-byte view call on the filler: 21,331 isolated
+= 21,000 + 64 calldata + 267 execution, 267 without isolation. Calldata is 11,064 (buy) and 11,076 (sell) gas of each
+figure. The test does not depend on the revert reason, so "before" is the same file run against `a2062a3`'s source.
+USDC in the fixture is `NativeUsdcShim`, whose transfers use cheatcodes and a CREATE, so the successful fill's absolute
+figure is not Arc's; its difference is.
+
+| Path (transaction gas, `--isolate`) | Before `a2062a3` | Reverts with | After `63c1f11` | Reverts with | Change |
+| --- | --- | --- | --- | --- | --- |
+| Buy, balance moved | 155,858 | `TRANSFER_FROM_FAILED` | 54,171 | `SwapperBalanceTooLow` | -101,687 |
+| Buy, Permit2 approval revoked | 155,613 | `TRANSFER_FROM_FAILED` | 57,375 | `SwapperAllowanceTooLow` | -98,238 |
+| Buy, nonce invalidated | 128,880 | `InvalidNonce` | 46,707 | `NonceUsed` | -82,173 |
+| Buy, deadline passed | 101,291 | `DeadlineReached` | 40,932 | `OrderExpired` | -60,359 |
+| Sell, balance moved | 155,831 | `TRANSFER_FROM_FAILED` | 53,797 | `SwapperBalanceTooLow` | -102,034 |
+| Sell, Permit2 approval revoked | 153,571 | `TRANSFER_FROM_FAILED` | 57,070 | `SwapperAllowanceTooLow` | -96,501 |
+| Sell, nonce invalidated | 129,278 | `InvalidNonce` | 46,719 | `NonceUsed` | -82,559 |
+| Sell, deadline passed | 101,689 | `DeadlineReached` | 40,944 | `OrderExpired` | -60,745 |
+| Buy, successful fill | 506,839 | | 511,849 | | +5,010 |
+| Sell, successful fill | 549,017 | | 554,210 | | +5,193 |
+
+Every griefed revert is now 41k to 57k gas for the whole transaction, below the 60k to 70k target; about a fifth of
+each is calldata. The owner's figure for such a revert on chain, about 300k, was not measured here; real-chain gas
+remains open.
+
+`.gas-snapshot`: 106 rows before, 116 after (the nine guard tests and the two gas tests). Across the 106 common rows
++5,288,520 gas (+0.821%). A successful fill costs +5,010 (buy) or +5,193 to 5,194 (sell); a revert that reaches the
+reactor +5,003. `test_orderMercuriBuy`, `…Sell`, `test_orderOtherBuy` and `…Sell` (both fee suites) fall 56,466 to
+56,763 because their closing replay now fails at `NonceUsed`; `test_execFeeNotPaidOnRevert` falls 145,758 (its
+cancelled, expired and replayed orders now fail early). Tests that deploy extra fillers rise with the larger creation
+code (up to +1,287,195 for `test_execFeeReentrantKeeperCannotDoublePay`). `forge snapshot --check` passes.
+
+### Bytecode identity
+
+Hashes are `shasum -a 256` of `forge inspect MercuriOrderFiller deployedBytecode` / `bytecode` output, as in
+section 18 (raw-byte sha256 in brackets).
+
+| | Before (`a2062a3`, = `0db36d2`) | After (`63c1f11`) |
+| --- | --- | --- |
+| Runtime | 10,971 bytes, `071edbcdc7e498dd6820bc35fcc0684bd320fab5e97cf431edab8b9d3c449bce` (raw `60cddff4…2953`) | 13,062 bytes, `9b55039d6672ccbe6ffbf2aee1b5f97ddcb1d8554b0303af066b3ae612ecd327` (raw `077f275103afe6dfeb18e526b215027c267fb4541a68684680fdd2509dbfdb30`) |
+| Creation | 11,640 bytes, `6237ea72059a3e96eb7e9cb8f265e204591f616238cb6188699f4cf1f371da87` (raw `b8bbf3c0…9879`) | 13,738 bytes, `48324df63c1329ddb4c3b32295977978447d0a854615479fb45e9a7f43f88b6d` (raw `5fbb209b4807e165f6f1d87292350505d76be8a82ba9f586cc11e6c6c83398e2`) |
+| Self-test keccak (manifest immutables) | `0x3c593855e5be7eb03741e17c661633382268998e06c189ecf7e07b35560a1610` | `0x7c91e0016c4479ee370f298ae33c64dbc973037601ce0fccf14128a7abf46ace` |
+| `src/MercuriOrderFiller.sol` sha256 | `0550d570…fa75` | `14149bd68af46a7282e8849d53107432e5ad453a52d5939b586e90438ee12bf9` (in `source-manifest.json`) |
+
+The runtime grows 2,091 bytes (still below EIP-170's 24,576): the upstream decay, `Uint16Array`, bounded-math and
+mulDiv code the reactor already uses. Same compiler, settings and pins; no `lib/` change (the closures still match).
+
+ABI: errors `OrderExpired`, `NonceUsed`, `SwapperBalanceTooLow` and `SwapperAllowanceTooLow` added. The ABI now also
+lists the upstream library errors `InvalidDecayCurve()` and `IndexOutOfBounds()`, which the guard can raise only for an
+order whose input curve the reactor would refuse with the same error. Functions, events and the constructor are
+unchanged. Any ABI copy, such as the backend's, must be regenerated (`forge inspect MercuriOrderFiller abi --json`); the
+backend's self-caused selector list (`SwapperBalanceTooLow()`, `SwapperAllowanceTooLow()`, `NonceUsed()`) matches these
+names. `order_expiring.json` does not embed the filler and is unchanged (`25fbc6bc…1f79`).
+
+forge-lint reports, on the new filler lines, `incorrect-shift` on `1 << (nonce & 0xff)` (a false positive: the
+literal is the value shifted, as in Permit2's own `1 << bitPos`), `unsafe-typecast` on the two `int256(...)` casts,
+which mirror `_computeDelta` exactly, including where it would revert, and `named-struct-fields`. The existing filler
+already carries the same kinds of notes.
+
+### Gates at `63c1f11`
+
+`TRADE_VECTOR_BACKEND=<backend copy> TRADE_VECTOR_WEBUI=<web app copy> bash script/check-contracts.sh`: exit 0, about
+10 s with a warm build. Upstream sources 110 and 34 match; source manifest (two files) matches; `forge fmt --check`
+clean; NatSpec 34 ABI entries, 0 failures; preflight clean for both manifests (testnet pending `feeRecipient`, mainnet
+pending `executionFee` and `feeRecipient`) and a pending choice refused without `--allow-pending`; verifier self-tests
+ok (13,062-byte runtime MATCH; flipped `usdc`, `executionFee`, `feeRecipient` and reactor pointer bytes each reported by
+name); record writer self-test 18/18; `forge test --fuzz-seed 0x5042` 149 passed, 0 failed, 4 skipped (14 suites);
+`order_expiring.json` identical in the three places (`25fbc6bc74d97ca6bb4ec137b9fc1ea5c464d20ade41c885ef24c2a35d1d1f79`);
+snapshot check 115 passed, 1 skipped.
+
+Invariants: 40 unseeded campaigns of `test/invariant/*` at the default 64 runs x 64 depth with `fail_on_revert`, each
+with a fresh `FOUNDRY_INVARIANT_FAILURE_PERSIST_DIR`: 40 of 40 passed, 4,096 calls and 0 reverts per invariant in each.
+The `--stress` run was not repeated for this round.
+
+The e2e fixture was regenerated with `TRADE_EXPORT_STATE=true forge test --match-contract TradeLocalStateTest
+--match-test test_exportState` (`test-export/` is not tracked).
+
+Open: the isolated re-audit of `63c1f11`; real-chain gas of a griefed and a successful fill; the backend's ABI copy;
+and, unchanged, the go-step items of section 18.

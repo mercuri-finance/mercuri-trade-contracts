@@ -46,6 +46,39 @@ Limits a reviewer should know:
 - On Arc native value is USDC. The reactor refunds its whole native balance to the filler after every fill; the filler
   accepts it from the reactor only, never pays it out, and has no way to return it.
 
+## Griefing defence
+
+The keeper pays the gas of every fill it sends, including one that reverts. Between the keeper's simulation and the
+transaction's inclusion a trader can make a cosigned fill revert: move the input tokens away, revoke the input token's
+approval to Permit2, cancel the order's Permit2 nonce, or let the deadline pass. Before this guard such a fill failed
+deep inside the reactor, at Permit2's input transfer, after the order had been decoded, hashed and its cosignature
+checked. Two layers answer it:
+
+- **On chain, the early guard.** `fill` decodes the order and, before calling the reactor, refuses it with a typed
+  error if the deadline has passed (`OrderExpired`), the Permit2 nonce bit is set (`NonceUsed`), or the trader's input
+  balance (`SwapperBalanceTooLow`) or allowance to Permit2 (`SwapperAllowanceTooLow`) is below the exact amount the
+  reactor would take in that block (the cosigned input, the base-fee adjustment and the input curve, resolved as the
+  reactor resolves them). The guard only reads, runs on every fill, and can only make a fill revert earlier: each of
+  its conditions is one the reactor or Permit2 would refuse anyway, at the same bound, so it changes no fee, minimum,
+  exclusivity or surplus rule. On the local fixture a griefed fill now costs about 41k to 57k gas for the whole
+  transaction, against about 101k to 156k before (release report, section 19).
+- **Off chain, the keeper's lanes.** The keeper classifies each revert by its selector. `SwapperBalanceTooLow`,
+  `SwapperAllowanceTooLow` and `NonceUsed` are caused by the trader; `OrderExpired` is not (the deadline was signed up
+  front). Wallets without a clean fill history trade in a probation lane with one order in flight and their own revert
+  budget, a self-caused revert bans the wallet for escalating periods, and the keeper keeps a griefing reserve in its
+  self-funding ledger. This is keeper code, outside this repository.
+
+Residual risk:
+
+- The guard makes a griefed fill cheap, not impossible: each grief still costs the keeper one small reverted
+  transaction. Bounding how many is the keeper lanes' job.
+- A fill that passes the guard can still revert later at full cost for reasons the trader does not control directly
+  (price moved past the signed minimum, liquidity) or through an input token with unusual behaviour.
+- The input token's `balanceOf` and `allowance` are called as static calls. A token whose views overstate passes the
+  guard and fails in Permit2 as before; one whose views understate or revert only blocks its own orders; their gas is
+  bounded by the transaction the keeper chose to send. `fill` already called that token's `balanceOf` before the guard.
+- The guard reads the filler's own `permit2`; the deployment script requires it to be the reactor's Permit2.
+
 ## Pause and recovery
 
 The filler has no pause. Fills stop when the keeper stops cosigning and stops calling `fill`, which is the incident
@@ -79,5 +112,5 @@ by the contract.
   deployment records.
 - The filler is immutable, with no owner, pause, upgrade or rescue path; only the configured keeper can call `fill`.
 
-An independent review was performed on 3 October 2026 (release report, section 18); no professional third-party audit
-has been performed yet.
+An independent review was performed on 3 October 2026 (release report, section 18); the early guard added after it
+(section 19) awaits its own isolated re-review. No professional third-party audit has been performed yet.

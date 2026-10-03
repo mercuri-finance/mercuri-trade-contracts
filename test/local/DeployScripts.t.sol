@@ -85,7 +85,7 @@ contract DeployScriptsTest is Test {
         assertEq(vm.parseJsonAddress(manifest, ".reactorFeeOwner"), vm.parseJsonAddress(launchRecord, ".timelock"));
         assertEq(vm.parseJsonAddress(manifest, ".reactorFeeOwner"), 0x41129B5215cA24b29a4cABcaE26d3569744DEe2E);
         assertEq(vm.parseJsonString(manifest, ".feeRecipient"), "REQUIRED_AT_D3_OWNER_GO");
-        assertEq(vm.parseJsonUint(manifest, ".executionFee"), 30_000);
+        assertEq(vm.parseJsonUint(manifest, ".executionFee"), 50_000);
     }
 
     function test_feeRecipientSentinelRefused() public {

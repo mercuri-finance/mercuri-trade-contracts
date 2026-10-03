@@ -102,7 +102,7 @@ Fixed in the filler's bytecode at deployment; a change means a new filler.
 | Parameter | Value |
 | --- | --- |
 | App fee | 50 bps of the USDC side on listed pools (`APP_FEE_BPS`); none on Launch pools, which pay Launch's hook fee. On a buy it is computed on the gross signed input, which includes the execution fee |
-| Execution fee | at most 0.10 USDC (`MAX_EXECUTION_FEE`); the testnet manifest sets 0.03 USDC; zero disables it |
+| Execution fee | at most 0.10 USDC (`MAX_EXECUTION_FEE`); the testnet manifest sets 0.05 USDC; zero disables it |
 | Execution fee recipient | the keeper's transaction address, also the only address allowed to call `fill` |
 | App fee recipient | the treasury, the same one Launch uses |
 

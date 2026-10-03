@@ -43,9 +43,10 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
     /// The keeper's transaction address: the fixed execution-fee recipient.
     address internal feeRecipient = makeAddr("keeper");
 
-    /// The execution fee of the filler under test (spec D13 default). Suites override it to rerun at another fee.
+    /// The execution fee of the filler under test: the testnet manifest value (ECON-02). Suites override it to rerun
+    /// at another fee.
     function _executionFee() internal view virtual returns (uint256) {
-        return 30_000;
+        return 50_000;
     }
 
     function _orderChainID() internal view virtual returns (uint256) {
@@ -826,7 +827,7 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
         assertEq(atMax.executionFee(), MAX_FEE);
         assertEq(atMax.feeRecipient(), feeRecipient);
         assertEq(_newFiller(0).executionFee(), 0);
-        assertEq(filler.executionFee(), 30_000, "harness default (spec D13)");
+        assertEq(filler.executionFee(), 50_000, "harness default: the manifest value");
     }
 
     function test_execFeeConstructorRejectsZeroRecipient() public {

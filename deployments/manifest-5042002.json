@@ -7,6 +7,6 @@
   "appRecipient": "0xc914763d1652931dc3874B75387B3886aBAcF891",
   "reactorFeeOwner": "0x41129B5215cA24b29a4cABcaE26d3569744DEe2E",
   "reactorFeeController": "0x0000000000000000000000000000000000000000",
-  "executionFee": 30000,
+  "executionFee": 50000,
   "feeRecipient": "REQUIRED_AT_D3_OWNER_GO"
 }

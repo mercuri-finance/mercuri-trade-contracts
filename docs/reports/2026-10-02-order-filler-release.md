@@ -94,7 +94,7 @@ Gas deltas are from `forge snapshot --diff` as reported by each task (seed `0x50
 | Requirement | Baseline | Candidate | Command / artifact | Result | Open gap |
 | --- | --- | --- | --- | --- | --- |
 | Reactor protocol fee in the output token | `outputs.length != 1` reverted `InvalidOrder` whenever a fee controller added a fee output | Any number of outputs is accepted if every one is in the output token with a non-zero recipient; the swap targets their sum, the trader keeps everything above their own minimum | `test_protocolFeeOutputMercuriBuy/Sell`, `...OtherBuy/Sell`, `testFuzz_protocolFeeOutput` (bps 0..5, asserts trader at least the minimum, fee recipient delta equals minimum x bps / 10000, filler balances and allowances zero), `test_feeControllerExpiringRaisedOutputStillFills` | RED then GREEN recorded by A2; 6 tests passed; fuzz 513 runs; gate green | Only buy-direction input fee is tested; sell-direction input fee PENDING (deferred minor). No test pins fee recipient equal to filler or swapper, or multiple fee outputs (correct by inspection) |
-| Input-token fee | Reverts | Still reverts `InvalidOrder`, order stays open, no funds move. A fee in the input token cannot be paid because the whole input is spent on the swap | `test_protocolFeeOnInputFailsWithoutLoss`; invariant `inputFeeAttempt` asserts the selector | Pass locally | This is a liveness limit, not a safety defect: if a reactor owner enables an input-token fee controller, every order on that reactor stops filling until a replacement filler is deployed (spec R4, E11). On the Uniswap-owned mainnet reactor this is outside our control |
+| Input-token fee | Reverts | Still reverts `InvalidOrder`, order stays open, no funds move. A fee in the input token cannot be paid because the whole input is spent on the swap | `test_protocolFeeOnInputFailsWithoutLoss`; invariant `inputFeeAttempt` asserts the selector | Pass locally | This is a liveness limit, not a safety defect: if a reactor owner enables an input-token fee controller, every order on that reactor stops filling until a replacement filler is deployed (spec R4, E11). On the Uniswap-owned mainnet reactor this is outside our control. Superseded by spec D27 (section 20): both networks run our own reactor, owned by Launch's timelock |
 | Controller owner for tests | | `MockFeeController` set by the reactor owner (`setProtocolFeeController` is `onlyOwner`) | A2 report | Confirmed | Whether Uniswap would ever enable a controller on a reactor we do not own is an assumption (R4) |
 | Zero-amount fee output | | Accepted (bps = 0 covered by fuzz) | A2 report | Pass | None |
 
@@ -105,13 +105,17 @@ Gas deltas are from `forge snapshot --diff` as reported by each task (seed `0x50
 | Curve (spec D2) | no expiry curve test | Trader-signed relative blocks `[20, 21]`, relative amounts `[0, -2^128]`. Keeper cosigns with `decayStartBlock` equal to the finalized head. At offset up to +20 the required output is the cosigned value; at +21 the required output exceeds `uint128` and the fill reverts `InvalidOrder`, nonce unused | `test_expiringOrderFillsInsideWindow`, `test_expiringOrderDeadAfterWindow`, `test_expiryBoundarySweep` (0..40 with snapshots), `testFuzz_expiryBoundary` (512 runs default, 10,000 under stress, fills iff offset <= 20; since renamed `testFuzz_exclusiveExpiryBoundary`, see section 14) | Pass. No filler change was needed: the filler already rejects outputs above `uint128` | `test_expiringOrderFillsInsideWindow` alone asserts only no-revert (the fuzz is the stronger check; deferred minor) |
 | Cosigner cannot lower output | | `InvalidCosignerOutput` | `test_cosignerCannotLowerOutput` | Pass | None |
 | Raised output above market | | Router reverts `V4TooLittleReceived(gross+1, gross)`, trader balance and nonce unchanged; raised = gross fills | `test_raisedOutputAboveMarketReverts` | Pass | A raised output at gross is the largest fillable; anything higher fails, which is the intended D4 limit |
-| Condition data in signed order | | `additionalValidationData` set, validation contract zero, still fills | `test_orderWithConditionDataStillFills` | Pass | Reactor ignores the data; the keeper enforces the trigger (D11) |
+| Condition data in signed order | | `additionalValidationData` set, validation contract zero, still fills | `test_orderWithConditionDataStillFills` | Pass | Reactor ignores the data; the keeper enforces the trigger (D11). Superseded by section 20 (D22): the validator checks the condition and refuses the D11 encoding (`test_orderWithLegacyConditionDataRefused`) |
 | Invariant | | `expiring` handler: even seeds at +0..+20 must fill, odd seeds at +21..+40 must revert `InvalidOrder` with input and nonce unchanged | `TradeInvariants.t.sol` | Pass, 52k calls per stress campaign | None |
 | Cross-language vector | | `test-export/trade-orders/order_expiring.json` consumed by backend and web app; SHA-256 `cd325ce75f4091cdc0bed4e0328c6f3937731fe8885adc81d9b805c6d404c631` identical in all three copies at A3 time | `check-contracts.sh` SHA gate with `TRADE_VECTOR_BACKEND` and `TRADE_VECTOR_WEBUI` set | Pass at A3 | The SHA gate was not exercised in the final gate run of this packet (variables unset, it printed the skip notice). Backend and web copies are not committed in their repos yet (B2 and C1). Gate silently skips when only one variable is set (deferred minor) |
 
 Block time and wall-clock figures in the spec ("about 10 s") are not evidenced by this report; they depend on Arc block time (PENDING).
 
 ## 9. Immutability and replacement path (E11)
+
+Superseded in part by section 20 (spec D22, R7): orders now name the filler's validator in the trader's signature, so
+a replacement filler, which comes with its own validator, cannot settle orders signed for the old one
+(`test_execFeeOrderForAnotherFillerRefused`). The rows below describe the candidate before that change.
 
 | Requirement | Baseline | Candidate | Command / artifact | Result | Open gap |
 | --- | --- | --- | --- | --- | --- |
@@ -574,3 +578,221 @@ The e2e fixture was regenerated with `TRADE_EXPORT_STATE=true forge test --match
 
 Open: the isolated re-audit of `63c1f11`; real-chain gas of a griefed and a successful fill; the backend's ABI copy;
 and, unchanged, the go-step items of section 18.
+
+## 20. Addendum: on-chain order validation (spec D21, D22, D27)
+
+The owner's 3 October decisions (spec section 10) move the take-profit and stop-loss condition, the pool and the filler
+into the trader's signature and check them on chain. The code is commit `ea9006f` on `orders/late-cosign`, from
+`0f7dfd4`, then `d48a116` (the verifier reports a missing binding getter cleanly; the validator's NatSpec table is
+re-aligned, bytecode byte-identical); this section and the docs follow in the commit after it. Nothing was broadcast and no transaction was sent to
+any network; every deployment below ran on a loopback anvil fork, and `deployments/5042002.json` still does not exist.
+**An isolated re-audit of this change is pending**; neither the independent review of section 18 nor any other covers
+it.
+
+### The change
+
+| Where | Change | Spec |
+| --- | --- | --- |
+| `src/MercuriOrderValidator.sol` (new) | Implements UniswapX `IValidationCallback.validate(filler, resolvedOrder)`, a view the reactor calls in `_prepare`, before the input transfer. Immutable, no owner, no storage. Immutables `filler` and `poolManager`. Decodes `additionalValidationData` as four words, `abi.encode(uint8 version, uint8 kind, bytes32 poolId, uint160 triggerSqrtPriceX96)`, range-checking each word before narrowing it, so malformed data is a typed refusal, never a decoder revert or panic: length other than 128 bytes or a trigger above 160 bits `InvalidValidationData`, version other than 1 `UnsupportedVersion`, kind above 2 `UnknownKind`, a limit with a nonzero trigger or a take-profit or stop-loss trigger outside `[MIN_SQRT_PRICE, MAX_SQRT_PRICE)` `InvalidTrigger`. Refuses any filler but its own (`WrongFiller`). For kinds 1 and 2 reads the signed pool's `sqrtPriceX96` with v4-core `StateLibrary.getSlot0` (one `extsload`) from the pinned v4-core, refuses an uninitialized pool (`PoolNotInitialized`) and refuses a price that has not reached the trigger (`TriggerNotReached`); a limit is never price-checked | D22 |
+| `src/MercuriOrderFiller.sol` | Constructor gains `IPoolManager poolManager_` (zero refused) and deploys `new MercuriOrderValidator{salt: VALIDATOR_SALT}(address(this), poolManager_)`, stored as the immutable `validator`. `fill` refuses an order whose `additionalValidationContract` is not `validator` (`WrongValidator`), after `InvalidOutputs` and before the early guard and the reactor. `reactorCallback` refuses a pool whose `keccak256(abi.encode(key))` is not the signed `poolId` (`PoolNotSigned`), after the existing `PoolMismatch` checks and before any approval or swap. NatSpec: orders are now bound to the filler through its validator (supersedes the E11 sentence) | D22, R7 |
+| `script/TradeManifest.sol`, `script/DeployOrderFiller.s.sol` | Manifest field `poolManager`, required to equal Launch's record. The standard CREATE2 deployer's code hash is required. The script predicts the filler (`CREATE2_FACTORY`, `FILLER_SALT`, built creation code with the nine arguments) and the validator (CREATE2 from that filler, `VALIDATOR_SALT`, validator creation code with `(filler, poolManager)`), refuses an occupied filler address, deploys `new MercuriOrderFiller{salt: FILLER_SALT}` and reverts unless both land at their predictions and name each other and the manifest's PoolManager | D22 |
+| `deployments/manifest-5042002.json`, `manifest-5042.json` | Gain `poolManager` (`0x8366…0951` on both, from Launch's records). The mainnet manifest still names no reactor: mainnet deploys its own, owned by Launch's mainnet timelock `0x94aF…eb40` (D27). Nothing in this repository names the Uniswap-owned mainnet reactor (owner `0x33f2…51e8`, spec E7) as ours; `test_mainnetManifestIsReviewOnly` asserts the manifest has no `reactor` key | D27 |
+| `script/write-trade-record.py` | The filler broadcast must be a `CREATE2` call to the standard deployer whose input is `FILLER_SALT ++ init code`, whose init code is the built filler with exactly the recorded arguments, and whose address is that CREATE2 address (a factory call's receipt carries no contract address); the one contract it created must be the `MercuriOrderValidator` at its predicted address with the built validator init code. The record gains `validator` and `poolManager` | D22 |
+| `script/verify-trade-filler.py` | Verifies the validator's runtime (immutables `filler`, `poolManager`) next to the filler's (now with `validator`); checks the binding both ways (each immutable names the other, the validator is the filler's CREATE2 deployment, the filler is the standard deployer's CREATE2 of the built code and manifest arguments, and `filler.validator()` and `validator.filler()` read on chain agree) and the deployer's code hash; adds `poolManager` to the Launch-record preflight. New self-tests: flipped filler `validator`, validator `filler` and `poolManager` bytes, and EIP-1014's own CREATE2 examples | D22 |
+| `script/check-natspec.py`, `source-manifest.json`, `script/check-contracts.sh` | NatSpec coverage extended to the validator (54 ABI entries, from 34); the source manifest lists three sources; the gate requires the three new flipped-byte reports by name | |
+
+#### Trigger direction
+
+The trigger is the signed pool's `sqrtPriceX96` (currency1 per currency0, raw units), compared inclusively with the
+pool's spot price before the swap. Take-profit fires when the order's rate, output per input, has risen to the
+trigger; stop-loss when it has fallen to it. v4 sorts currencies, so the input is currency0 exactly when its address
+is lower, and the rate rises with the price exactly then:
+
+| Order | USDC is | Input is | Token's USDC price | Take-profit fires | Stop-loss fires |
+| --- | --- | --- | --- | --- | --- |
+| Sell token for USDC | currency1 | currency0 | rises with the price | price >= trigger | price <= trigger |
+| Sell token for USDC | currency0 | currency1 | falls with the price | price <= trigger | price >= trigger |
+| Buy token with USDC | currency0 | currency0 | falls with the price | price >= trigger | price <= trigger |
+| Buy token with USDC | currency1 | currency1 | rises with the price | price <= trigger | price >= trigger |
+
+So a sell's take-profit fires as the token's USDC price rises to the trigger and its stop-loss as it falls; a buy's
+take-profit as the token's price falls and its stop-loss as it rises. The web app opens buys as limits only today;
+the contract handles all four rows. Clients must express the trigger in the signed pool's own orientation.
+
+#### Why the validator is deployed by the filler
+
+Each contract names the other, so neither init code can contain the other's address if both are deployed separately
+through the CREATE2 deployer (each init code hash would depend on the other). The filler therefore deploys the
+validator itself, with CREATE2 from its own address. Both addresses are still deterministic and predicted before the
+broadcast (the filler's from the standard deployer, the validator's from the filler), the pair is created in one
+transaction, there is no moment when the filler exists without its validator, and nobody else can deploy that
+validator. The filler's init code embeds the validator's creation code (filler creation code 13,738 to 15,671 bytes);
+its runtime does not.
+
+### CREATE2 deployer, read-only (`eth_getCode`)
+
+| Network | RPC | Block | Block hash | Code at `0x4e59b44847b379578588920cA78FbF26c0B4956C` |
+| --- | --- | --- | --- | --- |
+| Arc testnet (5042002) | `https://rpc.testnet.arc.network` | 65,275,728 | `0x059b37a03941c9d838b911a575a1b0ece373ac0252ef755501d18042280c8f09` | 69 bytes, keccak `0x2fa86add0aed31f33a762c9d88e807c475bd51d0f52bd0955754b2608f7e4989` |
+| Arc testnet (5042002) | `https://rpc.testnet.arc.network` | 64,325,644 (the fork pin) | `0x47b31c84b571d202c795d0839d0a2b66fb8276d9796e24b60dec740e391da7c3` | same 69 bytes and keccak |
+| Arc mainnet (5042) | `https://rpc.mainnet.arc.io` | 24,040,008 | `0x789b98f14e39856a37eb69b7e4f6fa4296e09b8ecdc36eb0de077d9b87515b30` | same 69 bytes and keccak |
+
+The code is the standard deterministic deployer (`0x7fff…ffe036016000816020823780358282 34f580151560395781 82fd5b80825250505060 14600cf3`,
+the same bytes on both networks), which `TradeManifest.CREATE2_FACTORY_CODEHASH` pins. `https://rpc.arc.io` did not
+resolve (DNS) from this host on 3 Oct; the mainnet read used `https://rpc.mainnet.arc.io`, the endpoint this
+repository's `probe-trade-rpc.py` names. Every request was a read with a `curl` User-Agent; nothing was sent.
+
+### Tests
+
+| Suite / test | What it shows |
+| --- | --- |
+| `MercuriOrderValidatorTest` (new, real v4 PoolManager, 10 tests) | `test_triggerDirectionTable`: 2 kinds x 2 sides x 2 USDC positions x (one unit before, at, one unit past the trigger) = 24 cases against an oracle written from the token's USDC price, independently of the contract's `input < output` rule: 16 accepted, 8 refused, and in every orientation the trigger itself and exactly one neighbour pass. `testFuzz_triggerDirectionMatchesOracle` (any price and trigger in v4's range, boundary forced often). `test_stopLossFiresOnlyAfterPriceFalls`, `test_wrongFillerRefused`, `test_limitNeedsNoPrice` (passes on a pool that does not exist; nonzero trigger refused), `test_triggerOutsideV4RangeRefused`, `test_uninitializedPoolRefused`, `test_malformedConditionRefused` (13 encodings: empty, the D11 encoding, 127 and 129 bytes, versions 0, 2 and dirty, kinds 3, 255 and dirty, triggers of 2^160 for both kinds, all-zero), `testFuzz_arbitraryDataNeverPanics` (random bytes: only a well-formed limit passes, every refusal is one of the typed errors), `test_constructorAndGetters` |
+| `UniswapXFillerTriggerTest` (new, real reactor, filler, validator and Launch fixture, 6 tests) | `test_fillerRefusesOrderWithoutItsValidator` (no validator, and a look-alike validator that also accepts our filler: `WrongValidator`, nothing moved, nonce unused). `test_fillerRefusesPoolOtherThanSigned` (a listed market's Launch pool, an unsigned pool of the same pair with another fee, and the reverse binding: `PoolNotSigned`). `test_triggeredOrdersOnEveryRoute` (Launch and listed pools, token below and above USDC, buy and sell, take-profit and stop-loss: one unit short `TriggerNotReached` with nothing moved, at the price fills). `test_stopLossFillsAfterMarketFalls` (a real swap moves the pool through the trigger). `test_compromiseDrill` and `testFuzz_compromiseExtractionBound`, below |
+| Compromise drill (spec §10 bar 12, contract part) | The attacker holds the keeper key (pranks `feeRecipient`) and the cosigner key (cosigns at will, exclusive to our filler or open). On an untriggered protected stop (minimum = today's net value less a 3% band): our filler `TriggerNotReached`; the attacker's own `MercuriOrderFiller` keyed to itself `WrongValidator`; a bare reactor filler `WrongFiller` (open cosign) or `NoExclusiveOverride` (exclusive cosign). The attacker then pushes the signed pool through the trigger with its own swap (R9, same block): the Launch pool and an attacker-made pool of the pair at the trigger price are refused `PoolNotSigned`, the outside filler still `WrongFiller`, nothing moved and the nonce unused. Through the signed pool the fill either pays the victim at least the signed minimum (`extracted <= value - minimum <= value x band`) or reverts with nothing moved. The fixed cases exercise both: a 1e6 push fills within the band, a 100e6 push leaves the order unfilled, for the token below and above USDC; the fuzz covers pushes of 1e6 to 400e6 and both positions |
+| `DeployScriptsTest` (+4) | `test_scriptValidatorSaltMatchesFiller`, `test_create2FactoryCodeRequired` (known code accepted, other code `Create2FactoryMismatch`), `test_deployPairLandsAtPrediction` (the script's broadcast lands both at their predictions, naming each other; a changed argument moves both addresses; a second run `AlreadyDeployed`), `test_deployedPairMismatchRefused` (filler off prediction, another validator, another PoolManager). `test_launchRecordMismatchRefused` now also tampers `poolManager`; `test_mainnetManifestIsReviewOnly` asserts no `reactor` key and the record's PoolManager |
+| `DeployOrdersForkTest` (new) | `test_create2PredictionOnArcFork`: on an anvil fork of testnet at 64,325,644 the deployer's code hash is the pinned one, a locally deployed reactor owned by the record's timelock, and the script's pair deployment from the manifest lands at the predicted filler `0x80d8…CFbf` and validator `0x30E2…Cf79`, bound to the recorded PoolManager. Also passes on a mainnet fork at 24,040,000 (filler `0x77D9…771f`, validator `0x95Fb…B14e`, with a placeholder keeper and fee). Skipped without `ARC_LOCAL_FORK_RPC` |
+| Changed existing tests | The harness signs every order for a filler's validator with a limit condition on the order's pool (`signFor`, `marketKey`, `_condition`). `test_orderWithConditionDataStillFills` became `test_orderWithLegacyConditionDataRefused` (the D11 encoding and empty data refused by the validator; the D22 condition fills). `test_execFeePreFeeOrderFillsThroughNewFiller` became `test_execFeeOrderForAnotherFillerRefused` (R7: an order signed for another filler is refused `WrongValidator`, the signatures differ). Third-party filler tests now expect `WrongFiller` after the exclusive window and for an open cosign (exclusivity is a second, independent barrier). `testFuzz_guardAmountMatchesReactor` probes the reactor with an unvalidated copy of the same input side (the validator never reads amounts). Grief gas gains `test_conditionGas` |
+| Invariants | `TradeInvariantsTest` (and its fork variant): every `step` call also runs the four D22 actions: an order with no validator or a look-alike (`WrongValidator`), an order routed through the same token's other pool (`PoolNotSigned`), a take-profit or stop-loss one unit short (`TriggerNotReached`), and the same at the current price (fills, counts toward the execution-fee ghost). Every refusal follows a refused non-keeper attempt and must move nothing, pay nothing and leave the nonce unused; `afterInvariant` requires each of the four in every run; new `invariant_validatorBinding`. Running all four per `step` instead of a sixth selector keeps their per-run reachability as likely as `step` itself (a separate selector missed one in a 64-call run in the first campaign; recorded here, not a contract result) |
+
+### Gas
+
+Isolated transaction gas (`forge test --isolate`, method of section 19), the same listed-pool order:
+
+| Path | `63c1f11` | `ea9006f` | Change |
+| --- | --- | --- | --- |
+| Buy, successful limit fill | 511,849 | 519,031 | +7,182 (calldata 11,064 to 12,260: +1,196) |
+| Sell, successful limit fill | 554,210 | 561,379 | +7,169 (calldata 11,076 to 12,260: +1,184) |
+| Buy, take-profit at the trigger | | 520,427 | +1,396 over the limit fill (the price read) |
+| Sell, take-profit at the trigger | | 562,799 | +1,420 over the limit fill (+24 calldata) |
+| Buy, balance moved / allowance revoked / nonce used / deadline passed | 54,171 / 57,375 / 46,707 / 40,932 | 55,497 / 58,701 / 48,032 / 42,258 | +1,325 to +1,326 |
+| Sell, same four | 53,797 / 57,070 / 46,719 / 40,944 | 55,111 / 58,384 / 48,032 / 42,258 | +1,313 to +1,314 |
+
+A limit fill costs about +6,000 in execution: the reactor's call into the validator (a cold account), its decode, and
+the filler's `WrongValidator` check, data decode and pool-id hash; the rest is the 160 extra calldata bytes (validator
+address word and four condition words). A take-profit or stop-loss adds one cold `extsload` of the pool's slot 0, which
+the swap would otherwise warm, about +1,400. Griefed reverts grow mostly by the calldata. Deploying the pair (one
+transaction, rehearsal receipt) uses 3,264,199 gas.
+
+`.gas-snapshot`: 116 rows before, 130 after. Three rows left with their renamed or replaced tests
+(`test_orderWithConditionDataStillFills` in both fee suites, `test_execFeePreFeeOrderFillsThroughNewFiller`); 17 rows
+were added (the new suites and the renamed tests). Across the 113 common rows +15,720,330 gas (+1.975%). The test
+rows include harness work that is not contract gas: every market now writes its `PoolKey` to the `marketKey` registry
+(three storage slots, about 66k) and each order reads it and the filler's `validator()`; so a single-fill row such as
+`test_orderOtherBuy` rises 57,678 (`test_orderMercuriBuy` 77,555), against the +6,000 contract figure above. Tests that
+deploy fillers rise with the validator deployment (about 350k per filler, for example
+`test_execFeeConstructorRejectsFeeAboveMax` +701,086 and `test_execFeeReentrantKeeperCannotDoublePay` +1,499,568, three
+fillers); `test_exportExpiringOrderVector` +738,007 deploys a validator and initializes a pool. Rows fall where a
+control fill became a refusal (`test_thirdPartyFillerBlockedInsideWindow` -25,958, `test_thirdPartyFillerCannotFillAfterWindow`
+-14,446). `forge snapshot --check` passes.
+
+### Bytecode identity
+
+`forge inspect <contract> deployedBytecode` / `bytecode` output hashed with `shasum -a 256` as in sections 18 and 19
+(raw-byte sha256 in brackets). Same compiler, settings and pins; no `lib/` change.
+
+| | Before (`63c1f11`, = `0f7dfd4`) | After (`ea9006f`) |
+| --- | --- | --- |
+| Filler runtime | 13,062 bytes, `9b55039d6672ccbe6ffbf2aee1b5f97ddcb1d8554b0303af066b3ae612ecd327` | 13,413 bytes, `155b04c3cd980403f63c606c0af2cbe5e860013119baa7c9784f3ca7176487dc` (raw `befb555a0541dc60970fc6baf694830481a74897f4c238c574e4af0b00e70aba`) |
+| Filler creation | 13,738 bytes, `48324df63c1329ddb4c3b32295977978447d0a854615479fb45e9a7f43f88b6d` | 15,671 bytes, `ac00c9f3907ea895d68a2733bd024a84427b1236451eca385eb9c949e06bec8e` (raw `13a955427175cab109877fbdd38cfbcb896fe3a37be006c9781a075cd4187f96`) |
+| Validator runtime | | 1,222 bytes, `d622f25c3e10d1bed0ae25210fce66b5675a03522c4e99c4e74793c4fc31e914` (raw `775ee89bffc3fbfefafedb280ce5211d0e616538ee9140fa994e92cf2a9e7f01`) |
+| Validator creation | | 1,440 bytes, `3ddfd93fad45f94150005a3a13dfc0e72d565d8e5575781781d949e64e2461d5` (raw `e4e42b268d669283c65b1aa4afe2c90891c8f52d0c05ace770cd3e9709e9165d`) |
+| Self-test keccak (manifest immutables, placeholder reactor, keeper, filler and validator) | filler `0x7c91e0016c4479ee370f298ae33c64dbc973037601ce0fccf14128a7abf46ace` | filler `0xd84224181321da1372f6e486e8253606f5d66ecebed3b24051b3c61104a0ef9e`, validator `0x8f74eb329798a6c50da55f56c174449163f411e3c4fffc82f73319f7e3575fe6` |
+| `src/MercuriOrderFiller.sol` sha256 | `14149bd6…2bf9` | `4ff0fbe472e5a22285bf8fdcd9d0ab87c155b62ff1b4a60a52db16cf4244b2d3` |
+| `src/MercuriOrderValidator.sol` sha256 | | `a2f81fd970daae8f338f890f92cd7b38923035dd2c4e43661e0fc92dbb818704` (`780ad88a…c0d1` at `ea9006f`, NatSpec alignment only) |
+
+The filler runtime grows 351 bytes (the validator check, the pool-id check and the `validator` and `VALIDATOR_SALT`
+getters). Both are far below EIP-170.
+
+ABI. Filler: constructor gains `poolManager_`; functions `validator()` and `VALIDATOR_SALT()`; errors `WrongValidator()`
+and `PoolNotSigned()`. Validator: `validate`, `filler()`, `poolManager()`, `VERSION()`, `KIND_LIMIT()`,
+`KIND_TAKE_PROFIT()`, `KIND_STOP_LOSS()`, and errors `ZeroAddress`, `WrongFiller`, `InvalidValidationData`,
+`UnsupportedVersion`, `UnknownKind`, `InvalidTrigger`, `PoolNotInitialized`, `TriggerNotReached`. A fill can now revert
+with a validator error (bubbled through the reactor); the keeper's revert classification needs the validator ABI.
+Exported with `forge inspect <contract> abi --json` to the session scratchpad (`filler-abi.json` sha256
+`f3dc2cc97fd59179c2e5c3ae98b5298761395da7500dbf8cf2507d6004964d75`, `validator-abi.json`
+`fc37cc99b7b682c649d437fa08461d30199bb480280711ead10256773672d121`); the backend's copies are not updated here.
+
+### Loopback rehearsal at `ea9006f`
+
+Anvil forked `https://rpc.testnet.arc.network` at block 65,275,728 on port 8550 (`--fork-header "User-Agent: curl/8.7.1"`).
+`DeployTestnetReactor` (rehearsal owner: anvil account 1) then `DeployOrderFiller` (rehearsal keeper: anvil account 2),
+sender anvil account 0, both with `--broadcast` to the loopback anvil only:
+
+| Item | Value (fork-only) |
+| --- | --- |
+| Reactor | `0xC37B7C35aD214bB8c11Ee49E3c4483d3B33A7118`, block 65,275,729, runtime keccak `0xd7a5867bd6bea358f040527c10ba7ab2e76ce071e7b7be6181b26a0c1e7e7dcb` (profile `small`, unchanged) |
+| Filler | `0xDE23A3b9E70dF562E6E97Beca6323913CabaaBFE`, block 65,275,730, the script's prediction; runtime keccak `0x53a0c31b338556821b27a223706b254a782ae531abd77262079951b3bcd12351` |
+| Validator | `0x28Fbd127F04eE06c54f9D26BA4c0FBe98dFBa92E`, the script's prediction; runtime keccak `0xee298477e1ded9872c0f297fe484cc3d36590197b5d47ee9e95e9d16dde2e035` |
+
+The same addresses came out of an earlier rehearsal on a fork at another block: the CREATE2 addresses do not depend
+on the sender's nonce. `write-trade-record.py --rehearsal` wrote the record (with `validator`, `poolManager` and
+`sourceRevision` `ea9006fb8ed3d2aec19bcd353ae127d3fa34de54`) into the scratchpad, and `verify-trade-filler.py --rehearsal
+--block 65275730` exited 0: reactor, filler and validator MATCH; "validator … is the filler's own CREATE2 deployment";
+"filler … is the standard deployer's CREATE2 of the built code with the manifest arguments"; "binding read on chain:
+filler.validator() and validator.filler() name each other"; router, reactor owner and fee controller match. With the
+record's validator replaced by the reactor's address, or by an address without code, it exited 1: the filler MISMATCH
+inside `validator`, the validator MISMATCH, "is not the CREATE2 address", and the on-chain binding read reported as a
+revert or an empty return.
+
+### Vector and fixture
+
+`test_exportExpiringOrderVector` regenerates `test-export/trade-orders/order_expiring.json`. The order now names a
+`MercuriOrderValidator` bound to the vector's filler, with `additionalValidationData = abi.encode(1, 1, poolId,
+trigger)`: a take-profit on a hookless pool of the two vector tokens initialized at the order's own rate, so the order
+is exactly at its trigger. The test still proves it a real order (refused for another filler inside the window, filled
+by the named filler at block 1020, dead at 1021) and adds that another filler is refused `WrongFiller` past the window.
+New fields: `validator`, `poolId`, `kind`, `triggerSqrtPriceX96` (a decimal string) and `additionalValidationData`.
+SHA-256 `0bc97dd52d2036c3999bff8cb625992ffa8e5d6a194c2e33f5b7555dfa5e0e3a` (deterministic across runs), copied
+uncommitted to the backend's `internal/orders/testdata/order_expiring.json` and the web app's
+`src/lib/trade/__fixtures__/order_expiring.json`; the gate confirms the three copies identical. `order.json` (the legacy
+pre-cosigned vector) is unchanged (`79365514…acca`). The backend's `Order.Condition` still parses the D11 encoding and
+rejects any validation contract, so its tests that read this vector fail until the backend adopts D22.
+
+`TRADE_EXPORT_STATE=true forge test --match-contract TradeLocalStateTest --match-test test_exportState` regenerates the
+e2e fixture: the four uncosigned limit orders name the filler's validator with a limit condition on their own pool,
+`anvil-order.json` gains `validator`, and `anvil-state.json` holds the reactor, filler and validator code.
+
+### Residual risks
+
+- **R7.** The filler and its validator are bound together and orders name the validator. A replacement (including a
+  keeper key rotation) strands open orders on the old pair, fillable only by the old keeper key; runbook updated.
+- **R9.** The validator reads the pool's current spot price. An attacker holding both keys can push it through a
+  trigger in the same block and fill there. The signed minimum bounds the loss (the band, for a protected stop),
+  proven by the compromise drill; the six-block hold stays off chain and does not bind a compromised keeper.
+- The trigger compares the spot price before the swap, not the execution price; the fill's own price impact and fees
+  are bounded only by the signed minimum (D21's band rule sizes it).
+- A pool with an unexpected hook could move its own price during a swap; the backend admits only the Launch hook or
+  no hook (spec D12), and the trader signs the pool.
+
+### Gates at `d48a116`
+
+`TRADE_VECTOR_BACKEND=<backend copy> TRADE_VECTOR_WEBUI=<web app copy> bash script/check-contracts.sh`: exit 0 (also at
+`ea9006f`, 3 min 40 s on a cold build). Upstream sources 110 and 34 match; source manifest (three files) matches; `forge fmt
+--check` clean; NatSpec 54 ABI entries, 0 failures; preflight clean for both manifests (testnet pending `feeRecipient`,
+mainnet pending `executionFee` and `feeRecipient`) and a pending choice refused without `--allow-pending`; verifier
+self-tests ok, with the filler `usdc`, `executionFee`, `feeRecipient`, `validator`, the validator `filler` and
+`poolManager` and the reactor pointer byte each reported by name, and the EIP-1014 examples reproduced; record writer
+self-test 26/26; `forge test --fuzz-seed 0x5042` 171 passed, 0 failed, 5 skipped (17 suites); `order_expiring.json`
+identical in the three places (`0bc97dd5…0e3a`); snapshot check 129 passed, 1 skipped.
+
+Invariants: 40 unseeded campaigns of `test/invariant/*` at `ea9006f`, the default 64 runs x 64 depth with
+`fail_on_revert`, each with a fresh `FOUNDRY_INVARIANT_FAILURE_PERSIST_DIR` (`mktemp -d`): 40 of 40 passed, 4,096 calls
+and 0 reverts for each of the three invariants (`invariant_executionFeePerFill`, `invariant_tradeCustodyAndApprovals`,
+`invariant_validatorBinding`) in every campaign, 252 s in all; no failure was persisted in any of the 40 directories.
+Every run's `afterInvariant` required at least one of each D22 refusal and one triggered fill.
+
+Stress: `ARC_LOCAL_FORK_RPC=<loopback anvil fork of https://rpc.testnet.arc.network at 64,325,644>
+TRADE_FORK_CHAIN_ID=5042002 TRADE_FORK_BLOCK=64325644 bash script/check-contracts.sh --stress` at `d48a116`: exit 0 in
+526 s. With the fork set the default suite ran 185 passed, 0 failed, 2 skipped (the fork suites, including
+`DeployOrdersForkTest`, did not skip); `verify-trade-router.py` passed; `FOUNDRY_FUZZ_RUNS=10000` over every
+non-invariant suite 179 passed, 0 failed, 2 skipped (15 suites); invariants at 1024 runs x 256 depth, `fail_on_revert`,
+seed `0x5042002`, for `TradeInvariantsTest` and `TradeForkInvariantsTest`: 6 of 6 passed, 262,144 calls and 0 reverts
+each, nothing persisted. This stress run left the vector copy check out (both variables unset): a concurrent session in
+the backend tree had restored that repository's committed `order_expiring.json` (`25fbc6bc…1f79`) while the first
+attempt ran, and that attempt stopped at the copy check. The copies were written again and the gate above confirms all
+three identical.
+
+Open: the isolated re-audit of `ea9006f`; the backend (D22 encoding, validator address in `/v1/network`, revert
+classification with the validator's errors, ABI copies) and the web app (encoding, trigger as the pool's
+`sqrtPriceX96` in its orientation) must adopt the new vector; `CLAUDE.md`/`AGENTS.md` still describe `src/` as the
+filler alone; real-chain gas; and, unchanged, the go-step items of section 18.

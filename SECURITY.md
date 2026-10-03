@@ -14,7 +14,8 @@ moves.
 
 ## Scope
 
-The contract in `src/`, `MercuriOrderFiller`, and the deployment scripts in `script/`. Nothing is deployed yet; once
+The contracts in `src/`, `MercuriOrderFiller` and the `MercuriOrderValidator` it deploys, and the deployment scripts in
+`script/`. Nothing is deployed yet; once
 it is, the scope is the addresses in the deployment records under `deployments/`. The vendored dependencies under
 `lib/` are upstream code, and Launch's contracts are in their own public repository; report defects in them there as
 well.
@@ -27,16 +28,20 @@ compromised keeper or cosigner key are a trust boundary rather than a defect; wh
 
 | Component | Mutability | Who controls what |
 | --- | --- | --- |
-| `MercuriOrderFiller` | Immutable: no owner, pause, upgrade or rescue path | Nobody. Every dependency, the execution fee and the keeper address are fixed in its bytecode. Only the keeper can call `fill`; only the reactor can call back into it or send it native value |
+| `MercuriOrderFiller` | Immutable: no owner, pause, upgrade or rescue path | Nobody. Every dependency, the execution fee, the keeper address and its validator are fixed in its bytecode. Only the keeper can call `fill`; only the reactor can call back into it or send it native value. It refuses an order that does not name its validator and swaps only through the pool the trader signed |
+| `MercuriOrderValidator` | Immutable: no owner, pause, upgrade or storage. Deployed by the filler's constructor with CREATE2, bound to that filler and to the v4 PoolManager | Nobody. The reactor calls it before any transfer; it refuses every filler but its own and, for a take-profit or stop-loss, a pool price that has not reached the signed trigger in the order's direction. It reads the pool's current spot price, which can be moved within a block |
 | `V3DutchOrderReactor` | Immutable upstream code (UniswapX `eb7ce07`, unchanged) with one owner | The owner is Launch's TimelockController on the same network (`timelock` in Launch's deployment record; the deployment scripts and the verifier require it). The owner can set a protocol fee controller, which adds output-token fees of at most 5 bps of the outputs, or transfer ownership. A controller can also make every fill revert: an input-token fee is refused by the filler (`FeeOutputUnsupported`) and a reverting controller blocks the reactor itself. Every owner action waits the timelock's delay. The reactor ships with no controller, and the scripts and the verifier require that |
-| Keeper (`feeRecipient`) | Off-chain service with one transaction key | The only caller of `fill`. It chooses when to fill and through which USDC pool of the order's pair, and receives the execution fee. A compromised key can fill cosigned orders early, ignore a take-profit or stop-loss trigger, or pick a worse pool of the pair; it cannot pay the trader less than the signed minimum or take more than one execution fee per fill |
-| Cosigner | Off-chain key named in each order | Cosigns an order at fill time: the decay start block, the exclusive filler and output overrides that can only raise the outputs (the reactor refuses a lower one). A compromised cosigner can cosign any stored order and fill it, through any filler it names, at its signed minimum, whether or not the order's trigger has been reached |
+| Keeper (`feeRecipient`) | Off-chain service with one transaction key | The only caller of `fill`. It chooses when to fill and receives the execution fee; the pool is the one the trader signed. A compromised key can fill a cosigned order the moment its condition holds on chain, skipping the six-block hold the honest keeper waits for; it cannot fill an untriggered take-profit or stop-loss, use another pool or another filler, pay the trader less than the signed minimum or take more than one execution fee per fill |
+| Cosigner | Off-chain key named in each order | Cosigns an order at fill time: the decay start block, the exclusive filler and output overrides that can only raise the outputs (the reactor refuses a lower one). A compromised cosigner can cosign any stored order, but only our filler can settle it (the validator refuses every other filler), and only its keeper can call that filler |
+| Keeper and cosigner together | The worst case the contracts bound | Can fill a stored order through our filler and its signed pool once the order's condition holds, and can push that pool's price within the same block to make it hold (R9). The trader still receives at least the signed minimum, so the loss on an order is at most its value less that minimum: for a protected stop the trader-signed band times the order's notional, and only on orders whose trigger is reached on chain. A limit order fills at the trader's own price or better |
 
 What is enforced on chain, for every order: the trader's input is spent only once, by the trader's own signature, and
 only if the trader's balance rises by at least the signed minimum output before the deadline and within the
-cosigned window. The take-profit and stop-loss trigger is the keeper's commitment, not an on-chain check: the reactor
-ignores the order's `additionalValidationData` because no validation contract is set. An on-chain trigger was
-considered and not built (see the release report, section 18).
+cosigned window. The order names our validator and carries its condition in the trader-signed
+`additionalValidationData`: `abi.encode(uint8 version, uint8 kind, bytes32 poolId, uint160 triggerSqrtPriceX96)`. Only
+our filler can settle it, only through that pool, and a take-profit or stop-loss only while the pool's current price
+is at or beyond the trigger in the order's direction (release report, section 20). The six-block hold before the
+keeper fires (spec D3) stays off chain: it is the keeper's filter against a price pushed for a block or two.
 
 Limits a reviewer should know:
 
@@ -45,6 +50,11 @@ Limits a reviewer should know:
   trader loses Launch's referral credit. A new Launch hook therefore needs a new filler.
 - On Arc native value is USDC. The reactor refunds its whole native balance to the filler after every fill; the filler
   accepts it from the reactor only, never pays it out, and has no way to return it.
+- The trigger is checked against the signed pool's spot price before the swap, not an oracle (none exists on Arc for
+  these assets). Anyone can move a pool's price within a block; under a key compromise that lets an order fill at the
+  manipulated moment (R9). The signed minimum bounds the cost: the band, for a protected stop.
+- The filler and its validator are bound together (R7). Orders name the validator, so a replacement filler cannot
+  settle orders signed for the old one; they stay fillable only through the old pair, by the old keeper key.
 
 ## Griefing defence
 
@@ -91,7 +101,7 @@ fee or subsidise an order.
 
 | Change | Cost |
 | --- | --- |
-| New filler (bug fix, keeper key rotation, fee change, a new Launch hook, a new route) | Deploy, verify, write the record, then switch the keeper and API configuration to it. No order migration: orders bind to the reactor and the cosigner, and the cosigner names the new filler as exclusive filler from the switch on |
+| New filler (bug fix, keeper key rotation, fee change, a new Launch hook, a new route) | Deploy the filler, which deploys its new validator; verify, write the record, then switch the keeper and API configuration to the pair, so new orders name the new validator. Open orders are bound to the old pair (R7): keep the old filler and its keeper key serving them until they expire (at most 30 days) or the traders sign again. After a key compromise, ask traders to sign again and rely on the on-chain bounds above |
 | New reactor | Every open order must be signed again by its trader: the reactor is in the signed order and is the Permit2 spender |
 | Cosigner rotation | Configuration in the keeper and API (the cosigner address the web app puts in new orders). Orders signed with the old cosigner can only be filled by that key until they expire or are cancelled |
 
@@ -107,10 +117,13 @@ by the contract.
 
 - Release evidence for the filler candidate: `docs/reports/2026-10-02-order-filler-release.md`, including the
   independent audit of 3 October 2026 and its fix round (section 18).
-- Reproducible bytecode: `python3 script/verify-trade-filler.py` after `forge build`. Until a deployment record exists
-  it runs in `--self-test` and `--preflight` mode against the freshly built artifacts, the manifests and Launch's
-  deployment records.
-- The filler is immutable, with no owner, pause, upgrade or rescue path; only the configured keeper can call `fill`.
+- Reproducible bytecode: `python3 script/verify-trade-filler.py` after `forge build`, for the reactor, the filler and
+  the validator, with the binding between the last two checked both ways. Until a deployment record exists it runs in
+  `--self-test` and `--preflight` mode against the freshly built artifacts, the manifests and Launch's deployment
+  records.
+- The filler and the validator are immutable, with no owner, pause, upgrade or rescue path; only the configured keeper
+  can call `fill`.
 
 An independent review was performed on 3 October 2026 (release report, section 18); the early guard added after it
-(section 19) awaits its own isolated re-review. No professional third-party audit has been performed yet.
+(section 19) and the on-chain order validation (section 20) await their own isolated re-review. No professional
+third-party audit has been performed yet.

@@ -36,7 +36,8 @@ deployment inputs and the release evidence. The backend, the keeper and the web 
 Spot swaps go through Uniswap's Universal Router and Permit2 into the Uniswap v4 pools on Arc; the 1% trade fee on a
 graduated token's pool is Launch's hook, unchanged. Listed Arc assets pay an app fee to the treasury as a command in
 the router plan the trader signs. Limit, take-profit and stop-loss orders are UniswapX V3 Dutch orders, cosigned at
-fill time by the backend keeper and filled through the one contract this repository adds.
+fill time by the backend keeper and filled through the two contracts this repository adds: the filler and its order
+validator, which checks each order's signed condition on chain.
 
 **Contents** · [Deployment](#deployment) · [How it works](#how-it-works) · [Contracts](#contracts) ·
 [Parameters](#parameters) · [Events](#events) · [Build and verify](#build-and-verify) · [Security](#security) ·
@@ -44,14 +45,17 @@ fill time by the backend keeper and filled through the one contract this reposit
 
 ## Deployment
 
-None yet. Trade adds no deployed contract of its own today. The first will be the filler for the hosted keeper, with
-the pinned UniswapX reactor, on Arc testnet first. That needs its own review, deployment record and release evidence
-in this repository before orders open on either network.
+None yet. Trade adds no deployed contract of its own today. The first will be the filler for the hosted keeper and the
+order validator it deploys, with our own pinned UniswapX reactor, on Arc testnet first. That needs its own review,
+deployment record and release evidence in this repository before orders open on either network. Mainnet will run its
+own reactor too, owned by Launch's timelock, never the existing Uniswap-owned one.
 
 The testnet inputs are in [`deployments/manifest-5042002.json`](deployments/manifest-5042002.json). The reactor fee
 owner is Launch's TimelockController on the same network, and the deployment scripts require it to equal `timelock` in
 Launch's deployment record. The execution fee recipient (the keeper) ships as a sentinel, and the filler script
-refuses to run until it is set.
+refuses to run until it is set. The filler goes through the standard CREATE2 deployer and deploys its validator with
+CREATE2 from its constructor, so the script predicts both addresses before broadcasting and refuses to finish unless
+the pair lands exactly there, each naming the other.
 
 | Dependency | Address (testnet, chain 5042002) | Mutability |
 | --- | --- | --- |
@@ -59,6 +63,8 @@ refuses to run until it is set.
 | Permit2 | [`0x000000000022D473030F116dDEE9F6B43aC78BA3`](https://explorer.testnet.arc.io/address/0x000000000022D473030F116dDEE9F6B43aC78BA3) | immutable · upstream |
 | Launch hook | [`0x87e6BaBAc4598F99f4A0717ad294934455Fe60cc`](https://explorer.testnet.arc.io/address/0x87e6BaBAc4598F99f4A0717ad294934455Fe60cc) | immutable · mercurifi launch |
 | USDC | [`0x3600000000000000000000000000000000000000`](https://explorer.testnet.arc.io/address/0x3600000000000000000000000000000000000000) | Arc system contract · upstream |
+| Uniswap v4 PoolManager | [`0x8366a39CC670B4001A1121B8F6A443A643e40951`](https://explorer.testnet.arc.io/address/0x8366a39CC670B4001A1121B8F6A443A643e40951) | immutable · upstream |
+| CREATE2 deployer | [`0x4e59b44847b379578588920cA78FbF26c0B4956C`](https://explorer.testnet.arc.io/address/0x4e59b44847b379578588920cA78FbF26c0B4956C) | immutable · the standard deterministic deployer |
 
 ## How it works
 
@@ -69,14 +75,17 @@ refuses to run until it is set.
   </picture>
 </p>
 
-1. **Sign.** The trader signs a limit, take-profit or stop-loss order as a UniswapX V3 Dutch order. Nothing moves
-   until it is filled.
+1. **Sign.** The trader signs a limit, take-profit or stop-loss order as a UniswapX V3 Dutch order. The signature
+   names the filler's order validator and the order's condition: its kind, its pool and, for a take-profit or
+   stop-loss, its trigger price. Nothing moves until it is filled.
 2. **Cosign.** At fill time the keeper cosigns the order, exclusive to this filler, and calls `fill` with the one
    USDC pool to use. Only the configured keeper can call `fill`.
-3. **Settle.** The filler first refuses, with a typed error and before the reactor runs, an order the trader has
-   made unfillable since the keeper checked it: a passed deadline, a used nonce, or too little input balance or
-   Permit2 allowance. The reactor then checks the signature, nonce and deadline and calls back. The filler swaps on
-   that pool through the Universal Router: a Launch pool pays Launch's hook fee, any other USDC pool pays the app fee.
+3. **Settle.** The filler first refuses, with a typed error and before the reactor runs, an order that does not name
+   its validator, and one the trader has made unfillable since the keeper checked it: a passed deadline, a used
+   nonce, or too little input balance or Permit2 allowance. The reactor then checks the signature, nonce and deadline
+   and asks the validator, which accepts only this filler and, for a take-profit or stop-loss, only while the signed
+   pool's price is at or beyond the trigger. The reactor calls back, and the filler swaps through the Universal Router
+   on the signed pool and no other: a Launch pool pays Launch's hook fee, any other USDC pool pays the app fee.
 4. **Pay out.** The trader receives every output above what the reactor takes; a fixed USDC execution fee goes to
    the keeper. If the trader's balance did not rise by the signed minimum, the whole fill reverts and no fee is paid.
 
@@ -84,7 +93,8 @@ refuses to run until it is set.
 
 | File | Role | Mutability |
 | --- | --- | --- |
-| [`MercuriOrderFiller.sol`](src/MercuriOrderFiller.sol) | The filler the keeper uses against the UniswapX reactor. Refuses an order the trader has made unfillable before the reactor runs, builds a single-pool swap, enforces net output and full input consumption, hands all surplus to the signed trader and pays the execution fee. No owner, pause, upgrade or rescue path. | immutable, not deployed |
+| [`MercuriOrderFiller.sol`](src/MercuriOrderFiller.sol) | The filler the keeper uses against the UniswapX reactor. Refuses an order that does not name its validator, or that the trader has made unfillable, before the reactor runs; swaps only through the pool the trader signed; enforces net output and full input consumption, hands all surplus to the signed trader and pays the execution fee. Deploys its validator in its constructor. No owner, pause, upgrade or rescue path. | immutable, not deployed |
+| [`MercuriOrderValidator.sol`](src/MercuriOrderValidator.sol) | The order validator the reactor calls before it moves anything. Accepts only its filler; for a take-profit or stop-loss, requires the signed pool's current price, read from the v4 PoolManager, to be at or beyond the signed trigger in the order's direction. Bound to its filler for life. No owner, pause, upgrade or storage. | immutable, not deployed |
 
 The one Universal Router entry point the filler calls is in [`interfaces/IOrderSwapRouter.sol`](src/interfaces/IOrderSwapRouter.sol).
 
@@ -99,7 +109,7 @@ Pinned sources it builds against:
 
 ## Parameters
 
-Fixed in the filler's bytecode at deployment; a change means a new filler (see
+Fixed in the filler's bytecode at deployment; a change means a new filler, which comes with a new validator (see
 [`docs/runbooks/filler-replacement.md`](docs/runbooks/filler-replacement.md)). That includes a new Launch hook: pools of
 any hook other than the filler's `launchHook` are charged the app fee and lose Launch's referral credit.
 
@@ -109,6 +119,8 @@ any hook other than the filler's `launchHook` are charged the app fee and lose L
 | Execution fee | at most 0.10 USDC (`MAX_EXECUTION_FEE`); the testnet manifest sets 0.05 USDC; zero disables it |
 | Execution fee recipient | the keeper's transaction address, also the only address allowed to call `fill` |
 | App fee recipient | the treasury, the same one Launch uses |
+| Order validator | deployed by the filler with CREATE2 (`VALIDATOR_SALT` zero), bound to that filler and to the v4 PoolManager |
+| Signed condition | `abi.encode(uint8 version, uint8 kind, bytes32 poolId, uint160 triggerSqrtPriceX96)`, version 1; kind 0 limit (trigger zero), 1 take-profit, 2 stop-loss (trigger within v4's price range) |
 
 Graduated tokens pay Launch's hook fee, split by Launch's FeeManager, on every pool swap whichever app sent it.
 Listed Arc assets pay the fixed 50 bps app fee on the USDC side, paid to the treasury inside the router plan; the API
@@ -153,30 +165,36 @@ For stress and pinned fork checks, set `ARC_LOCAL_FORK_RPC` (a loopback Anvil fo
 `TRADE_FORK_BLOCK`, then run `bash script/check-contracts.sh --stress`. The fork invariants are skipped without them;
 the default gate runs locally without a fork.
 
-[`script/verify-trade-filler.py`](script/verify-trade-filler.py) compares a deployed filler and reactor with the
-freshly compiled artifacts at one block. It reconstructs immutable values from the manifest and the deployment record
-(the reactor's function-pointer immutable from a constructor simulation) and requires every other byte to match, and
-checks the reactor's `owner()` and `feeController()` and the router's code hash and PERMIT2 bytes. `--reactor-only`
-verifies the reactor before any filler exists. Every run first cross-checks the manifest against Launch's deployment
-record for the chain (permit2, USDC, Launch hook, treasury as app fee recipient, timelock as reactor fee owner) and the
-reproduced router; `--preflight` runs that check alone, offline, and the gate runs it for both manifests along with
-the verifier's self-tests. The mainnet manifest, [`deployments/manifest-5042.json`](deployments/manifest-5042.json), is
-for review only: its owner choices are sentinels and the deployment scripts refuse chain 5042.
+[`script/verify-trade-filler.py`](script/verify-trade-filler.py) compares a deployed filler, validator and reactor with
+the freshly compiled artifacts at one block. It reconstructs immutable values from the manifest and the deployment
+record (the reactor's function-pointer immutable from a constructor simulation) and requires every other byte to match,
+and checks the reactor's `owner()` and `feeController()` and the router's code hash and PERMIT2 bytes. It checks the
+filler-validator binding both ways: each one's immutable names the other, the validator is the CREATE2 address the
+filler deploys to, and the filler is the standard deployer's CREATE2 address of the built code with the manifest's
+arguments. `--reactor-only` verifies the reactor before any filler exists. Every run first cross-checks the manifest
+against Launch's deployment record for the chain (permit2, USDC, Launch hook, PoolManager, treasury as app fee
+recipient, timelock as reactor fee owner) and the reproduced router; `--preflight` runs that check alone, offline, and
+the gate runs it for both manifests along with the verifier's self-tests. The mainnet manifest,
+[`deployments/manifest-5042.json`](deployments/manifest-5042.json), is for review only: its owner choices are sentinels
+and the deployment scripts refuse chain 5042.
 
 [`script/write-trade-record.py`](script/write-trade-record.py) writes `deployments/<chainId>.json` in the shape of
 Launch's deployment records, and only from completed forge broadcasts whose receipts, chain, commit and constructor
-arguments match the manifest; it never overwrites a record.
+arguments match the manifest, with the validator the filler created at its predicted address; it never overwrites a
+record.
 
 ## Security
 
 | | |
 | --- | --- |
-| [`docs/reports/2026-10-02-order-filler-release.md`](docs/reports/2026-10-02-order-filler-release.md) | Release evidence for the filler candidate: source revision, tests, gas, reviewer questions and open items. |
-| Mutability | The filler is immutable: no owner, pause, upgrade or rescue path. Replacing it, including rotating the keeper key, means deploying a new filler and switching the keeper by configuration: [`docs/runbooks/filler-replacement.md`](docs/runbooks/filler-replacement.md). |
+| [`docs/reports/2026-10-02-order-filler-release.md`](docs/reports/2026-10-02-order-filler-release.md) | Release evidence for the filler and validator candidates: source revision, tests, gas, reviewer questions and open items. |
+| Mutability | The filler and the validator are immutable: no owner, pause, upgrade or rescue path. Replacing the filler, including rotating the keeper key, replaces the validator too, and orders signed for the old pair stay fillable only by it: [`docs/runbooks/filler-replacement.md`](docs/runbooks/filler-replacement.md). |
 | Governance | The reactor's only owner is Launch's timelock, with power over a 0 to 5 bps output fee controller; the keeper and cosigner are off-chain keys. What each can do: [`SECURITY.md`](SECURITY.md). |
 
 The filler was independently reviewed on 3 October 2026 and every finding was fixed or decided (release report,
-section 18). That was not an audit by a security firm; no third-party audit has been performed yet. To report a
+section 18). The early guard (section 19) and the on-chain order validation (section 20) came after that review and
+await an isolated re-audit. That review was not an audit by a security firm; no third-party audit has been performed
+yet. To report a
 vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## License

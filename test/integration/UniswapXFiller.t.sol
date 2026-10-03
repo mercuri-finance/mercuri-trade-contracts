@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {UniversalRouterHarness} from "./UniversalRouterSwap.t.sol";
 import {MercuriOrderFiller} from "../../src/MercuriOrderFiller.sol";
+import {MercuriOrderValidator} from "../../src/MercuriOrderValidator.sol";
 import {IOrderSwapRouter} from "../../src/interfaces/IOrderSwapRouter.sol";
 import {V3DutchOrderReactor} from "../../lib/uniswapx/src/reactors/V3DutchOrderReactor.sol";
 import {IPermit2 as XPermit2} from "../../lib/uniswapx/lib/permit2/src/interfaces/IPermit2.sol";
@@ -42,6 +43,9 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
     uint256 internal constant COSIGNER_KEY = 987654321;
     /// The keeper's transaction address: the fixed execution-fee recipient.
     address internal feeRecipient = makeAddr("keeper");
+    /// The filler whose validator the orders built next name (spec D22). Tests that fill through another filler sign
+    /// for it first.
+    MercuriOrderFiller internal signFor;
 
     /// The execution fee of the filler under test: the testnet manifest value (ECON-02). Suites override it to rerun
     /// at another fee.
@@ -59,6 +63,7 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
         super.setUp();
         reactor = new V3DutchOrderReactor(XPermit2(address(permit2)), address(this));
         filler = _newFiller(_executionFee());
+        signFor = filler;
     }
 
     function _newFiller(uint256 fee) internal returns (MercuriOrderFiller) {
@@ -70,8 +75,19 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
             address(hook),
             appRecipient,
             fee,
-            feeRecipient
+            feeRecipient,
+            poolManager
         );
+    }
+
+    /// The signed condition (spec D22): `abi.encode(uint8 version, uint8 kind, bytes32 poolId, uint160 trigger)`.
+    function _condition(uint8 kind, PoolKey memory key, uint160 trigger) internal pure returns (bytes memory) {
+        return abi.encode(uint8(1), kind, keccak256(abi.encode(key)), trigger);
+    }
+
+    /// A limit condition on the pool of the order's token's latest market.
+    function _limitData(address input, address output) internal view returns (bytes memory) {
+        return _condition(0, marketKey[input == USDC ? output : input], 0);
     }
 
     /// Fills as the configured keeper: only `feeRecipient` may call `fill` (spec D20).
@@ -91,18 +107,43 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
         return net - fee;
     }
 
+    /// A limit order on the token's latest market, naming `signFor`'s validator.
     function _order(address input, address output, uint256 amount, uint256 minimum, uint256 nonce)
         internal
         view
         returns (SignedOrder memory signed)
     {
+        signed = _orderWith(input, output, amount, minimum, nonce, _limitData(input, output));
+    }
+
+    /// An order naming `signFor`'s validator with the given signed condition, cosigned as of this block.
+    function _orderWith(
+        address input,
+        address output,
+        uint256 amount,
+        uint256 minimum,
+        uint256 nonce,
+        bytes memory condition
+    ) internal view returns (SignedOrder memory signed) {
+        signed = _orderFor(input, output, amount, minimum, nonce, signFor.validator(), condition);
+    }
+
+    /// An order naming any validator (or none) with any validation data, cosigned as of this block.
+    function _orderFor(
+        address input,
+        address output,
+        uint256 amount,
+        uint256 minimum,
+        uint256 nonce,
+        IValidationCallback validator,
+        bytes memory condition
+    ) internal view returns (SignedOrder memory signed) {
         NonlinearDutchDecay memory flat = NonlinearDutchDecay(0, new int256[](0));
         V3DutchOutput[] memory outputs = new V3DutchOutput[](1);
         outputs[0] = V3DutchOutput(output, minimum, flat, trader, minimum, 0);
         V3DutchOrder memory order;
-        order.info = OrderInfo(
-            IReactor(address(reactor)), trader, nonce, block.timestamp + 1 days, IValidationCallback(address(0)), ""
-        );
+        order.info =
+            OrderInfo(IReactor(address(reactor)), trader, nonce, block.timestamp + 1 days, validator, condition);
         order.cosigner = vm.addr(COSIGNER_KEY);
         order.startingBaseFee = block.basefee;
         order.baseInput = V3DutchInput(XERC20(input), amount, flat, amount, 0);
@@ -184,12 +225,29 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
         uint256 raised,
         address exclusive
     ) internal view returns (SignedOrder memory signed) {
+        signed = _expiringOrderWith(
+            input, output, amount, minimum, nonce, head, raised, exclusive, _limitData(input, output)
+        );
+    }
+
+    /// `_expiringOrderFor` with any signed condition, naming `signFor`'s validator.
+    function _expiringOrderWith(
+        address input,
+        address output,
+        uint256 amount,
+        uint256 minimum,
+        uint256 nonce,
+        uint256 head,
+        uint256 raised,
+        address exclusive,
+        bytes memory condition
+    ) internal view returns (SignedOrder memory signed) {
         NonlinearDutchDecay memory flat = NonlinearDutchDecay(0, new int256[](0));
         V3DutchOutput[] memory outputs = new V3DutchOutput[](1);
         outputs[0] = V3DutchOutput(output, minimum, _expiryCurve(), trader, minimum, 0);
         V3DutchOrder memory order;
         order.info = OrderInfo(
-            IReactor(address(reactor)), trader, nonce, block.timestamp + 1 days, IValidationCallback(address(0)), ""
+            IReactor(address(reactor)), trader, nonce, block.timestamp + 1 days, signFor.validator(), condition
         );
         order.cosigner = vm.addr(COSIGNER_KEY);
         order.startingBaseFee = 0;
@@ -234,6 +292,7 @@ abstract contract UniswapXFillerHarness is UniversalRouterHarness {
             IHooks(address(0))
         );
         poolManager.initialize(m.key, uint160(1 << 96));
+        marketKey[address(token)] = m.key;
         PoolModifyLiquidityTest lp = new PoolModifyLiquidityTest(poolManager);
         token.approve(address(lp), type(uint256).max);
         IERC20(USDC).approve(address(lp), type(uint256).max);
@@ -415,7 +474,8 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
             address(0),
             appRecipient,
             _executionFee(),
-            feeRecipient
+            feeRecipient,
+            poolManager
         );
     }
 
@@ -551,14 +611,16 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         uint256 gross = _quote(m, false, 1000000e18, abi.encode(uint256(uint160(trader))));
         uint256 start = block.number;
         CallbackFiller outsider = _outsider();
-        // Control: the same order cosigned without an exclusive filler fills through the outsider.
+        // The same order cosigned without an exclusive filler is still refused for the outsider, by the validator
+        // (spec D22): exclusivity is a second, independent barrier.
         SignedOrder memory open =
             _expiringOrderFor(address(m.token), USDC, 1000000e18, gross / 2, 71, start, 0, address(0));
         uint256 snap = vm.snapshotState();
         vm.roll(start + 1);
         uint256 before = IERC20(USDC).balanceOf(trader);
+        vm.expectRevert(MercuriOrderValidator.WrongFiller.selector);
         outsider.fill(open);
-        assertEq(IERC20(USDC).balanceOf(trader) - before, gross / 2, "outsider fills an open order");
+        assertEq(IERC20(USDC).balanceOf(trader), before, "outsider moved output");
         assertTrue(vm.revertToState(snap));
         SignedOrder memory signed = _expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 72, start, 0);
         snap = vm.snapshotState();
@@ -584,9 +646,9 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         vm.roll(start + EXPIRY_BLOCKS + 1);
         uint256 beforeToken = IERC20(address(m.token)).balanceOf(trader);
         uint256 beforeOutsider = IERC20(USDC).balanceOf(address(outsider));
-        // Exclusivity has ended (not NoExclusiveOverride): the reactor resolves the order and then cannot take
-        // start + 2^128 of output from the outsider, whatever its balance.
-        vm.expectRevert(bytes("TRANSFER_FROM_FAILED"));
+        // Exclusivity has ended (not NoExclusiveOverride): the validator refuses any filler but ours (spec D22), and
+        // the output, start + 2^128, could not be paid anyway.
+        vm.expectRevert(MercuriOrderValidator.WrongFiller.selector);
         outsider.fill(signed);
         assertEq(IERC20(address(m.token)).balanceOf(trader), beforeToken);
         assertEq(IERC20(USDC).balanceOf(address(outsider)), beforeOutsider);
@@ -608,8 +670,8 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
             if (offset <= EXPIRY_BLOCKS) {
                 assertEq(bytes4(err), ExclusivityLib.NoExclusiveOverride.selector, "window refusal");
             } else {
-                // Exclusivity lapsed; the curve, not the window, kills the order.
-                assertEq(err, abi.encodeWithSignature("Error(string)", "TRANSFER_FROM_FAILED"), "dead-order refusal");
+                // Exclusivity lapsed; the validator refuses every filler but ours (spec D22).
+                assertEq(bytes4(err), MercuriOrderValidator.WrongFiller.selector, "dead-order refusal");
             }
         }
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0, "outsider used nonce");
@@ -666,15 +728,27 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         assertEq(IERC20(USDC).allowance(address(filler), address(reactor)), 0);
     }
 
-    function test_orderWithConditionDataStillFills() public {
-        // The reactor ignores additionalValidationData while the contract is zero; the keeper owns the trigger.
+    /// The superseded D11 condition, `abi.encode(uint8 kind, uint256 trigger)`, is refused by the validator before
+    /// anything moves, as is an order with no condition; the same order with the D22 condition fills.
+    function test_orderWithLegacyConditionDataRefused() public {
         Market memory m = _market(false, true);
         uint256 gross = _quote(m, false, 1000000e18, abi.encode(uint256(uint160(trader))));
         SignedOrder memory signed = _expiringOrder(address(m.token), USDC, 1000000e18, gross / 2, 68, block.number, 0);
         V3DutchOrder memory order = abi.decode(signed.order, (V3DutchOrder));
+        bytes memory current = order.info.additionalValidationData;
         order.info.additionalValidationData = abi.encode(uint8(1), uint256(2e18));
-        signed = _resign(order, address(m.token), 1000000e18, 68);
-        _fill(filler, signed, m.key);
+        SignedOrder memory legacy = _resign(order, address(m.token), 1000000e18, 68);
+        uint256 before = IERC20(address(m.token)).balanceOf(trader);
+        vm.expectRevert(MercuriOrderValidator.InvalidValidationData.selector);
+        _fill(filler, legacy, m.key);
+        order.info.additionalValidationData = "";
+        SignedOrder memory empty = _resign(order, address(m.token), 1000000e18, 68);
+        vm.expectRevert(MercuriOrderValidator.InvalidValidationData.selector);
+        _fill(filler, empty, m.key);
+        assertEq(IERC20(address(m.token)).balanceOf(trader), before);
+        assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
+        order.info.additionalValidationData = current;
+        _fill(filler, _resign(order, address(m.token), 1000000e18, 68), m.key);
     }
 
     function test_expiryBoundarySweep() public {
@@ -706,7 +780,8 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
             address(hook),
             appRecipient,
             _executionFee(),
-            feeRecipient
+            feeRecipient,
+            poolManager
         );
     }
 
@@ -841,7 +916,8 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
                 address(hook),
                 appRecipient,
                 fee,
-                address(0)
+                address(0),
+                poolManager
             );
         }
     }
@@ -849,6 +925,7 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
     /// A zero-fee filler pays the pre-fee amounts exactly on all four routes (see also UniswapXFillerZeroFeeTest).
     function test_execFeeZeroBehavesAsBefore() public {
         MercuriOrderFiller f = _newFiller(0);
+        signFor = f;
         for (uint256 route; route < 4; ++route) {
             bool launch = route < 2;
             bool buy = route % 2 == 0;
@@ -936,6 +1013,7 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
     }
 
     function _sellBoundary(MercuriOrderFiller f, bool launch, uint256 nonce) internal {
+        signFor = f;
         uint256 fee = f.executionFee();
         Market memory m = _market(false, launch);
         uint128 amount = _amount(launch, false);
@@ -1005,11 +1083,13 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
             address(hook),
             appRecipient,
             _executionFee(),
-            predicted
+            predicted,
+            poolManager
         );
         caller = new FillCaller(f, USDC);
         assertEq(address(caller), predicted, "keeper address");
         assertEq(f.feeRecipient(), address(caller));
+        signFor = f; // orders built next name this filler's validator
     }
 
     /// A contract keeper fills through the keeper path and earns exactly the execution fee, nothing more.
@@ -1268,6 +1348,7 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
     /// Fee at its maximum with the minimum order (spec D15: 10 USDC on the USDC side).
     function test_execFeeAtMaxWithMinimumOrder() public {
         MercuriOrderFiller f = _newFiller(MAX_FEE);
+        signFor = f;
         for (uint256 route; route < 4; ++route) {
             bool launch = route < 2;
             bool buy = route % 2 == 0;
@@ -1291,37 +1372,39 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
         }
     }
 
-    /// Orders bind the reactor and cosigner, not the filler, so an order signed before the fee existed (same
-    /// format) fills through the fee-charging filler when it has room above its minimum, and is refused with
-    /// nothing moved when its minimum leaves no room for the fee.
-    function test_execFeePreFeeOrderFillsThroughNewFiller() public {
+    /// R7: an order names its filler's validator in the trader's signature, so it is bound to that filler. An order
+    /// signed for another filler (here one without the fee) is refused by this one before the reactor, with nothing
+    /// moved, even with the same keeper and cosigner; the same order signed for this filler fills. A replacement filler
+    /// therefore never settles orders signed for the one it replaces.
+    function test_execFeeOrderForAnotherFillerRefused() public {
         MercuriOrderFiller old = _newFiller(0);
+        assertTrue(address(old.validator()) != address(filler.validator()), "each filler has its own validator");
         uint256 fee = filler.executionFee();
         Market memory m = _market(false, true);
         uint256 gross = _netQuote(m, false, 1000000e18, 0);
-        // Signed at the exact pre-fee quote: the old filler fills it; the new one refuses (V4TooLittleReceived).
-        SignedOrder memory exact = _order(address(m.token), USDC, 1000000e18, gross, 230);
-        uint256 snap = vm.snapshotState();
-        _fill(old, exact, m.key);
-        assertTrue(vm.revertToState(snap));
-        Snap memory before = _snap(m, filler, address(this));
-        _expectShortSell(m, gross + fee, gross);
-        _fill(filler, exact, m.key);
-        _assertUnchanged(before, _snap(m, filler, address(this)), "pre-fee exact quote");
-        assertFalse(_nonceUsed(230));
-        // A standing order with room above its minimum: same trader signature, fills through the new filler.
+        signFor = old;
         SignedOrder memory forOld =
-            _expiringOrderFor(address(m.token), USDC, 1000000e18, gross / 2, 231, block.number, 0, address(old));
+            _expiringOrderFor(address(m.token), USDC, 1000000e18, gross / 2, 231, block.number, 0, address(filler));
+        signFor = filler;
         SignedOrder memory forNew =
             _expiringOrderFor(address(m.token), USDC, 1000000e18, gross / 2, 231, block.number, 0, address(filler));
-        assertEq(forOld.sig, forNew.sig, "the trader's signature does not name the filler");
+        assertTrue(keccak256(forOld.sig) != keccak256(forNew.sig), "the trader's signature names the validator");
+        Snap memory before = _snap(m, filler, address(this));
+        vm.expectRevert(MercuriOrderFiller.WrongValidator.selector);
+        _fill(filler, forOld, m.key);
+        _assertUnchanged(before, _snap(m, filler, address(this)), "order for another filler");
+        assertFalse(_nonceUsed(231));
+        // The old filler cannot settle it either here: the cosigner made it exclusive to the new filler.
+        vm.expectRevert(ExclusivityLib.NoExclusiveOverride.selector);
+        _fill(old, forOld, m.key);
         _fill(filler, forNew, m.key);
         assertEq(IERC20(USDC).balanceOf(trader) - before.traderUsdc, gross - fee);
         assertEq(IERC20(USDC).balanceOf(feeRecipient) - before.keeper, fee);
         _assertFillerClean(m, filler);
     }
 
-    /// Fee on vs fee off on the same signed order: the trader's result differs by the fee and nothing else.
+    /// Fee on vs fee off on the same order, signed once for each filler's validator: the trader's result differs by
+    /// the fee and nothing else.
     function test_execFeeTraderSurplusMatchesZeroFeeExceptFee() public {
         MercuriOrderFiller off = _newFiller(0);
         uint256 fee = filler.executionFee();
@@ -1331,12 +1414,16 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
             Market memory m = _market(buy, launch);
             uint128 amount = _amount(launch, buy);
             (address input, address output) = _io(m, buy);
-            SignedOrder memory signed = _order(input, output, amount, _netQuote(m, buy, amount, fee) / 2, 240 + route);
+            uint256 minimum = _netQuote(m, buy, amount, fee) / 2;
+            signFor = off;
+            SignedOrder memory forOff = _order(input, output, amount, minimum, 240 + route);
+            signFor = filler;
+            SignedOrder memory signed = _order(input, output, amount, minimum, 240 + route);
             uint256 expectedOn = _netQuote(m, buy, amount, fee);
             uint256 expectedOff = _netQuote(m, buy, amount, 0);
             Snap memory before = _snap(m, filler, address(this));
             uint256 snap = vm.snapshotState();
-            _fill(off, signed, m.key);
+            _fill(off, forOff, m.key);
             Snap memory withoutFee = _snap(m, off, address(this));
             assertTrue(vm.revertToState(snap));
             _fill(filler, signed, m.key);
@@ -1365,6 +1452,7 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
     ) public {
         uint256 fee = bound(feeSeed, 0, MAX_FEE);
         MercuriOrderFiller f = _newFiller(fee);
+        signFor = f;
         Market memory m = _market(buy, launch);
         uint256 amount = buy || !launch ? bound(amountSeed, 1, 100e6) : bound(amountSeed, 1e12, 1e24);
         (address input, address output) = _io(m, buy);

@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""Read-only reproduction of the Trade reactor and filler runtime bytes at a pinned block.
+"""Read-only reproduction of the Trade reactor, filler and validator runtime bytes at a pinned block.
 
 Rebuilds each expected runtime from out/ (deployedBytecode + immutableReferences) with the manifest and
 deployment immutables substituted, then compares byte for byte with eth_getCode. Prints MATCH or the
 differing offsets and exits non-zero on any mismatch. No keys, no signing, no writes.
 
+The filler and its validator name each other (spec D22), and the binding is checked both ways: the filler's
+`validator` immutable is the recorded validator, the validator's `filler` immutable is the recorded filler, the
+validator is the CREATE2 address the filler's constructor deploys to (from the filler, VALIDATOR_SALT, the built
+validator creation code with (filler, poolManager)), and the filler is the CREATE2 address of the built filler creation
+code with the manifest's arguments through the standard deployer with FILLER_SALT. Both getters are also read with
+eth_call.
+
   python3 script/verify-trade-filler.py --rpc URL --block N --deployment FILE   # FILE has reactor, filler,
-                                                                                # reactorFeeOwner, feeRecipient,
-                                                                                # reactorFeeController
+                                                                                # validator, reactorFeeOwner,
+                                                                                # feeRecipient, reactorFeeController
   python3 script/verify-trade-filler.py --reactor-only --rpc URL --block N --deployment FILE
                                                     # the reactor alone, before any filler: FILE has reactor,
                                                     # reactorFeeOwner and reactorFeeController
@@ -37,13 +44,61 @@ MAX_EXECUTION_FEE = 100_000
 POINTER = '_getBlockNumberish'
 # The only immutables each contract may carry. A different set in either direction is a reviewed-source change.
 EXPECTED_IMMUTABLES = {
-    'filler': {'reactor', 'router', 'permit2', 'usdc', 'launchHook', 'appRecipient', 'executionFee', 'feeRecipient'},
+    'filler': {'reactor', 'router', 'permit2', 'usdc', 'launchHook', 'appRecipient', 'executionFee', 'feeRecipient',
+               'validator'},
+    'validator': {'filler', 'poolManager'},
     'reactor': {'permit2', POINTER},
 }
+FILLER_ARTIFACT = 'out/MercuriOrderFiller.sol/MercuriOrderFiller.json'
+VALIDATOR_ARTIFACT = 'out/MercuriOrderValidator.sol/MercuriOrderValidator.json'
+CREATE2_FACTORY = '0x4e59b44847b379578588920ca78fbf26c0b4956c'
+CREATE2_FACTORY_CODEHASH = '0x2fa86add0aed31f33a762c9d88e807c475bd51d0f52bd0955754b2608f7e4989'
+FILLER_SALT = bytes(32)  # TradeManifest.FILLER_SALT
+VALIDATOR_SALT = bytes(32)  # MercuriOrderFiller.VALIDATOR_SALT
 
 
 def cast_keccak(raw):
     return subprocess.run(['cast', 'keccak', '0x' + raw.hex()], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def create2_address(deployer, salt, init_code):
+    """EIP-1014: keccak256(0xff ++ deployer ++ salt ++ keccak256(init_code))[12:], lower case."""
+    init_hash = bytes.fromhex(cast_keccak(init_code).removeprefix('0x'))
+    raw = b'\xff' + bytes.fromhex(deployer.removeprefix('0x')) + salt + init_hash
+    return '0x' + cast_keccak(raw)[-40:]
+
+
+def creation_code(path):
+    return bytes.fromhex(load(path)['bytecode']['object'].removeprefix('0x'))
+
+
+def predicted_validator(filler, pool_manager):
+    """The validator the filler at `filler` deploys in its constructor."""
+    init = creation_code(VALIDATOR_ARTIFACT) + address_word(filler) + address_word(pool_manager)
+    return create2_address(filler, VALIDATOR_SALT, init)
+
+
+def predicted_filler(manifest, reactor, fee_recipient):
+    """The filler the deploy script lands through the standard CREATE2 deployer for these arguments."""
+    args = [address_word(reactor), address_word(manifest['router']), address_word(manifest['permit2']),
+            address_word(manifest['usdc']), address_word(manifest['launchHook']),
+            address_word(manifest['appRecipient']), uint_word(execution_fee(manifest)), address_word(fee_recipient),
+            address_word(manifest['poolManager'])]
+    return create2_address(CREATE2_FACTORY, FILLER_SALT, creation_code(FILLER_ARTIFACT) + b''.join(args))
+
+
+def create2_self_test():
+    """EIP-1014's own examples 0 and 5, so the address formula itself is checked offline."""
+    ok = True
+    for deployer, salt, init, want in (
+        ('0x0000000000000000000000000000000000000000', bytes(32), bytes(1), '0x4d1a2e2bb4f88f0250f26ffff098b0b30b26bf38'),
+        ('0x00000000000000000000000000000000deadbeef', bytes.fromhex('00000000000000000000000000000000000000000000000000000000cafebabe'),
+         bytes.fromhex('deadbeef'), '0x60f3f640a8508fc6a86d45df051962668e1e8ac7'),
+    ):
+        got = create2_address(deployer, salt, init)
+        print(f'create2 {deployer} {init.hex()}: {got} ({"ok" if got == want else "WRONG, want " + want})')
+        ok &= got == want
+    return ok
 
 
 def rpc_call(url, method, params):
@@ -167,7 +222,7 @@ def execution_fee(manifest):
     return fee
 
 
-def manifest_values(manifest, reactor, fee_recipient):
+def manifest_values(manifest, reactor, fee_recipient, validator):
     return {
         'reactor': address_word(reactor),
         'router': address_word(manifest['router']),
@@ -177,7 +232,12 @@ def manifest_values(manifest, reactor, fee_recipient):
         'appRecipient': address_word(manifest['appRecipient']),
         'executionFee': uint_word(execution_fee(manifest)),
         'feeRecipient': address_word(fee_recipient),
+        'validator': address_word(validator),
     }
+
+
+def validator_values(manifest, filler):
+    return {'filler': address_word(filler), 'poolManager': address_word(manifest['poolManager'])}
 
 
 def verify_reactor(args, manifest, owner, tag, live):
@@ -301,11 +361,17 @@ def expect_rejected(label, artifact, values, kind):
     return False
 
 
+# Offline self-tests stand in for the deployed pair with these placeholder addresses.
+SELF_TEST_FILLER = '0x00000000000000000000000000000000000000f1'
+SELF_TEST_VALIDATOR = '0x00000000000000000000000000000000000000f2'
+
+
 def immutable_set_self_test():
     import copy
     manifest = load('deployments/manifest-5042002.json')
     filler = load('out/MercuriOrderFiller.sol/MercuriOrderFiller.json')
-    values = manifest_values(manifest, '0x00000000000000000000000000000000000000aa', SELF_TEST_RECIPIENT)
+    values = manifest_values(manifest, '0x00000000000000000000000000000000000000aa', SELF_TEST_RECIPIENT,
+                             SELF_TEST_VALIDATOR)
     extra = copy.deepcopy(filler)
     extra['deployedBytecode']['immutableReferences']['999999999'] = [{'start': 0, 'length': 32}]
     extra.setdefault('ast', {}).setdefault('nodes', []).append(
@@ -333,9 +399,9 @@ def recipient_input_self_test():
 
 def self_test(flip, name='usdc'):
     manifest = load('deployments/manifest-5042002.json')
-    filler = load('out/MercuriOrderFiller.sol/MercuriOrderFiller.json')
+    filler = load(FILLER_ARTIFACT)
     fake_reactor = '0x00000000000000000000000000000000000000aa'
-    values = manifest_values(manifest, fake_reactor, SELF_TEST_RECIPIENT)
+    values = manifest_values(manifest, fake_reactor, SELF_TEST_RECIPIENT, SELF_TEST_VALIDATOR)
     live, ranges = expected_runtime(filler, values, 'filler')
     live = bytearray(live)
     if flip:
@@ -344,6 +410,20 @@ def self_test(flip, name='usdc'):
         live[start + 31] ^= 0x01
     ok = verify('filler self-test' + (f' (one {name} byte flipped)' if flip else ''), 'filler', filler, values, bytes(live))
     return ok
+
+
+def validator_self_test(flip, name='filler'):
+    """The validator's runtime with its two immutables; a flipped byte in either must be reported by name."""
+    manifest = load('deployments/manifest-5042002.json')
+    validator = load(VALIDATOR_ARTIFACT)
+    values = validator_values(manifest, SELF_TEST_FILLER)
+    live, ranges = expected_runtime(validator, values, 'validator')
+    live = bytearray(live)
+    if flip:
+        start = next(s for s, e, n in ranges if n == name)
+        live[start + 31] ^= 0x01
+    label = 'validator self-test' + (f' (one {name} byte flipped)' if flip else '')
+    return verify(label, 'validator', validator, values, bytes(live))
 
 
 # A known via-IR function id for the reactor's _getBlockNumberish pointer. Offline there is no constructor to
@@ -401,7 +481,8 @@ ROUTER_REPORT = 'docs/reports/2026-09-27-trade-router-comparison.json'
 ROUTER_ARTIFACT = 'out/trade-router/UniversalRouter.sol/UniversalRouter.json'
 PENDING_PREFIX = 'REQUIRED_'
 # Manifest key -> Launch record key; each must be equal.
-LAUNCH_FIELDS = {'permit2': 'permit2', 'usdc': 'usdc', 'launchHook': 'launchHook', 'appRecipient': 'treasury'}
+LAUNCH_FIELDS = {'permit2': 'permit2', 'usdc': 'usdc', 'launchHook': 'launchHook', 'poolManager': 'poolManager',
+                 'appRecipient': 'treasury'}
 # Owner choices that may still be pending sentinels during review.
 CHOICES = ('reactorFeeOwner', 'executionFee', 'feeRecipient')
 
@@ -557,7 +638,8 @@ def rehearsal_choice(deployment, key):
 
 def required_reactor_fields(deployment, reactor_only):
     """The deployment record keys a live run needs."""
-    keys = ['reactor', 'reactorFeeOwner', 'reactorFeeController'] + ([] if reactor_only else ['filler', 'feeRecipient'])
+    keys = ['reactor', 'reactorFeeOwner', 'reactorFeeController'] + (
+        [] if reactor_only else ['filler', 'validator', 'feeRecipient'])
     missing = [key for key in keys if not is_address(deployment.get(key))]
     if missing:
         raise SystemExit(f'deployment record lacks {", ".join(missing)}')
@@ -579,7 +661,8 @@ def preflight_self_test():
             ok = False
     base = load('deployments/manifest-5042002.json')
     other = '0x00000000000000000000000000000000000000Ab'
-    cases = {key: other for key in ('permit2', 'usdc', 'launchHook', 'appRecipient', 'reactorFeeOwner', 'router')}
+    cases = {key: other for key in ('permit2', 'usdc', 'launchHook', 'poolManager', 'appRecipient', 'reactorFeeOwner',
+                                    'router')}
     cases.update(routerCodeHash='0x' + '11' * 32, executionFee=100_001, feeRecipient='0x' + '0' * 40,
                  reactorFeeController='none', chainId=1)
     mainnet_owner = load(f'{LAUNCH_RECORDS}/5042.json')['timelock']
@@ -604,6 +687,10 @@ def preflight_self_test():
     for deployment, reactor_only, good in (
         ({'reactor': other, 'reactorFeeOwner': other, 'reactorFeeController': ZERO_ADDRESS}, True, True),
         ({'reactor': other, 'reactorFeeOwner': other, 'reactorFeeController': ZERO_ADDRESS}, False, False),
+        ({'reactor': other, 'reactorFeeOwner': other, 'reactorFeeController': ZERO_ADDRESS, 'filler': other,
+          'feeRecipient': other}, False, False),
+        ({'reactor': other, 'reactorFeeOwner': other, 'reactorFeeController': ZERO_ADDRESS, 'filler': other,
+          'validator': other, 'feeRecipient': other}, False, True),
         ({'reactor': other, 'reactorFeeOwner': other}, True, False),
     ):
         try:
@@ -624,6 +711,39 @@ def preflight_self_test():
     return ok
 
 
+VALIDATOR_SELECTOR = '0x3a5381b5'  # validator()
+FILLER_SELECTOR = '0xcaac9dca'  # filler()
+
+
+def check_binding(rpc, tag, manifest, deployment, fee_recipient, factory_code):
+    """Both directions of the filler-validator binding and both CREATE2 derivations. Prints and returns the verdict."""
+    ok = True
+    filler, validator = deployment['filler'].lower(), deployment['validator'].lower()
+    want_validator = predicted_validator(filler, manifest['poolManager'])
+    if want_validator != validator:
+        print(f'validator {validator} is not the CREATE2 address {want_validator} the filler deploys')
+        ok = False
+    else:
+        print(f'validator {validator} is the filler\'s own CREATE2 deployment (VALIDATOR_SALT, poolManager {manifest["poolManager"]})')
+    want_filler = predicted_filler(manifest, deployment['reactor'], fee_recipient)
+    if want_filler != filler:
+        print(f'filler {filler} is not the standard deployer\'s CREATE2 address {want_filler} for the built code and manifest')
+        ok = False
+    else:
+        print(f'filler {filler} is the standard deployer\'s CREATE2 of the built code with the manifest arguments')
+    if cast_keccak(factory_code) != CREATE2_FACTORY_CODEHASH:
+        print(f'CREATE2 deployer {CREATE2_FACTORY} code hash {cast_keccak(factory_code)} != {CREATE2_FACTORY_CODEHASH}')
+        ok = False
+    onchain_validator = '0x' + rpc_call(rpc, 'eth_call', [{'to': filler, 'data': VALIDATOR_SELECTOR}, tag])[-40:]
+    onchain_filler = '0x' + rpc_call(rpc, 'eth_call', [{'to': validator, 'data': FILLER_SELECTOR}, tag])[-40:]
+    if onchain_validator.lower() != validator or onchain_filler.lower() != filler:
+        print(f'binding read on chain: filler.validator() {onchain_validator}, validator.filler() {onchain_filler}')
+        ok = False
+    else:
+        print('binding read on chain: filler.validator() and validator.filler() name each other')
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--rpc', default=DEFAULT_RPC)
@@ -639,6 +759,9 @@ def main():
     parser.add_argument('--self-test-flipped', action='store_true', help='offline: verify with one immutable byte flipped; exits non-zero')
     parser.add_argument('--self-test-flipped-fee', action='store_true', help='offline: verify with one executionFee byte flipped; exits non-zero')
     parser.add_argument('--self-test-flipped-recipient', action='store_true', help='offline: verify with one feeRecipient byte flipped; exits non-zero')
+    parser.add_argument('--self-test-flipped-validator', action='store_true', help="offline: verify with one byte of the filler's validator flipped; exits non-zero")
+    parser.add_argument('--self-test-validator-flipped-filler', action='store_true', help="offline: verify the validator with one byte of its filler flipped; exits non-zero")
+    parser.add_argument('--self-test-validator-flipped-pool-manager', action='store_true', help="offline: verify the validator with one byte of its poolManager flipped; exits non-zero")
     parser.add_argument('--self-test-reactor-flipped', action='store_true', help='offline: verify the reactor with one function-pointer byte flipped; exits non-zero')
     args = parser.parse_args()
 
@@ -648,11 +771,22 @@ def main():
         sys.exit(0 if self_test(True, 'executionFee') else 1)
     if args.self_test_flipped_recipient:
         sys.exit(0 if self_test(True, 'feeRecipient') else 1)
+    if args.self_test_flipped_validator:
+        sys.exit(0 if self_test(True, 'validator') else 1)
+    if args.self_test_validator_flipped_filler:
+        sys.exit(0 if validator_self_test(True, 'filler') else 1)
+    if args.self_test_validator_flipped_pool_manager:
+        sys.exit(0 if validator_self_test(True, 'poolManager') else 1)
     if args.self_test_reactor_flipped:
         sys.exit(0 if reactor_self_test(True) else 1)
     if args.self_test:
-        good = self_test(False)
-        bad = self_test(True) or self_test(True, 'executionFee') or self_test(True, 'feeRecipient')
+        good = self_test(False) and validator_self_test(False)
+        bad = (self_test(True) or self_test(True, 'executionFee') or self_test(True, 'feeRecipient')
+               or self_test(True, 'validator') or validator_self_test(True, 'filler')
+               or validator_self_test(True, 'poolManager'))
+        if not create2_self_test():
+            print('self-test FAILED: the CREATE2 address formula does not reproduce EIP-1014')
+            sys.exit(1)
         if not recipient_input_self_test():
             print('self-test FAILED: a non-hex feeRecipient was not refused cleanly')
             sys.exit(1)
@@ -668,7 +802,7 @@ def main():
         if not good or bad or not sets or not reactor_good or reactor_bad:
             print('self-test FAILED: verifier did not behave as required')
             sys.exit(1)
-        print('self-test ok: unmodified runtimes match; a flipped filler usdc, executionFee or feeRecipient byte and a flipped reactor function-pointer byte are rejected; the reactor feeController check and the manifest preflight refuse every tampered value')
+        print('self-test ok: unmodified runtimes match; a flipped filler usdc, executionFee, feeRecipient or validator byte, a flipped validator filler or poolManager byte and a flipped reactor function-pointer byte are rejected; the CREATE2 formula reproduces EIP-1014; the reactor feeController check and the manifest preflight refuse every tampered value')
         return
     if args.preflight:
         sys.exit(0 if run_preflight(load(args.manifest), CHOICES if args.allow_pending else ()) else 1)
@@ -705,9 +839,12 @@ def main():
             fee_recipient = rehearsal_choice(deployment, 'feeRecipient')
         else:
             fee_recipient = required_fee_recipient(manifest, deployment)
-        filler = load('out/MercuriOrderFiller.sol/MercuriOrderFiller.json')
-        values = manifest_values(manifest, deployment['reactor'], fee_recipient)
+        filler = load(FILLER_ARTIFACT)
+        values = manifest_values(manifest, deployment['reactor'], fee_recipient, deployment['validator'])
         ok &= verify('filler', 'filler', filler, values, code(deployment['filler']))
+        ok &= verify('validator', 'validator', load(VALIDATOR_ARTIFACT), validator_values(manifest, deployment['filler']),
+                     code(deployment['validator']))
+        ok &= check_binding(args.rpc, tag, manifest, deployment, fee_recipient, code(CREATE2_FACTORY))
         ok &= check_router_code(code(manifest['router']), manifest, f'router at block {args.block}')
     onchain = rpc_call(args.rpc, 'eth_call', [{'to': deployment['reactor'], 'data': OWNER_SELECTOR}, tag])
     onchain = '0x' + onchain[-40:]

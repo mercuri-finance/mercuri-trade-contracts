@@ -2,15 +2,20 @@
 """Writes the Trade deployment record `<chainId>.json` from completed forge broadcasts. No keys, no network.
 
 The record has the shape of Launch's deployment records (one flat JSON object, sorted keys, two-space indent, chain id
-and blocks as integers) with the Trade keys: reactor, filler, executionFee, feeRecipient, reactorFeeOwner,
-reactorFeeController, appRecipient, launchHook, usdc, permit2, router, deployBlock (the reactor's block, the first in
-which either contract can emit), fillerDeployBlock, deployer, version and sourceRevision.
+and blocks as integers) with the Trade keys: reactor, filler, validator, executionFee, feeRecipient, reactorFeeOwner,
+reactorFeeController, appRecipient, launchHook, poolManager, usdc, permit2, router, deployBlock (the reactor's block,
+the first in which any of the contracts can emit), fillerDeployBlock (the filler's and its validator's block), deployer,
+version and sourceRevision.
 
 It only ever writes from a broadcast that completed: forge's `run-latest.json` (or a timestamped `run-*.json`) with no
-pending transaction, exactly the one expected CREATE, a receipt with status 1 for it, the receipt's contract address
-equal to the transaction's, the broadcast's chain equal to the manifest's and its commit a prefix of the source
-revision. The constructor arguments recorded in the broadcast must equal the manifest. Anything else is refused and
-nothing is written. A dry run (`dry-run/`, no receipts) is refused.
+pending transaction, exactly the one expected deployment, a receipt with status 1 for it, the broadcast's chain equal to
+the manifest's and its commit a prefix of the source revision. The reactor is a CREATE whose receipt names the same
+contract address. The filler is a CREATE2 through the standard deployer (spec D22): the transaction goes to that
+deployer, its input is `FILLER_SALT ++ init code`, the init code is the built filler's creation code with the
+recorded arguments, and the filler's address is that CREATE2 address; the one contract it creates in its constructor
+is the validator, at the CREATE2 address from the filler with `VALIDATOR_SALT` and the built validator's creation code
+with `(filler, poolManager)`. The constructor arguments must equal the manifest. Anything else is refused and nothing
+is written. A dry run (`dry-run/`, no receipts) is refused.
 
   python3 script/write-trade-record.py --reactor-broadcast FILE --filler-broadcast FILE [--manifest FILE]
                                        [--out-dir deployments] [--source-revision SHA]
@@ -41,6 +46,11 @@ ANVIL_ACCOUNTS = {a.lower() for a in (
     '0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f', '0xa0Ee7A142d267C1f36714E4a8F75612F20a79720',
 )}
 ZERO = '0x' + '0' * 40
+CREATE2_FACTORY = '0x4e59b44847b379578588920ca78fbf26c0b4956c'
+FILLER_SALT = '00' * 32  # TradeManifest.FILLER_SALT
+VALIDATOR_SALT = '00' * 32  # MercuriOrderFiller.VALIDATOR_SALT
+FILLER_ARTIFACT = 'out/MercuriOrderFiller.sol/MercuriOrderFiller.json'
+VALIDATOR_ARTIFACT = 'out/MercuriOrderValidator.sol/MercuriOrderValidator.json'
 
 
 class Refused(Exception):
@@ -56,8 +66,43 @@ def same(a, b):
     return isinstance(a, str) and isinstance(b, str) and a.lower() == b.lower()
 
 
+def keccak(data):
+    out = subprocess.run(['cast', 'keccak', '0x' + data.hex()], capture_output=True, text=True)
+    if out.returncode != 0:
+        raise Refused(f'cast keccak failed: {out.stderr.strip()}')
+    return bytes.fromhex(out.stdout.strip().removeprefix('0x'))
+
+
+def create2_address(deployer, salt_hex, init_code):
+    """EIP-1014: keccak256(0xff ++ deployer ++ salt ++ keccak256(init_code))[12:]."""
+    raw = b'\xff' + bytes.fromhex(deployer.removeprefix('0x')) + bytes.fromhex(salt_hex) + keccak(init_code)
+    return '0x' + keccak(raw)[12:].hex()
+
+
+def word(value):
+    """One ABI word: an address or an unsigned integer given as a string."""
+    if is_address(value):
+        return bytes(12) + bytes.fromhex(value[2:])
+    return int(str(value)).to_bytes(32, 'big')
+
+
+def creation_code(artifact):
+    try:
+        data = json.loads((root / artifact).read_text())
+    except (OSError, ValueError) as error:
+        raise Refused(f'cannot read {artifact} (run forge build): {error}')
+    return bytes.fromhex(data['bytecode']['object'].removeprefix('0x'))
+
+
+def validator_address(filler, pool_manager, code=None):
+    """The validator the filler at `filler` deploys: CREATE2 from the filler with VALIDATOR_SALT."""
+    code = creation_code(VALIDATOR_ARTIFACT) if code is None else code
+    return create2_address(filler, VALIDATOR_SALT, code + word(filler) + word(pool_manager))
+
+
 def completed_create(path, contract, chain, revision):
-    """The (address, block, deployer, arguments) of the one CREATE of `contract` in a completed broadcast."""
+    """The (address, block, deployer, arguments, transaction) of the one deployment of `contract` in a completed
+    broadcast: a CREATE for the reactor, a CREATE2 through the standard deployer for the filler."""
     path = Path(path)
     if 'dry-run' in path.parts:
         raise Refused(f'{path} is a dry run: nothing was broadcast')
@@ -79,23 +124,38 @@ def completed_create(path, contract, chain, revision):
         raise Refused(f'{path} has {len(transactions)} transactions; expected the one {contract} deployment')
     tx = transactions[0]
     name = str(tx.get('contractName') or '')
-    if tx.get('transactionType') != 'CREATE' or name.split('.')[0] != contract:
-        raise Refused(f'{path} deploys {name or "nothing"} ({tx.get("transactionType")}), not {contract}')
+    kind = 'CREATE2' if contract == 'MercuriOrderFiller' else 'CREATE'
+    if tx.get('transactionType') != kind or name.split('.')[0] != contract:
+        raise Refused(f'{path} deploys {name or "nothing"} ({tx.get("transactionType")}), not {contract} by {kind}')
     receipts = {str(r.get('transactionHash', '')).lower(): r for r in data.get('receipts') or []}
     receipt = receipts.get(str(tx.get('hash', '')).lower())
     if receipt is None:
         raise Refused(f'{path} has no receipt for {tx.get("hash")}: the broadcast did not complete')
     if receipt.get('status') not in ('0x1', 1):
         raise Refused(f'{path}: the {contract} deployment {tx.get("hash")} failed (status {receipt.get("status")})')
-    address = receipt.get('contractAddress')
-    if not is_address(address) or not same(address, tx.get('contractAddress')):
-        raise Refused(f'{path}: receipt contract address {address} != transaction {tx.get("contractAddress")}')
+    if kind == 'CREATE':
+        address = receipt.get('contractAddress')
+        if not is_address(address) or not same(address, tx.get('contractAddress')):
+            raise Refused(f'{path}: receipt contract address {address} != transaction {tx.get("contractAddress")}')
+    else:
+        # A CREATE2 through the deployer is a call: its receipt has no contract address. The address follows from
+        # the call's input, which must be the salt and an init code whose CREATE2 address is the recorded one.
+        address = tx.get('contractAddress')
+        body = (tx.get('transaction') or {})
+        if not same(body.get('to'), CREATE2_FACTORY):
+            raise Refused(f'{path}: the {contract} CREATE2 went to {body.get("to")}, not the standard deployer')
+        data = str(body.get('input') or body.get('data') or '').removeprefix('0x')
+        if len(data) < 64 or data[:64] != FILLER_SALT:
+            raise Refused(f'{path}: the {contract} CREATE2 does not use FILLER_SALT')
+        if not is_address(address) or not same(create2_address(CREATE2_FACTORY, data[:64], bytes.fromhex(data[64:])),
+                                                address):
+            raise Refused(f'{path}: transaction contract address {address} is not the CREATE2 address of its input')
     try:
         block = int(receipt['blockNumber'], 16) if isinstance(receipt['blockNumber'], str) else int(receipt['blockNumber'])
     except (KeyError, TypeError, ValueError):
         raise Refused(f'{path}: the receipt has no block number')
     deployer = (tx.get('transaction') or {}).get('from') or receipt.get('from')
-    return checksum(address), block, checksum(deployer), list(tx.get('arguments') or [])
+    return checksum(address), block, checksum(deployer), list(tx.get('arguments') or []), tx
 
 
 def checksum(address):
@@ -123,7 +183,8 @@ def chosen(manifest, key, value, rehearsal):
 def build(args, manifest, revision):
     chain = manifest['chainId']
     if args.reactor_broadcast:
-        reactor, block, _, reactor_args = completed_create(args.reactor_broadcast, 'V3DutchOrderReactor', chain, revision)
+        reactor, block, _, reactor_args, _ = completed_create(
+            args.reactor_broadcast, 'V3DutchOrderReactor', chain, revision)
         if len(reactor_args) != 2:
             raise Refused(f'reactor constructor arguments {reactor_args} are not (permit2, owner)')
         if not same(reactor_args[0], manifest['permit2']):
@@ -140,13 +201,31 @@ def build(args, manifest, revision):
             raise Refused(f'previous record reactorFeeOwner {owner} != manifest {manifest.get("reactorFeeOwner")}')
         if not same(controller, manifest.get('reactorFeeController', ZERO)):
             raise Refused(f'previous record reactorFeeController {controller} != manifest')
-    filler, filler_block, deployer, filler_args = completed_create(
+    filler, filler_block, deployer, filler_args, filler_tx = completed_create(
         args.filler_broadcast, 'MercuriOrderFiller', chain, revision)
-    if len(filler_args) != 8:
-        raise Refused(f'filler constructor arguments {filler_args} are not the eight the filler takes')
+    if len(filler_args) != 9:
+        raise Refused(f'filler constructor arguments {filler_args} are not the nine the filler takes')
     for index, key in enumerate(('router', 'permit2', 'usdc', 'launchHook', 'appRecipient'), start=1):
         if not same(filler_args[index], manifest[key]):
             raise Refused(f'filler {key} {filler_args[index]} != manifest {manifest[key]}')
+    if not same(filler_args[8], manifest.get('poolManager')):
+        raise Refused(f'filler poolManager {filler_args[8]} != manifest {manifest.get("poolManager")}')
+    # The CREATE2 input must be this build's filler creation code with exactly the recorded arguments.
+    body = filler_tx.get('transaction') or {}
+    init = bytes.fromhex(str(body.get('input') or body.get('data') or '').removeprefix('0x')[64:])
+    expected_init = creation_code(FILLER_ARTIFACT) + b''.join(word(a) for a in filler_args)
+    if init != expected_init:
+        raise Refused('filler init code is not the built MercuriOrderFiller with the recorded arguments')
+    created = filler_tx.get('additionalContracts') or []
+    if len(created) != 1 or str(created[0].get('contractName') or '').split('.')[0] != 'MercuriOrderValidator':
+        raise Refused(f'the filler deployment created {len(created)} contracts, not exactly its MercuriOrderValidator')
+    validator = created[0].get('address')
+    expected_validator = validator_address(filler, filler_args[8])
+    if not same(validator, expected_validator):
+        raise Refused(f'validator {validator} is not the CREATE2 address {expected_validator} from the filler')
+    validator_init = bytes.fromhex(str(created[0].get('initCode') or '').removeprefix('0x'))
+    if validator_init != creation_code(VALIDATOR_ARTIFACT) + word(filler) + word(filler_args[8]):
+        raise Refused('validator init code is not the built MercuriOrderValidator bound to this filler')
     if not same(filler_args[0], reactor):
         raise Refused(f'filler reactor {filler_args[0]} != recorded reactor {reactor}')
     if filler_block < block:
@@ -168,12 +247,14 @@ def build(args, manifest, revision):
         'fillerDeployBlock': filler_block,
         'launchHook': checksum(manifest['launchHook']),
         'permit2': checksum(manifest['permit2']),
+        'poolManager': checksum(manifest['poolManager']),
         'reactor': checksum(reactor),
         'reactorFeeController': checksum(controller),
         'reactorFeeOwner': checksum(owner),
         'router': checksum(manifest['router']),
         'sourceRevision': revision,
         'usdc': checksum(manifest['usdc']),
+        'validator': checksum(validator),
         'version': VERSION,
     }
 
@@ -220,16 +301,20 @@ def selftest():
     base = json.loads((root / 'deployments/manifest-5042002.json').read_text())
     chosen_manifest = dict(base, feeRecipient=keeper)
 
-    def broadcast(name, address, arguments, block, **override):
+    filler_code = creation_code(FILLER_ARTIFACT)
+    validator_code = creation_code(VALIDATOR_ARTIFACT)
+
+    def broadcast(name, address, arguments, block, tx=None, receipt=None, **override):
         tx_hash = '0x' + (('aa' if name.startswith('V3') else 'bb') * 32)
         data = {
-            'transactions': [{
+            'transactions': [dict({
                 'hash': tx_hash, 'transactionType': 'CREATE', 'contractName': name, 'contractAddress': address,
                 'function': None, 'arguments': arguments,
                 'transaction': {'from': '0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266'},
-            }],
-            'receipts': [{'status': '0x1', 'transactionHash': tx_hash, 'blockNumber': hex(block),
-                          'contractAddress': address, 'from': '0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266'}],
+            }, **(tx or {}))],
+            'receipts': [dict({'status': '0x1', 'transactionHash': tx_hash, 'blockNumber': hex(block),
+                               'contractAddress': address, 'from': '0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266'},
+                              **(receipt or {}))],
             'libraries': [], 'pending': [], 'returns': {}, 'timestamp': 1, 'chain': 5042002, 'commit': 'b794a9c',
         }
         for key, value in override.items():
@@ -244,13 +329,29 @@ def selftest():
     def reactor_bc(**o):
         return broadcast('V3DutchOrderReactor.small', reactor, [base['permit2'], base['reactorFeeOwner']], 100, **o)
 
-    def filler_args(owner_reactor=reactor, recipient=keeper, fee=None):
+    def filler_args(owner_reactor=reactor, recipient=keeper, fee=None, pool_manager=None):
         return [owner_reactor, base['router'], base['permit2'], base['usdc'], base['launchHook'],
-                base['appRecipient'], str(base['executionFee'] if fee is None else fee), recipient]
+                base['appRecipient'], str(base['executionFee'] if fee is None else fee), recipient,
+                pool_manager or base['poolManager']]
 
     def filler_bc(**o):
+        """A CREATE2 of the built filler through the standard deployer, with its validator, as forge records it."""
         arguments = o.pop('arguments', filler_args())
-        return broadcast('MercuriOrderFiller', filler, arguments, 101, **o)
+        init = filler_code + b''.join(word(a) for a in arguments)
+        address = create2_address(CREATE2_FACTORY, FILLER_SALT, init)
+        validator = validator_address(address, arguments[8], validator_code)
+        tx = {
+            'transactionType': 'CREATE2',
+            'transaction': {'from': '0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266', 'to': CREATE2_FACTORY,
+                            'input': '0x' + FILLER_SALT + init.hex()},
+            'additionalContracts': [{
+                'transactionType': 'CREATE2', 'contractName': 'MercuriOrderValidator', 'address': validator,
+                'initCode': '0x' + (validator_code + word(address) + word(arguments[8])).hex(),
+            }],
+        }
+        tx.update(o.pop('tx', {}))
+        receipt = dict({'contractAddress': None}, **o.pop('receipt', {}))
+        return broadcast('MercuriOrderFiller', address, arguments, 101, tx=tx, receipt=receipt, **o)
 
     cases = []
 
@@ -285,7 +386,8 @@ def selftest():
             cases.append((name, ok, text, record))
 
     case('complete broadcasts', chosen_manifest, reactor_bc(), filler_bc(), True,
-         must=['"fillerDeployBlock": 101', '"deployBlock": 100', '"reactorFeeOwner": "0x41129B5215cA24b29a4cABcaE26d3569744DEe2E"'])
+         must=['"fillerDeployBlock": 101', '"deployBlock": 100', '"reactorFeeOwner": "0x41129B5215cA24b29a4cABcaE26d3569744DEe2E"',
+               '"validator": "0x', '"poolManager": "0x8366a39CC670B4001A1121B8F6A443A643e40951"'])
     case('pending transaction', chosen_manifest, reactor_bc(), filler_bc(pending=[{'hash': '0x01'}]), False,
          must=['pending'])
     case('no receipt', chosen_manifest, reactor_bc(receipts=[]), filler_bc(), False, must=['no receipt'])
@@ -294,8 +396,35 @@ def selftest():
     case('other chain', chosen_manifest, reactor_bc(chain=5042), filler_bc(), False, must=['chain 5042'])
     case('other contract', chosen_manifest, reactor_bc(), filler_bc(tx={'contractName': 'CallbackFiller'}), False,
          must=['not MercuriOrderFiller'])
-    case('receipt address differs', chosen_manifest, reactor_bc(), filler_bc(receipt={'contractAddress': reactor}),
+    case('filler by plain CREATE', chosen_manifest, reactor_bc(), filler_bc(tx={'transactionType': 'CREATE'}), False,
+         must=['not MercuriOrderFiller by CREATE2'])
+    case('receipt address differs', chosen_manifest, reactor_bc(receipt={'contractAddress': filler}), filler_bc(),
          False, must=['receipt contract address'])
+    good = filler_bc()
+    other_address = '0x' + '12' * 20
+    case('filler not at the CREATE2 address of its input', chosen_manifest, reactor_bc(),
+         filler_bc(tx={'contractAddress': other_address}), False, must=['not the CREATE2 address'])
+    case('filler CREATE2 through another deployer', chosen_manifest, reactor_bc(),
+         filler_bc(tx={'transaction': dict(good['transactions'][0]['transaction'], to=other_address)}), False,
+         must=['not the standard deployer'])
+    case('filler with another salt', chosen_manifest, reactor_bc(),
+         filler_bc(tx={'transaction': dict(good['transactions'][0]['transaction'],
+                                           input='0x' + '01' * 32 + good['transactions'][0]['transaction']['input'][66:])}),
+         False, must=['FILLER_SALT'])
+    tampered = bytearray.fromhex(good['transactions'][0]['transaction']['input'][2:])
+    tampered[-1] ^= 1  # the recorded arguments name one pool manager, the init code another
+    tampered_address = create2_address(CREATE2_FACTORY, FILLER_SALT, bytes(tampered[32:]))
+    case('filler init code differs from its recorded arguments', chosen_manifest, reactor_bc(),
+         filler_bc(tx={'contractAddress': tampered_address,
+                       'transaction': dict(good['transactions'][0]['transaction'], input='0x' + tampered.hex())}),
+         False, must=['not the built MercuriOrderFiller'])
+    case('no validator created', chosen_manifest, reactor_bc(), filler_bc(tx={'additionalContracts': []}), False,
+         must=['not exactly its MercuriOrderValidator'])
+    wrong_validator = dict(good['transactions'][0]['additionalContracts'][0], address=other_address)
+    case('validator elsewhere', chosen_manifest, reactor_bc(), filler_bc(tx={'additionalContracts': [wrong_validator]}),
+         False, must=['is not the CREATE2 address'])
+    case('filler poolManager differs', chosen_manifest, reactor_bc(),
+         filler_bc(arguments=filler_args(pool_manager=other_address)), False, must=['poolManager'])
     case('commit is not the revision', chosen_manifest, reactor_bc(commit='deadbee'), filler_bc(), False,
          must=['commit deadbee'])
     case('owner is not the manifest timelock', chosen_manifest,

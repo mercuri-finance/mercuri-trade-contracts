@@ -19,6 +19,11 @@ import {ERC20 as XERC20} from "../../lib/uniswapx/lib/solmate/src/tokens/ERC20.s
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {ExclusivityLib} from "../../lib/uniswapx/src/lib/ExclusivityLib.sol";
 import {CallbackFiller} from "../utils/CallbackFiller.sol";
+import {MercuriOrderValidator} from "../../src/MercuriOrderValidator.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @dev Local-only deployment: no reactor is assumed to exist on Arc testnet.
 contract UniswapXLocalTest is LaunchFixture {
@@ -100,8 +105,15 @@ contract UniswapXLocalTest is LaunchFixture {
 
     uint256 internal constant EXPIRING_START_AMOUNT = 50e6;
 
-    /// The order the app submits: single-point expiry curve, take-profit condition data, no cosignature yet.
-    function _uncosignedExpiring(uint256 nonce, uint256 deadline) internal view returns (V3DutchOrder memory order) {
+    /// The order the app submits: single-point expiry curve, naming the validator with a take-profit condition on
+    /// `pool` at `trigger` (spec D22), no cosignature yet.
+    function _uncosignedExpiring(
+        uint256 nonce,
+        uint256 deadline,
+        IValidationCallback validator,
+        bytes32 pool,
+        uint160 trigger
+    ) internal view returns (V3DutchOrder memory order) {
         NonlinearDutchDecay memory flat = NonlinearDutchDecay(0, new int256[](0));
         int256[] memory amounts = new int256[](1);
         amounts[0] = -int256(uint256(1) << 128);
@@ -119,8 +131,8 @@ contract UniswapXLocalTest is LaunchFixture {
             swapper,
             nonce,
             deadline,
-            IValidationCallback(address(0)),
-            abi.encode(uint8(1), uint256(2e18)) // take-profit at 2.0; ignored on-chain while the contract is zero
+            validator,
+            abi.encode(uint8(1), uint8(1), pool, trigger) // version 1, take-profit, the signed pool, the trigger
         );
         order.cosigner = vm.addr(COSIGNER_KEY);
         order.startingBaseFee = 0;
@@ -153,8 +165,31 @@ contract UniswapXLocalTest is LaunchFixture {
         );
     }
 
+    /// A hookless pool of the vector's two tokens, initialized at the order's own rate (50 output per 100 input, raw
+    /// units) as a v4 `sqrtPriceX96`. The take-profit trigger is that price, so the order is exactly at its trigger.
+    function _vectorPool() internal returns (bytes32 pool, uint160 price) {
+        bool inputIs0 = address(inputToken) < address(outputToken);
+        PoolKey memory key = PoolKey(
+            Currency.wrap(inputIs0 ? address(inputToken) : address(outputToken)),
+            Currency.wrap(inputIs0 ? address(outputToken) : address(inputToken)),
+            3000,
+            60,
+            IHooks(address(0))
+        );
+        // price = currency1 per currency0; the rate is EXPIRING_START_AMOUNT output per 100e18 input.
+        (uint256 num, uint256 den) =
+            inputIs0 ? (EXPIRING_START_AMOUNT, uint256(100e18)) : (100e18, EXPIRING_START_AMOUNT);
+        price = uint160(Math.sqrt(Math.mulDiv(num, 1 << 192, den)));
+        poolManager.initialize(key, price);
+        pool = keccak256(abi.encode(key));
+    }
+
     function test_exportExpiringOrderVector() public {
-        V3DutchOrder memory order = _uncosignedExpiring(19, block.timestamp + 1 days);
+        // The validator is bound to the export filler, the stand-in for MercuriOrderFiller in this vector.
+        CallbackFiller exportFiller = new CallbackFiller(IReactor(address(reactor)));
+        MercuriOrderValidator validator = new MercuriOrderValidator(address(exportFiller), poolManager);
+        (bytes32 pool, uint160 trigger) = _vectorPool();
+        V3DutchOrder memory order = _uncosignedExpiring(19, block.timestamp + 1 days, validator, pool, trigger);
         bytes32 orderHash = order.hash();
         bytes32 permitDigest = _permitDigest(order, orderHash);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(TRADER_KEY, permitDigest);
@@ -163,7 +198,6 @@ contract UniswapXLocalTest is LaunchFixture {
         bytes memory uncosigned = abi.encode(order);
 
         // Cosigned as the keeper does at head 1000: decay starts at 1020 and only our filler may fill until then.
-        CallbackFiller exportFiller = new CallbackFiller(IReactor(address(reactor)));
         order.cosignerData = CosignerData(1020, address(exportFiller), 0, 0, new uint256[](1));
         order.cosignerData.outputAmounts[0] = EXPIRING_START_AMOUNT + 1;
         bytes32 cosignedDigest = order.cosignerDigest(orderHash);
@@ -172,11 +206,18 @@ contract UniswapXLocalTest is LaunchFixture {
         assertEq(order.hash(), orderHash, "cosigner data is outside the signed hash");
 
         // The vector must be a real order: at the last valid block (1020) another filler is refused and the
-        // cosigned copy fills through the named filler.
+        // cosigned copy fills through the named filler, whose validator accepts the price at the trigger.
         SignedOrder memory cosigned = SignedOrder(abi.encode(order), signature);
         vm.roll(1020);
         vm.expectRevert(ExclusivityLib.NoExclusiveOverride.selector);
         reactor.execute(cosigned);
+        // Another filler holding the same cosigned order past exclusivity is refused by the validator.
+        CallbackFiller other = new CallbackFiller(IReactor(address(reactor)));
+        uint256 beforeOther = vm.snapshotState();
+        vm.roll(1021);
+        vm.expectRevert(MercuriOrderValidator.WrongFiller.selector);
+        other.fill(cosigned);
+        assertTrue(vm.revertToState(beforeOther));
         outputToken.mint(address(exportFiller), EXPIRING_START_AMOUNT + 1);
         uint256 snap = vm.snapshotState();
         vm.roll(1021); // one block later the output is start + 2^128: dead for every filler
@@ -197,6 +238,11 @@ contract UniswapXLocalTest is LaunchFixture {
         vm.serializeAddress(key, "trader", swapper);
         vm.serializeAddress(key, "cosigner", order.cosigner);
         vm.serializeAddress(key, "filler", address(exportFiller));
+        vm.serializeAddress(key, "validator", address(validator));
+        vm.serializeBytes32(key, "poolId", pool);
+        vm.serializeUint(key, "kind", 1);
+        vm.serializeUint(key, "triggerSqrtPriceX96", trigger);
+        vm.serializeBytes(key, "additionalValidationData", order.info.additionalValidationData);
         vm.serializeUint(key, "chainId", block.chainid);
         vm.serializeBytes32(key, "hash", orderHash);
         vm.serializeBytes32(key, "cosignerDigest", uncosignedDigest);

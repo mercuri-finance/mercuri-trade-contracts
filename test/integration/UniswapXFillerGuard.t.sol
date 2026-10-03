@@ -178,14 +178,20 @@ contract UniswapXFillerGuardTest is UniswapXFillerHarness {
         NonlinearDutchDecay memory curve,
         uint256 decayStartBlock,
         address output,
-        uint256 nonce
+        uint256 nonce,
+        IValidationCallback validator
     ) internal view returns (SignedOrder memory signed) {
         NonlinearDutchDecay memory flat = NonlinearDutchDecay(0, new int256[](0));
         V3DutchOutput[] memory outputs = new V3DutchOutput[](1);
         outputs[0] = V3DutchOutput(output, 1, flat, trader, 1, 0);
         V3DutchOrder memory order;
         order.info = OrderInfo(
-            IReactor(address(reactor)), trader, nonce, block.timestamp + 1 days, IValidationCallback(address(0)), ""
+            IReactor(address(reactor)),
+            trader,
+            nonce,
+            block.timestamp + 1 days,
+            validator,
+            address(validator) == address(0) ? bytes("") : _limitData(USDC, output)
         );
         order.cosigner = vm.addr(COSIGNER_KEY);
         order.startingBaseFee = startingBaseFee;
@@ -232,13 +238,37 @@ contract UniswapXFillerGuardTest is UniswapXFillerHarness {
         uint256 b1 = b0 + bound(s.gap, 1, 100);
         NonlinearDutchDecay memory curve = NonlinearDutchDecay(b0 | (b1 << 16), amounts);
         uint256 decayStart = block.number + bound(s.decayDelay, 0, 10);
-        SignedOrder memory signed =
-            _curvedOrder(start, max, cosigned, adjustment, startingBaseFee, curve, decayStart, address(m.token), 320);
+        SignedOrder memory signed = _curvedOrder(
+            start,
+            max,
+            cosigned,
+            adjustment,
+            startingBaseFee,
+            curve,
+            decayStart,
+            address(m.token),
+            320,
+            filler.validator()
+        );
+        // The probe is not the validator's filler, so it resolves the same input side signed without a validator: the
+        // validator reads only the condition, never the amounts.
+        SignedOrder memory unvalidated = _curvedOrder(
+            start,
+            max,
+            cosigned,
+            adjustment,
+            startingBaseFee,
+            curve,
+            decayStart,
+            address(m.token),
+            320,
+            IValidationCallback(address(0))
+        );
         vm.roll(block.number + bound(s.elapsed, 0, 300));
 
         InputProbe probe = new InputProbe(IReactor(address(reactor)));
         uint256 resolved;
-        try probe.probe(signed) {
+        try probe.probe(unvalidated) {
             revert("probe returned");
         } catch (bytes memory err) {
             assertEq(bytes4(err), InputProbe.Resolved.selector, "reactor refused the probe");
@@ -288,6 +318,7 @@ contract UniswapXFillerGuardTest is UniswapXFillerHarness {
             IHooks(address(0))
         );
         poolManager.initialize(m.key, uint160(1 << 96));
+        marketKey[address(token)] = m.key;
         PoolModifyLiquidityTest lp = new PoolModifyLiquidityTest(poolManager);
         token.approve(address(lp), type(uint256).max);
         IERC20(USDC).approve(address(lp), type(uint256).max);

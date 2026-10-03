@@ -39,6 +39,15 @@ for pair in 'fee:executionFee' 'recipient:feeRecipient'; do
   fi
   grep -q "MISMATCH at offsets.*inside immutables: ${pair##*:}" <<<"$flipped" || { echo "flipped ${pair##*:} self-test failed without its mismatch report: $flipped" >&2; exit 1; }
 done
+# The filler and its validator name each other (spec D22): a flipped byte in the filler's `validator` or in the
+# validator's `filler` or `poolManager` must be reported against its own name.
+for pair in 'flipped-validator:validator' 'validator-flipped-filler:filler' 'validator-flipped-pool-manager:poolManager'; do
+  if flipped=$(python3 script/verify-trade-filler.py --self-test-${pair%%:*} 2>&1); then
+    echo "verify-trade-filler.py accepted a runtime with a flipped ${pair##*:} byte (${pair%%:*})" >&2
+    exit 1
+  fi
+  grep -q "MISMATCH at offsets.*inside immutables: ${pair##*:}" <<<"$flipped" || { echo "${pair%%:*} self-test failed without its mismatch report: $flipped" >&2; exit 1; }
+done
 # The reactor's via-IR function-pointer immutable comes from a constructor simulation; a flipped pointer byte must fail.
 if flipped=$(python3 script/verify-trade-filler.py --self-test-reactor-flipped 2>&1); then
   echo 'verify-trade-filler.py accepted a reactor runtime with a flipped function-pointer byte' >&2

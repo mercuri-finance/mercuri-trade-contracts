@@ -12,14 +12,14 @@ import {
     CosignerData
 } from "../../lib/uniswapx/src/lib/V3DutchOrderLib.sol";
 import {IReactor} from "../../lib/uniswapx/src/interfaces/IReactor.sol";
-import {IValidationCallback} from "../../lib/uniswapx/src/interfaces/IValidationCallback.sol";
 import {ERC20 as XERC20} from "../../lib/uniswapx/lib/solmate/src/tokens/ERC20.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 
 /// @dev Offline state export for the Go/Anvil late-cosigning test. Never broadcast. Four trader-signed, uncosigned
 ///      limit orders (buy and sell on a Launch pool and on a listed, hookless pool) carry the single-point expiry curve
-///      and the signed condition, exactly as the web app submits them. The backend keeper cosigns them at fill time
-///      with Anvil's second development key.
+///      and name the filler's validator with the signed condition (spec D22: version 1, limit, the order's pool, no
+///      trigger), exactly as the web app submits them. The backend keeper cosigns them at fill time with Anvil's second
+///      development key. The export holds the reactor, the filler and the validator the filler deployed.
 contract TradeLocalStateTest is UniswapXFillerHarness {
     using V3DutchOrderLib for V3DutchOrder;
 
@@ -65,6 +65,7 @@ contract TradeLocalStateTest is UniswapXFillerHarness {
         vm.serializeAddress(KEY, "reactor", address(reactor));
         vm.serializeAddress(KEY, "permit2", address(permit2));
         vm.serializeAddress(KEY, "filler", address(filler));
+        vm.serializeAddress(KEY, "validator", address(filler.validator()));
         vm.serializeAddress(KEY, "quoter", address(quoter));
         vm.serializeAddress(KEY, "poolManager", address(poolManager));
         vm.serializeAddress(KEY, "launchHook", address(hook));
@@ -117,8 +118,8 @@ contract TradeLocalStateTest is UniswapXFillerHarness {
             trader,
             nonce,
             block.timestamp + 1 days,
-            IValidationCallback(address(0)),
-            abi.encode(uint8(0), uint256(0)) // the signed condition: a limit order
+            filler.validator(),
+            _limitData(input, output) // the signed condition: a limit order on this market's pool
         );
         order.cosigner = LOCAL_COSIGNER;
         order.startingBaseFee = 0;

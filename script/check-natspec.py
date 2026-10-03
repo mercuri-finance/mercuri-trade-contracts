@@ -12,7 +12,11 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CONTRACTS = {"MercuriOrderFiller": "src/MercuriOrderFiller.sol", "IOrderSwapRouter": "src/interfaces/IOrderSwapRouter.sol"}
+CONTRACTS = {
+    "MercuriOrderFiller": "src/MercuriOrderFiller.sol",
+    "MercuriOrderValidator": "src/MercuriOrderValidator.sol",
+    "IOrderSwapRouter": "src/interfaces/IOrderSwapRouter.sol",
+}
 INHERITED = {
     "UPGRADE_INTERFACE_VERSION", "acceptOwnership", "owner", "pendingOwner",
     "proxiableUUID", "transferOwnership", "upgradeToAndCall", "paused",

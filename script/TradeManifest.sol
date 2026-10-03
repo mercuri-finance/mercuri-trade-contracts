@@ -6,7 +6,9 @@ import {Script, console2} from "forge-std/Script.sol";
 /// @notice Shared manifest reader for the Trade testnet deployment scripts. Holds no key and never broadcasts.
 /// @dev Owner choices ship as sentinel strings and are refused until replaced with an address; the loopback rehearsal
 ///      override is honoured only on anvil (see `_resolveChoice`). `reactorFeeOwner` is decided: Launch's
-///      TimelockController on the same network, required to equal `timelock` in Launch's deployment record.
+///      TimelockController on the same network, required to equal `timelock` in Launch's deployment record. The filler
+///      is deployed through the standard CREATE2 deployer with `FILLER_SALT`, and deploys its validator with CREATE2,
+///      so both addresses are predicted before broadcasting and asserted after.
 abstract contract TradeManifest is Script {
     uint256 internal constant TESTNET_CHAIN_ID = 5042002;
     string internal constant MANIFEST_PATH = "deployments/manifest-5042002.json";
@@ -14,6 +16,14 @@ abstract contract TradeManifest is Script {
     string internal constant LAUNCH_RECORDS = "lib/mercuri-launch-contracts/deployments/";
     /// @dev Mirrors MercuriOrderFiller.MAX_EXECUTION_FEE so a bad manifest fails before any broadcast.
     uint256 internal constant MAX_EXECUTION_FEE = 100_000;
+    /// @dev Mirrors MercuriOrderFiller.VALIDATOR_SALT, the salt with which the filler deploys its validator.
+    bytes32 internal constant VALIDATOR_SALT = bytes32(0);
+    /// @dev Salt of the filler's CREATE2 deployment through `CREATE2_FACTORY` (forge-std's standard deployer).
+    bytes32 internal constant FILLER_SALT = bytes32(0);
+    /// @dev Runtime keccak of the standard deterministic deployer at `CREATE2_FACTORY`, read with `eth_getCode` on both
+    ///      Arc networks (report section 20).
+    bytes32 internal constant CREATE2_FACTORY_CODEHASH =
+        0x2fa86add0aed31f33a762c9d88e807c475bd51d0f52bd0955754b2608f7e4989;
 
     error WrongChain(uint256 chainId);
     error NoCode(string name, address account);
@@ -27,6 +37,9 @@ abstract contract TradeManifest is Script {
     error ReactorFeeOwnerNotTimelock(address owner, address timelock);
     error LaunchRecordMismatch(string field);
     error RouterMismatch(string what);
+    error Create2FactoryMismatch(bytes32 codeHash);
+    error AlreadyDeployed(address account);
+    error DeploymentMismatch(string what);
 
     /// @dev Refuses any chain other than Arc testnet. A local fork must keep chain id 5042002.
     function _requireTestnet() internal view {
@@ -62,13 +75,14 @@ abstract contract TradeManifest is Script {
     }
 
     /// @dev The manifest's Launch-side inputs must be the ones in Launch's record for this chain: permit2, USDC, the
-    ///      Launch hook and, as the app fee recipient, Launch's treasury.
+    ///      Launch hook, the v4 PoolManager and, as the app fee recipient, Launch's treasury.
     function _requireLaunchRecord(string memory manifest, string memory launchRecord) internal view {
         if (vm.parseJsonUint(manifest, ".chainId") != block.chainid) revert LaunchRecordMismatch("manifest chainId");
         if (vm.parseJsonUint(launchRecord, ".chainId") != block.chainid) revert LaunchRecordMismatch("record chainId");
         _requireSame(manifest, ".permit2", launchRecord, ".permit2", "permit2");
         _requireSame(manifest, ".usdc", launchRecord, ".usdc", "usdc");
         _requireSame(manifest, ".launchHook", launchRecord, ".launchHook", "launchHook");
+        _requireSame(manifest, ".poolManager", launchRecord, ".poolManager", "poolManager");
         _requireSame(manifest, ".appRecipient", launchRecord, ".treasury", "appRecipient");
     }
 
@@ -94,6 +108,13 @@ abstract contract TradeManifest is Script {
 
     function _requireCode(string memory name, address account) internal view {
         if (account.code.length == 0) revert NoCode(name, account);
+    }
+
+    /// @dev The filler is deployed through the standard deterministic deployer, so its code must be the known runtime.
+    function _requireCreate2Factory() internal view {
+        if (CREATE2_FACTORY.codehash != CREATE2_FACTORY_CODEHASH) {
+            revert Create2FactoryMismatch(CREATE2_FACTORY.codehash);
+        }
     }
 
     /// @dev `reactorFeeOwner` is an owner choice made at deployment time and ships as a sentinel string.

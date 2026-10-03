@@ -6,6 +6,9 @@ import {IPermit2 as XPermit2} from "../../lib/uniswapx/lib/permit2/src/interface
 import {SignedOrder} from "../../lib/uniswapx/src/base/ReactorStructs.sol";
 import {console2} from "forge-std/console2.sol";
 import {UniswapXFillerHarness} from "./UniswapXFiller.t.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 
 /// @notice Gas of a fill the trader griefs between the keeper's simulation and inclusion (moved balance, revoked
 ///         Permit2 allowance, invalidated nonce, passed deadline), next to a successful fill on the same path. The
@@ -16,6 +19,8 @@ import {UniswapXFillerHarness} from "./UniswapXFiller.t.sol";
 ///      measures 21,331 = 21,000 + 64 + 267 isolated, 267 without isolation). Without `--isolate` it is the call's
 ///      execution gas alone, with whatever the test already warmed. The call's calldata cost (EIP-2028) is logged too.
 contract UniswapXFillerGriefGasTest is UniswapXFillerHarness {
+    using StateLibrary for IPoolManager;
+
     enum Grief {
         None,
         Balance,
@@ -80,6 +85,33 @@ contract UniswapXFillerGriefGasTest is UniswapXFillerHarness {
         uint256 snap = vm.snapshotState();
         for (uint256 g; g < 5; ++g) {
             _measure(false, Grief(g));
+            vm.revertToState(snap);
+        }
+    }
+
+    /// Spec D22: the same listed-pool fill as a limit and as a take-profit at the pool's current price, so the
+    /// difference is the validator's price read (one PoolManager `extsload`).
+    function _measureCondition(bool buy, uint8 kind) internal returns (uint256 used) {
+        Market memory m = _market(buy, false);
+        uint128 amount = 100e6;
+        uint256 net = _netQuote(m, buy, amount, _executionFee());
+        (address input, address output) = buy ? (USDC, address(m.token)) : (address(m.token), USDC);
+        (uint160 price,,,) = poolManager.getSlot0(PoolId.wrap(keccak256(abi.encode(m.key))));
+        SignedOrder memory signed =
+            _orderWith(input, output, amount, net, 7, _condition(kind, m.key, kind == 0 ? 0 : price));
+        bytes memory data = abi.encodeCall(filler.fill, (signed, m.key));
+        vm.prank(feeRecipient);
+        (bool ok,) = address(filler).call(data);
+        used = _lastCallGasUsed();
+        console2.log(buy ? "buy " : "sell", kind == 0 ? "limit" : "take-profit");
+        console2.log("  gasTotalUsed / calldata cost", used, _calldataCost(data));
+        assertTrue(ok, "condition fill");
+    }
+
+    function test_conditionGas() public {
+        uint256 snap = vm.snapshotState();
+        for (uint256 i; i < 4; ++i) {
+            _measureCondition(i < 2, uint8(i % 2));
             vm.revertToState(snap);
         }
     }

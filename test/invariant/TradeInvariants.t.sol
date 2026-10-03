@@ -6,6 +6,11 @@ import {SignedOrder} from "../../lib/uniswapx/src/base/ReactorStructs.sol";
 import {IPermit2 as XPermit2} from "../../lib/uniswapx/lib/permit2/src/interfaces/IPermit2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MercuriOrderFiller} from "../../src/MercuriOrderFiller.sol";
+import {MercuriOrderValidator} from "../../src/MercuriOrderValidator.sol";
+import {IValidationCallback} from "../../lib/uniswapx/src/interfaces/IValidationCallback.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {V3DutchOrder} from "../../lib/uniswapx/src/lib/V3DutchOrderLib.sol";
 import {MockFeeController} from "../utils/MockFeeController.sol";
 import {CallbackFiller} from "../utils/CallbackFiller.sol";
@@ -22,6 +27,7 @@ interface ITradeExercise {
     function exerciseExpiring(uint256 offset) external;
     function inputFeeAttempt(uint256 seed) external;
     function feeFill(uint256 seed) external;
+    function exerciseValidation(uint256 seed) external;
 }
 
 contract TradeSequenceHandler {
@@ -31,8 +37,15 @@ contract TradeSequenceHandler {
         suite = s;
     }
 
+    /// One fill-path action, then the four spec D22 actions in turn (an order without our validator, one routed through
+    /// a pool it did not sign, an untriggered take-profit or stop-loss, and a triggered one). Running all four on every
+    /// step, rather than a separate selector, keeps their per-run reachability checks as likely as the step itself.
     function step(uint256 seed) external {
         suite.exercise(seed);
+        uint256 validation = uint256(keccak256(abi.encode(seed))) >> 2 << 2;
+        for (uint256 action; action < 4; ++action) {
+            suite.exerciseValidation(validation | action);
+        }
     }
 
     function toggleOutputFee() external {
@@ -59,6 +72,8 @@ contract TradeSequenceHandler {
 
 /// @dev Sequence properties for the new Trade filler, separate from Launch invariants.
 contract TradeInvariantsTest is UniswapXFillerHarness {
+    using StateLibrary for IPoolManager;
+
     Market[4] internal markets;
     TradeSequenceHandler internal handler;
     mapping(address => uint256) internal donated;
@@ -93,6 +108,14 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
     uint256 public executionFeesPaid;
     uint256 internal executionFeesPaidBase;
     uint256 internal keeperStart;
+    /// Spec D22 reachability: refusals of orders without our validator, of fills through an unsigned pool and of
+    /// untriggered conditions, and fills of triggered take-profit and stop-loss orders.
+    uint256 public wrongValidatorRejections;
+    uint256 public unsignedPoolRejections;
+    uint256 public untriggeredRejections;
+    uint256 public triggeredFills;
+    uint256[4] internal validationBase;
+    MercuriOrderValidator internal lookalike;
 
     function setUp() public virtual override {
         super.setUp();
@@ -130,6 +153,7 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         }
         outputFee = new MockFeeController(feeTo, 5, false);
         inputFee = new MockFeeController(feeTo, 5, true);
+        lookalike = new MercuriOrderValidator(address(filler), poolManager);
         bytes4[] memory selectors = new bytes4[](5);
         selectors[0] = handler.step.selector;
         selectors[1] = handler.toggleOutputFee.selector;
@@ -153,6 +177,9 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         this.toggleOutputFee();
         this.exerciseExpiring(0);
         this.exerciseExpiring(EXPIRY_BLOCKS + 1);
+        for (uint256 i; i < 8; ++i) {
+            this.exerciseValidation(i);
+        }
         // Reachability is judged on campaign activity only, not on this warm-up.
         feeFillsBase = feeFills;
         inputFeeRejectionsBase = inputFeeRejections;
@@ -160,6 +187,13 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         exclusiveRejectionsBase = exclusiveRejections;
         executionFeesPaidBase = executionFeesPaid;
         notKeeperRejectionsBase = notKeeperRejections;
+        validationBase = [wrongValidatorRejections, unsignedPoolRejections, untriggeredRejections, triggeredFills];
+    }
+
+    /// A limit condition on this market's own pool: markets 0 and 2 (and 1 and 3) share a token, so the pool is named
+    /// explicitly rather than taken from the token's latest market.
+    function _limit(Market memory m) internal pure returns (bytes memory) {
+        return _condition(0, m.key, 0);
     }
 
     /// One of the fixed non-keeper callers (chosen by `salt`) submits `signed` first and must be refused `NotKeeper`
@@ -237,7 +271,9 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         if (outputFeeOn) minimum = minimum * 10_000 / 10_005; // room for the 5 bps protocol fee
         uint256 nonce = nextNonce++;
         uint256 start = block.number;
-        SignedOrder memory signed = _expiringOrder(USDC, address(m.token), amount, minimum / 2, nonce, start, minimum);
+        SignedOrder memory signed = _expiringOrderWith(
+            USDC, address(m.token), amount, minimum / 2, nonce, start, minimum, address(filler), _limit(m)
+        );
         vm.roll(start + offset);
         uint256 beforeInput = IERC20(USDC).balanceOf(trader);
         uint256 beforeOutput = IERC20(address(m.token)).balanceOf(trader);
@@ -293,7 +329,7 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         require(msg.sender == address(handler) || msg.sender == address(this), "handler only");
         Market memory m = markets[seed % 4];
         uint256 nonce = nextNonce++;
-        SignedOrder memory signed = _order(USDC, address(m.token), 1e6 + seed % 5e6, 1, nonce);
+        SignedOrder memory signed = _orderWith(USDC, address(m.token), 1e6 + seed % 5e6, 1, nonce, _limit(m));
         reactor.setProtocolFeeController(address(inputFee));
         uint256 beforeUSDC = IERC20(USDC).balanceOf(trader);
         uint256 beforeBitmap = XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8);
@@ -346,7 +382,7 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
             assertGt(minimum, 0, "meaningful quote");
         }
         if (action == 3) minimum = type(uint128).max;
-        SignedOrder memory signed = _order(input, output, amount, minimum, nonce);
+        SignedOrder memory signed = _orderWith(input, output, amount, minimum, nonce, _limit(m));
         uint256 beforeInput = IERC20(input).balanceOf(trader);
         uint256 beforeOutput = IERC20(output).balanceOf(trader);
         uint256 beforeFee = IERC20(USDC).balanceOf(appRecipient);
@@ -391,6 +427,86 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         }
     }
 
+    /// Spec D22 actions, chosen by `seed % 4` on market `seed / 4 % 4`, buy or sell by `seed / 16`:
+    /// 0. an order naming no validator or a look-alike validator that also accepts our filler: `WrongValidator`;
+    /// 1. an order signed for this market's pool, filled through the other pool of the same token: `PoolNotSigned`;
+    /// 2. a take-profit or stop-loss one unit short of its trigger: `TriggerNotReached`;
+    /// 3. the same at the pool's current price: it fills and pays at least the signed minimum.
+    /// Every refusal follows a refused non-keeper attempt and moves nothing, pays no fee and leaves the nonce unused.
+    function exerciseValidation(uint256 seed) external {
+        require(msg.sender == address(handler) || msg.sender == address(this), "handler only");
+        steps++;
+        uint256 action = seed % 4;
+        uint256 index = seed / 4 % 4;
+        Market memory m = markets[index];
+        bool buy = seed / 16 % 2 == 0;
+        (address input, address output) = buy ? (USDC, address(m.token)) : (address(m.token), USDC);
+        uint128 amount = uint128(1e6 + (seed / 32) % 5e6);
+        if (!buy && address(m.key.hooks) != address(0)) amount = uint128(1000e18 + (seed / 32) % 10000e18);
+        uint256 nonce = nextNonce++;
+        uint8 kind = uint8(1 + seed / 64 % 2);
+        (uint160 price,,,) = poolManager.getSlot0(PoolId.wrap(keccak256(abi.encode(m.key))));
+        bool up = (kind == 1) == (input < output);
+        SignedOrder memory signed;
+        PoolKey memory key = m.key;
+        if (action == 0) {
+            IValidationCallback other = seed / 128 % 2 == 0 ? IValidationCallback(address(0)) : lookalike;
+            signed = _orderFor(input, output, amount, 1, nonce, other, _limit(m));
+        } else if (action == 1) {
+            signed = _orderWith(input, output, amount, 1, nonce, _limit(m));
+            key = markets[(index + 2) % 4].key; // the same token's other pool
+        } else {
+            uint160 trigger = action == 3 ? price : (up ? price + 1 : price - 1);
+            uint256 minimum = 1;
+            if (action == 3) {
+                minimum = _netQuote(m, buy, amount, filler.executionFee()) / 2;
+                if (outputFeeOn) minimum = minimum * 10_000 / 10_005;
+            }
+            signed = _orderWith(input, output, amount, minimum, nonce, _condition(kind, m.key, trigger));
+        }
+        uint256 beforeInput = IERC20(input).balanceOf(trader);
+        uint256 beforeOutput = IERC20(output).balanceOf(trader);
+        (bool ok, bytes memory err) = _tryFill(signed, key, nonce);
+        if (action == 3) {
+            if (!ok) {
+                assembly {
+                    revert(add(err, 32), mload(err))
+                }
+            }
+            successfulFills++;
+            triggeredFills++;
+            assertEq(beforeInput - IERC20(input).balanceOf(trader), amount, "triggered exact input");
+            assertGt(IERC20(output).balanceOf(trader), beforeOutput, "triggered output");
+            assertTrue(_nonceUsedBy(nonce), "triggered nonce used");
+            return;
+        }
+        assertFalse(ok, "invalid order filled");
+        bytes4[3] memory expected = [
+            MercuriOrderFiller.WrongValidator.selector,
+            MercuriOrderFiller.PoolNotSigned.selector,
+            MercuriOrderValidator.TriggerNotReached.selector
+        ];
+        assertEq(bytes4(err), expected[action], "refused for another reason");
+        if (action == 0) wrongValidatorRejections++;
+        else if (action == 1) unsignedPoolRejections++;
+        else untriggeredRejections++;
+        assertEq(IERC20(input).balanceOf(trader), beforeInput, "refused order moved input");
+        assertEq(IERC20(output).balanceOf(trader), beforeOutput, "refused order moved output");
+        assertFalse(_nonceUsedBy(nonce), "refused order used its nonce");
+    }
+
+    function _nonceUsedBy(uint256 nonce) internal view returns (bool) {
+        return XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8) & (1 << (nonce & 255)) != 0;
+    }
+
+    /// The filler and its validator name each other for life (spec D22).
+    function invariant_validatorBinding() public view {
+        MercuriOrderValidator v = MercuriOrderValidator(address(filler.validator()));
+        assertGt(address(v).code.length, 0, "validator code");
+        assertEq(v.filler(), address(filler), "validator bound to the filler");
+        assertEq(address(v.poolManager()), address(poolManager), "validator pool manager");
+    }
+
     /// The fee recipient's USDC grew by exactly one execution fee per successful fill, and by nothing else.
     function invariant_executionFeePerFill() public view {
         assertEq(executionFeesPaid, successfulFills * filler.executionFee(), "ghost: fills x fee");
@@ -424,6 +540,10 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         for (uint256 i; i < 3; ++i) {
             assertGt(notKeeperRejections[i], notKeeperRejectionsBase[i], "campaign never refused every non-keeper");
         }
+        assertGt(wrongValidatorRejections, validationBase[0], "campaign never refused an order without our validator");
+        assertGt(unsignedPoolRejections, validationBase[1], "campaign never refused an unsigned pool");
+        assertGt(untriggeredRejections, validationBase[2], "campaign never refused an untriggered order");
+        assertGt(triggeredFills, validationBase[3], "campaign never filled a triggered order");
         assertGe(steps, 13);
     }
 }

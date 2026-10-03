@@ -5,9 +5,11 @@ import {Test} from "forge-std/Test.sol";
 import {DeployTestnetReactor} from "../../script/DeployTestnetReactor.s.sol";
 import {DeployOrderFiller} from "../../script/DeployOrderFiller.s.sol";
 import {MercuriOrderFiller} from "../../src/MercuriOrderFiller.sol";
+import {MercuriOrderValidator} from "../../src/MercuriOrderValidator.sol";
 import {IOrderSwapRouter} from "../../src/interfaces/IOrderSwapRouter.sol";
 import {IReactor} from "../../lib/uniswapx/src/interfaces/IReactor.sol";
 import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {TradeManifest} from "../../script/TradeManifest.sol";
 import {V3DutchOrderReactor} from "../../lib/uniswapx/src/reactors/V3DutchOrderReactor.sol";
 import {IPermit2} from "../../lib/uniswapx/lib/permit2/src/interfaces/IPermit2.sol";
@@ -63,6 +65,29 @@ contract FillerHarness is DeployOrderFiller {
 
     function requireRouter(address router, string memory manifest) external view {
         _requireRouter(router, manifest);
+    }
+
+    function validatorSalt() external pure returns (bytes32) {
+        return VALIDATOR_SALT;
+    }
+
+    function predict(FillerArgs memory a) external pure returns (address filler, address validator) {
+        return _predict(a);
+    }
+
+    function deployPair(FillerArgs memory a) external returns (MercuriOrderFiller filler, address validator) {
+        return _deployPair(a);
+    }
+
+    function requireDeployedPair(MercuriOrderFiller filler, address predicted, address validator, address poolManager)
+        external
+        view
+    {
+        _requireDeployedPair(filler, predicted, validator, poolManager);
+    }
+
+    function requireCreate2Factory() external view {
+        _requireCreate2Factory();
     }
 }
 
@@ -161,6 +186,83 @@ contract DeployScriptsTest is Test {
         h.requireTimelockOwner(ANVIL_1, launchRecord, true);
     }
 
+    /// Constructor arguments that are never called by the constructor; any nonzero addresses work.
+    function _args(address poolManager) internal pure returns (DeployOrderFiller.FillerArgs memory a) {
+        a = DeployOrderFiller.FillerArgs(
+            address(1), address(2), address(3), address(4), address(5), address(6), 50_000, address(7), poolManager
+        );
+    }
+
+    /// The script's copy of the validator salt must be the filler's, or its prediction would miss.
+    function test_scriptValidatorSaltMatchesFiller() public {
+        MercuriOrderFiller filler = new MercuriOrderFiller(
+            IReactor(address(1)),
+            IOrderSwapRouter(address(2)),
+            IAllowanceTransfer(address(3)),
+            address(4),
+            address(5),
+            address(6),
+            0,
+            address(7),
+            IPoolManager(address(8))
+        );
+        assertEq(new FillerHarness().validatorSalt(), filler.VALIDATOR_SALT());
+    }
+
+    /// The standard CREATE2 deployer must hold its known runtime; any other code is refused.
+    function test_create2FactoryCodeRequired() public {
+        FillerHarness h = new FillerHarness();
+        assertEq(CREATE2_FACTORY.codehash, 0x2fa86add0aed31f33a762c9d88e807c475bd51d0f52bd0955754b2608f7e4989);
+        h.requireCreate2Factory();
+        vm.etch(CREATE2_FACTORY, hex"00");
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.Create2FactoryMismatch.selector, keccak256(hex"00")));
+        h.requireCreate2Factory();
+    }
+
+    /// The script's deployment lands the filler at its CREATE2 prediction from the standard deployer and the validator
+    /// at its prediction from the filler, each naming the other; a second run refuses the occupied address.
+    function test_deployPairLandsAtPrediction() public {
+        FillerHarness h = new FillerHarness();
+        DeployOrderFiller.FillerArgs memory a = _args(address(8));
+        (address predictedFiller, address predictedValidator) = h.predict(a);
+        (MercuriOrderFiller filler, address validator) = h.deployPair(a);
+        assertEq(address(filler), predictedFiller, "filler at its prediction");
+        assertEq(validator, predictedValidator, "validator at its prediction");
+        assertEq(address(filler.validator()), predictedValidator);
+        assertEq(MercuriOrderValidator(validator).filler(), address(filler));
+        assertEq(address(MercuriOrderValidator(validator).poolManager()), address(8));
+        // Any change to an argument moves both addresses.
+        (address otherFiller, address otherValidator) = h.predict(_args(address(9)));
+        assertTrue(otherFiller != predictedFiller && otherValidator != predictedValidator);
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.AlreadyDeployed.selector, predictedFiller));
+        h.deployPair(a);
+    }
+
+    /// The post-deployment check refuses a filler off its prediction, a validator other than the filler's own and a
+    /// validator bound to another pool manager.
+    function test_deployedPairMismatchRefused() public {
+        FillerHarness h = new FillerHarness();
+        MercuriOrderFiller filler = new MercuriOrderFiller(
+            IReactor(address(1)),
+            IOrderSwapRouter(address(2)),
+            IAllowanceTransfer(address(3)),
+            address(4),
+            address(5),
+            address(6),
+            0,
+            address(7),
+            IPoolManager(address(8))
+        );
+        address validator = address(filler.validator());
+        h.requireDeployedPair(filler, address(filler), validator, address(8));
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.DeploymentMismatch.selector, "filler address"));
+        h.requireDeployedPair(filler, address(0xf1), validator, address(8));
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.DeploymentMismatch.selector, "validator address"));
+        h.requireDeployedPair(filler, address(filler), address(0xf2), address(8));
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.DeploymentMismatch.selector, "validator poolManager"));
+        h.requireDeployedPair(filler, address(filler), validator, address(9));
+    }
+
     /// The script's copy of the bound must never drift from the filler's, or a manifest could pass here and fail
     /// the constructor (or the reverse) at deployment time.
     function test_scriptMaxExecutionFeeMatchesFiller() public {
@@ -173,7 +275,8 @@ contract DeployScriptsTest is Test {
             address(5),
             address(6),
             0,
-            address(7)
+            address(7),
+            IPoolManager(address(8))
         );
         assertEq(new FillerHarness().maxFee(), filler.MAX_EXECUTION_FEE());
     }
@@ -306,8 +409,8 @@ contract DeployScriptsTest is Test {
         FillerHarness h = new FillerHarness();
         string memory record = vm.readFile(TESTNET_RECORD);
         string memory manifest = vm.readFile("deployments/manifest-5042002.json");
-        string[4] memory keys = ["permit2", "usdc", "launchHook", "appRecipient"];
-        for (uint256 i; i < 4; ++i) {
+        string[5] memory keys = ["permit2", "usdc", "launchHook", "poolManager", "appRecipient"];
+        for (uint256 i; i < 5; ++i) {
             string memory value = vm.parseJsonString(manifest, string.concat(".", keys[i]));
             string memory tampered = vm.replace(manifest, value, "0x00000000000000000000000000000000000000Ab");
             vm.expectRevert(abi.encodeWithSelector(TradeManifest.LaunchRecordMismatch.selector, keys[i]));
@@ -322,7 +425,9 @@ contract DeployScriptsTest is Test {
     }
 
     /// The mainnet manifest exists for review only: its owner choices are sentinels, its reactor fee owner is
-    /// Launch's mainnet timelock, and the scripts still refuse chain 5042 (`test_scriptsRefuseOtherChains`).
+    /// Launch's mainnet timelock, and the scripts still refuse chain 5042 (`test_scriptsRefuseOtherChains`). Spec D27:
+    /// mainnet uses our own reactor, deployed by the reactor step and owned by that timelock; the manifest names no
+    /// existing reactor, so the Uniswap-owned mainnet reactor can never be taken for ours.
     function test_mainnetManifestIsReviewOnly() public view {
         string memory manifest = vm.readFile("deployments/manifest-5042.json");
         assertEq(vm.parseJsonUint(manifest, ".chainId"), 5042);
@@ -333,6 +438,11 @@ contract DeployScriptsTest is Test {
             vm.parseJsonAddress(vm.readFile(MAINNET_RECORD), ".timelock")
         );
         assertEq(vm.parseJsonAddress(manifest, ".reactorFeeController"), address(0));
+        assertFalse(vm.keyExistsJson(manifest, ".reactor"), "the mainnet reactor is deployed by us, not named");
+        assertEq(
+            vm.parseJsonAddress(manifest, ".poolManager"),
+            vm.parseJsonAddress(vm.readFile(MAINNET_RECORD), ".poolManager")
+        );
     }
 
     /// The router is pinned by code hash: the right runtime passes, any other runtime or an empty account is refused.

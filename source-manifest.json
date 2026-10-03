@@ -1,7 +1,8 @@
 {
   "algorithm": "sha256",
   "sources": {
-    "src/MercuriOrderFiller.sol": "14149bd68af46a7282e8849d53107432e5ad453a52d5939b586e90438ee12bf9",
+    "src/MercuriOrderFiller.sol": "4ff0fbe472e5a22285bf8fdcd9d0ab87c155b62ff1b4a60a52db16cf4244b2d3",
+    "src/MercuriOrderValidator.sol": "780ad88ad5cfd440730bba8de86b0b29bf0ceac89b41181c3522337bd4c5c0d1",
     "src/interfaces/IOrderSwapRouter.sol": "a8cffdb5307ab46c5fe166d5a291971835cc73af2cb6813458bb2aad5a96019b"
   }
 }

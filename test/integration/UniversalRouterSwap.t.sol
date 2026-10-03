@@ -25,6 +25,8 @@ abstract contract UniversalRouterHarness is LaunchFixture {
     IV4Quoter internal quoter;
     address internal trader = makeAddr("router trader");
     address internal appRecipient = makeAddr("app fee recipient");
+    /// The pool of each token's latest market, which orders for that token sign by default (spec D22).
+    mapping(address token => PoolKey) internal marketKey;
 
     struct RouterParameters {
         address permit2;
@@ -89,6 +91,7 @@ abstract contract UniversalRouterHarness is LaunchFixture {
         permit2.approve(address(m.token), address(router), type(uint160).max, type(uint48).max);
         permit2.approve(USDC, address(router), type(uint160).max, type(uint48).max);
         vm.stopPrank();
+        marketKey[address(m.token)] = m.key;
     }
 
     function _quote(Market memory m, bool buy, uint128 amount, bytes memory hookData) internal returns (uint256 out) {

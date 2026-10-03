@@ -5,32 +5,38 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
 import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
 import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import {ISignatureTransfer} from "permit2/src/interfaces/ISignatureTransfer.sol";
 import {IReactor} from "../lib/uniswapx/src/interfaces/IReactor.sol";
 import {IReactorCallback} from "../lib/uniswapx/src/interfaces/IReactorCallback.sol";
+import {IValidationCallback} from "../lib/uniswapx/src/interfaces/IValidationCallback.sol";
 import {SignedOrder, ResolvedOrder} from "../lib/uniswapx/src/base/ReactorStructs.sol";
 import {V3DutchOrder, V3DutchOrderLib, V3DutchInput} from "../lib/uniswapx/src/lib/V3DutchOrderLib.sol";
 import {NonlinearDutchDecayLib} from "../lib/uniswapx/src/lib/NonlinearDutchDecayLib.sol";
 import {MathExt} from "../lib/uniswapx/src/lib/MathExt.sol";
 import {FixedPointMathLib} from "../lib/uniswapx/lib/solmate/src/utils/FixedPointMathLib.sol";
 import {IOrderSwapRouter} from "./interfaces/IOrderSwapRouter.sol";
+import {MercuriOrderValidator} from "./MercuriOrderValidator.sol";
 
 /// @notice Settles one signed UniswapX order through one Arc v4 USDC pool. The signed trader receives every output
 ///         above what the reactor takes (its protocol fee) and, on a sell, above the execution fee: a fixed USDC fee
 ///         paid to `feeRecipient` (the keeper) on each successful fill, only out of value above the signed minimum.
 /// @dev Immutable: no owner, pause, upgrade or rescue path. The execution fee comes from the USDC side (see
-///      `executionFee`). Tokens sent to this contract outside a fill never subsidize another order or the fee. Orders
-///      are bound to their reactor and cosigner, not to this contract, so a replacement filler can settle orders that
-///      are already signed. Native value is accepted only from the reactor (its end-of-fill refund) and is never spent.
-///      Only the configured keeper (`feeRecipient`) can call `fill`. The keeper cosigns each order exclusive to this
-///      filler, and the caller of `fill` chooses the pool, so an open `fill` would let a copier route a keeper-cosigned
-///      order through a pool of its choice (for example around Launch's hook fee) or race the keeper for its own
-///      transaction. Restricting the caller keeps settlement and pool choice with the keeper. Replacing the filler,
-///      including rotating the keeper key, therefore means deploying a new filler and switching the keeper to it by
-///      configuration.
+///      `executionFee`). Tokens sent to this contract outside a fill never subsidize another order or the fee. Native
+///      value is accepted only from the reactor (its end-of-fill refund) and is never spent. Only the configured keeper
+///      (`feeRecipient`) can call `fill`. The keeper cosigns each order exclusive to this filler, and the caller of
+///      `fill` chooses the pool, so an open `fill` would let a copier route a keeper-cosigned order through a pool of
+///      its choice (for example around Launch's hook fee) or race the keeper for its own transaction.
+///
+///      Every order must name this filler's `validator`, which the constructor deploys with CREATE2 and which accepts
+///      only this filler and checks the signed take-profit or stop-loss trigger against the signed pool's price; the
+///      callback swaps only through that signed pool. So neither the keeper's nor the cosigner's key can settle an
+///      untriggered order, route one through another pool or settle it through another filler. Orders are bound to
+///      their reactor, cosigner and validator, and through the validator to this filler: a replacement filler, which
+///      rotating the keeper key requires, comes with its own validator and cannot settle orders signed for this one.
 contract MercuriOrderFiller is IReactorCallback {
     using SafeERC20 for IERC20;
     using V3DutchOrderLib for V3DutchOrder;
@@ -44,6 +50,9 @@ contract MercuriOrderFiller is IReactorCallback {
     uint256 public constant APP_FEE_BPS = 50;
     /// @notice Upper bound on `executionFee`: 0.10 USDC (6 decimals).
     uint256 public constant MAX_EXECUTION_FEE = 100_000;
+
+    /// @notice CREATE2 salt with which the constructor deploys `validator` from this contract.
+    bytes32 public constant VALIDATOR_SALT = bytes32(0);
 
     uint256 private constant BPS = 10_000;
 
@@ -66,6 +75,10 @@ contract MercuriOrderFiller is IReactorCallback {
     /// @notice Recipient of the execution fee: the keeper's transaction address, fixed for this filler's life.
     /// @dev Also the only address allowed to call `fill`.
     address public immutable feeRecipient;
+    /// @notice The order validator every order must name; it accepts no other filler.
+    /// @dev Deployed by the constructor with CREATE2 from this address with `VALIDATOR_SALT`, bound to this filler and
+    ///      the pool manager for life.
+    IValidationCallback public immutable validator;
 
     /// @dev True only while `fill` runs: `reactorCallback` requires it and a nested `fill` is refused.
     bool private active;
@@ -83,6 +96,10 @@ contract MercuriOrderFiller is IReactorCallback {
 
     /// @notice A constructor dependency or the fee recipient is the zero address.
     error ZeroAddress();
+    /// @notice The order does not name this filler's `validator` as its `additionalValidationContract`.
+    error WrongValidator();
+    /// @notice The pool supplied to `fill` is not the pool the trader signed in the order's validation data.
+    error PoolNotSigned();
     /// @notice `fill` was entered while a fill is already in progress.
     error Reentered();
     /// @notice The order does not have exactly one output to its signer in a token other than its input, or the
@@ -125,8 +142,11 @@ contract MercuriOrderFiller is IReactorCallback {
     ///         this block.
     error SwapperAllowanceTooLow();
 
-    /// @notice Fixes the settlement dependencies, fee recipients and execution fee for this filler's life.
-    /// @dev Reverts `ZeroAddress` if any address is zero and `ExecutionFeeTooHigh` above `MAX_EXECUTION_FEE`.
+    /// @notice Fixes the settlement dependencies, fee recipients and execution fee for this filler's life, and deploys
+    ///         this filler's order validator.
+    /// @dev Reverts `ZeroAddress` if any address is zero and `ExecutionFeeTooHigh` above `MAX_EXECUTION_FEE`. The
+    ///      validator's address is `CREATE2(this, VALIDATOR_SALT, keccak256(creationCode ++ abi.encode(this,
+    ///      poolManager_)))`, so both addresses are known before deployment.
     /// @param reactor_ Reactor that authenticates the signed order.
     /// @param router_ Universal Router used for the swap.
     /// @param permit2_ Permit2 allowance target used by the router.
@@ -135,6 +155,7 @@ contract MercuriOrderFiller is IReactorCallback {
     /// @param appRecipient_ App fee recipient for other USDC pools.
     /// @param executionFee_ Execution fee in USDC (6 decimals), at most `MAX_EXECUTION_FEE`; zero disables it.
     /// @param feeRecipient_ Execution fee recipient (the keeper's transaction address); must be nonzero.
+    /// @param poolManager_ Uniswap v4 PoolManager the validator reads trigger prices from.
     constructor(
         IReactor reactor_,
         IOrderSwapRouter router_,
@@ -143,12 +164,13 @@ contract MercuriOrderFiller is IReactorCallback {
         address launchHook_,
         address appRecipient_,
         uint256 executionFee_,
-        address feeRecipient_
+        address feeRecipient_,
+        IPoolManager poolManager_
     ) {
         if (
             address(reactor_) == address(0) || address(router_) == address(0) || address(permit2_) == address(0)
                 || usdc_ == address(0) || appRecipient_ == address(0) || launchHook_ == address(0)
-                || feeRecipient_ == address(0)
+                || feeRecipient_ == address(0) || address(poolManager_) == address(0)
         ) revert ZeroAddress();
         if (executionFee_ > MAX_EXECUTION_FEE) revert ExecutionFeeTooHigh();
         reactor = reactor_;
@@ -159,6 +181,7 @@ contract MercuriOrderFiller is IReactorCallback {
         appRecipient = appRecipient_;
         executionFee = executionFee_;
         feeRecipient = feeRecipient_;
+        validator = new MercuriOrderValidator{salt: VALIDATOR_SALT}(address(this), poolManager_);
     }
 
     /// @notice Accepts native value from the reactor only.
@@ -176,11 +199,14 @@ contract MercuriOrderFiller is IReactorCallback {
     ///         execution fee is taken from the order's USDC side (the input on a buy, the output on a sell) and paid
     ///         to `feeRecipient`.
     /// @dev Only the configured keeper (`feeRecipient`) may call this; any other caller reverts `NotKeeper` before the
-    ///      order is touched. The reactor enforces its signature, nonce and deadline; this call reverts atomically,
-    ///      paying no fee, if the trader's signed net minimum is unmet. Before the reactor runs, `_requireFundable`
-    ///      refuses an order the reactor would refuse at the input transfer (passed deadline, used nonce, too little
-    ///      balance or Permit2 allowance), so a trader who moves funds, revokes the approval or cancels the nonce after
-    ///      the keeper's simulation costs the keeper a cheap, typed revert rather than a deep one in the reactor.
+    ///      order is touched. An order that does not name `validator` reverts `WrongValidator` before the reactor; the
+    ///      validator then refuses an untriggered take-profit or stop-loss, and the callback refuses a `key` other than
+    ///      the signed pool (`PoolNotSigned`). The reactor enforces its signature, nonce and deadline; this call
+    ///      reverts atomically, paying no fee, if the trader's signed net minimum is unmet. Before the reactor runs,
+    ///      `_requireFundable` refuses an order the reactor would refuse at the input transfer (passed deadline, used
+    ///      nonce, too little balance or Permit2 allowance), so a trader who moves funds, revokes the approval or
+    ///      cancels the nonce after the keeper's simulation costs the keeper a cheap, typed revert rather than a deep
+    ///      one in the reactor.
     /// @param signed User-signed UniswapX V3 Dutch order and signature.
     /// @param key One USDC pool used for this fill.
     function fill(SignedOrder calldata signed, PoolKey calldata key) external {
@@ -190,6 +216,7 @@ contract MercuriOrderFiller is IReactorCallback {
         if (order.baseOutputs.length != 1 || order.baseOutputs[0].recipient != order.info.swapper) {
             revert InvalidOutputs();
         }
+        if (order.info.additionalValidationContract != validator) revert WrongValidator();
 
         IERC20 output = IERC20(order.baseOutputs[0].token);
         IERC20 input = IERC20(address(order.baseInput.token));
@@ -223,8 +250,10 @@ contract MercuriOrderFiller is IReactorCallback {
     }
 
     /// @notice Settles the reactor's resolved order against the supplied pool.
-    /// @dev Only the configured reactor can call this during an active fill. It leaves exactly `executionFee` USDC in
-    ///      this contract for `fill` to pay: a buy swaps the input less the app and execution fees; a sell requires
+    /// @dev Only the configured reactor can call this during an active fill, after `validator` accepted the order. The
+    ///      pool must be the one the trader signed: `keccak256(abi.encode(key))` equal to the `poolId` in the order's
+    ///      validation data, which the validator has already decoded and checked. It leaves exactly `executionFee` USDC
+    ///      in this contract for `fill` to pay: a buy swaps the input less the app and execution fees; a sell requires
     ///      the swap to yield the reactor's outputs plus the execution fee. It records the output the swap delivered
     ///      above that as `outputSurplus`, the most `fill` pays the trader on top of the reactor's outputs.
     /// @param orders Reactor's resolved orders; exactly one is accepted, with output-token fee outputs allowed.
@@ -244,6 +273,8 @@ contract MercuriOrderFiller is IReactorCallback {
             revert PoolMismatch();
         }
         if (input != usdc && output != usdc) revert PoolMismatch();
+        (,, bytes32 signedPool,) = abi.decode(order.info.additionalValidationData, (uint8, uint8, bytes32, uint160));
+        if (keccak256(abi.encode(key)) != signedPool) revert PoolNotSigned();
         bool app = address(key.hooks) != launchHook;
         bool buy = input == usdc;
         uint256 amount = order.input.amount;

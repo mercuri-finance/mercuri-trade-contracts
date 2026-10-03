@@ -151,8 +151,13 @@ the default gate runs locally without a fork.
 
 [`script/verify-trade-filler.py`](script/verify-trade-filler.py) compares a deployed filler and reactor with the
 freshly compiled artifacts at one block. It reconstructs immutable values from the manifest and the deployment record
-(the reactor's function-pointer immutable from a constructor simulation) and requires every other byte to match; the
-gate runs its offline self-tests.
+(the reactor's function-pointer immutable from a constructor simulation) and requires every other byte to match, and
+checks the reactor's `owner()` and `feeController()` and the router's code hash and PERMIT2 bytes. `--reactor-only`
+verifies the reactor before any filler exists. Every run first cross-checks the manifest against Launch's deployment
+record for the chain (permit2, USDC, Launch hook, treasury as app fee recipient, timelock as reactor fee owner) and the
+reproduced router; `--preflight` runs that check alone, offline, and the gate runs it for both manifests along with
+the verifier's self-tests. The mainnet manifest, [`deployments/manifest-5042.json`](deployments/manifest-5042.json), is
+for review only: its owner choices are sentinels and the deployment scripts refuse chain 5042.
 
 ## Security
 

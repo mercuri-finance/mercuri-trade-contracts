@@ -56,6 +56,14 @@ contract FillerHarness is DeployOrderFiller {
     function requireTimelockOwner(address owner, string memory launchRecord, bool rehearsal) external view {
         _requireTimelockOwner(owner, launchRecord, rehearsal);
     }
+
+    function requireLaunchRecord(string memory manifest, string memory launchRecord) external view {
+        _requireLaunchRecord(manifest, launchRecord);
+    }
+
+    function requireRouter(address router, string memory manifest) external view {
+        _requireRouter(router, manifest);
+    }
 }
 
 /// @dev Exposes the reactor script's post-deployment check.
@@ -272,5 +280,73 @@ contract DeployScriptsTest is Test {
         vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorMismatch.selector, "feeController"));
         h.requireDeployed(reactor, ANVIL_1, address(0));
         h.requireDeployed(reactor, ANVIL_1, controller);
+    }
+
+    string internal constant TESTNET_RECORD = "lib/mercuri-launch-contracts/deployments/5042002.json";
+    string internal constant MAINNET_RECORD = "lib/mercuri-launch-contracts/deployments/5042.json";
+
+    /// F5: both manifests agree with Launch's record for their chain: permit2, USDC, the Launch hook, the treasury as
+    /// app fee recipient and the timelock as reactor fee owner.
+    function test_manifestsMatchLaunchRecords() public {
+        FillerHarness h = new FillerHarness();
+        string memory record = vm.readFile(TESTNET_RECORD);
+        string memory manifest = vm.readFile("deployments/manifest-5042002.json");
+        h.requireLaunchRecord(manifest, record);
+        h.requireTimelockOwner(vm.parseJsonAddress(manifest, ".reactorFeeOwner"), record, false);
+        vm.chainId(5042);
+        record = vm.readFile(MAINNET_RECORD);
+        manifest = vm.readFile("deployments/manifest-5042.json");
+        h.requireLaunchRecord(manifest, record);
+        h.requireTimelockOwner(vm.parseJsonAddress(manifest, ".reactorFeeOwner"), record, false);
+    }
+
+    /// Each Launch-side manifest input that differs from Launch's record is refused by name, as is a manifest or
+    /// record for another chain.
+    function test_launchRecordMismatchRefused() public {
+        FillerHarness h = new FillerHarness();
+        string memory record = vm.readFile(TESTNET_RECORD);
+        string memory manifest = vm.readFile("deployments/manifest-5042002.json");
+        string[4] memory keys = ["permit2", "usdc", "launchHook", "appRecipient"];
+        for (uint256 i; i < 4; ++i) {
+            string memory value = vm.parseJsonString(manifest, string.concat(".", keys[i]));
+            string memory tampered = vm.replace(manifest, value, "0x00000000000000000000000000000000000000Ab");
+            vm.expectRevert(abi.encodeWithSelector(TradeManifest.LaunchRecordMismatch.selector, keys[i]));
+            h.requireLaunchRecord(tampered, record);
+        }
+        // The testnet manifest against the mainnet record, and either one on the wrong chain.
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.LaunchRecordMismatch.selector, "record chainId"));
+        h.requireLaunchRecord(manifest, vm.readFile(MAINNET_RECORD));
+        vm.chainId(5042);
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.LaunchRecordMismatch.selector, "manifest chainId"));
+        h.requireLaunchRecord(manifest, vm.readFile(MAINNET_RECORD));
+    }
+
+    /// The mainnet manifest exists for review only: its owner choices are sentinels, its reactor fee owner is
+    /// Launch's mainnet timelock, and the scripts still refuse chain 5042 (`test_scriptsRefuseOtherChains`).
+    function test_mainnetManifestIsReviewOnly() public view {
+        string memory manifest = vm.readFile("deployments/manifest-5042.json");
+        assertEq(vm.parseJsonUint(manifest, ".chainId"), 5042);
+        assertEq(vm.parseJsonString(manifest, ".executionFee"), "REQUIRED_AT_MAINNET_OWNER_GO");
+        assertEq(vm.parseJsonString(manifest, ".feeRecipient"), "REQUIRED_AT_MAINNET_OWNER_GO");
+        assertEq(
+            vm.parseJsonAddress(manifest, ".reactorFeeOwner"),
+            vm.parseJsonAddress(vm.readFile(MAINNET_RECORD), ".timelock")
+        );
+        assertEq(vm.parseJsonAddress(manifest, ".reactorFeeController"), address(0));
+    }
+
+    /// The router is pinned by code hash: the right runtime passes, any other runtime or an empty account is refused.
+    function test_routerCodeHashRequired() public {
+        FillerHarness h = new FillerHarness();
+        address router = address(new ReactorHarness());
+        string memory manifest = string.concat('{"routerCodeHash":"', vm.toString(router.codehash), '"}');
+        h.requireRouter(router, manifest);
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.RouterMismatch.selector, "codehash"));
+        h.requireRouter(address(h), manifest);
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.NoCode.selector, "router", address(0xabc)));
+        h.requireRouter(address(0xabc), manifest);
+        // The shipped testnet hash is the reproduced Arc testnet router, not any local build.
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.RouterMismatch.selector, "codehash"));
+        h.requireRouter(router, vm.readFile("deployments/manifest-5042002.json"));
     }
 }

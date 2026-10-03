@@ -25,6 +25,8 @@ abstract contract TradeManifest is Script {
     error ReactorFeeControllerNotAddress();
     error ReactorMismatch(string what);
     error ReactorFeeOwnerNotTimelock(address owner, address timelock);
+    error LaunchRecordMismatch(string field);
+    error RouterMismatch(string what);
 
     /// @dev Refuses any chain other than Arc testnet. A local fork must keep chain id 5042002.
     function _requireTestnet() internal view {
@@ -57,6 +59,37 @@ abstract contract TradeManifest is Script {
         }
         address timelock = vm.parseJsonAddress(launchRecord, ".timelock");
         if (owner != timelock) revert ReactorFeeOwnerNotTimelock(owner, timelock);
+    }
+
+    /// @dev The manifest's Launch-side inputs must be the ones in Launch's record for this chain: permit2, USDC, the
+    ///      Launch hook and, as the app fee recipient, Launch's treasury.
+    function _requireLaunchRecord(string memory manifest, string memory launchRecord) internal view {
+        if (vm.parseJsonUint(manifest, ".chainId") != block.chainid) revert LaunchRecordMismatch("manifest chainId");
+        if (vm.parseJsonUint(launchRecord, ".chainId") != block.chainid) revert LaunchRecordMismatch("record chainId");
+        _requireSame(manifest, ".permit2", launchRecord, ".permit2", "permit2");
+        _requireSame(manifest, ".usdc", launchRecord, ".usdc", "usdc");
+        _requireSame(manifest, ".launchHook", launchRecord, ".launchHook", "launchHook");
+        _requireSame(manifest, ".appRecipient", launchRecord, ".treasury", "appRecipient");
+    }
+
+    function _requireSame(
+        string memory manifest,
+        string memory key,
+        string memory launchRecord,
+        string memory recordKey,
+        string memory field
+    ) internal pure {
+        if (vm.parseJsonAddress(manifest, key) != vm.parseJsonAddress(launchRecord, recordKey)) {
+            revert LaunchRecordMismatch(field);
+        }
+    }
+
+    /// @dev The Universal Router keeps its permit2 in an internal immutable with no getter, so its runtime is pinned by
+    ///      the manifest's `routerCodeHash`. `verify-trade-filler.py --preflight` proves that runtime is the pinned
+    ///      router source with the manifest's permit2 in its PERMIT2 immutable.
+    function _requireRouter(address router, string memory manifest) internal view {
+        if (router.code.length == 0) revert NoCode("router", router);
+        if (router.codehash != vm.parseJsonBytes32(manifest, ".routerCodeHash")) revert RouterMismatch("codehash");
     }
 
     function _requireCode(string memory name, address account) internal view {

@@ -8,10 +8,21 @@ differing offsets and exits non-zero on any mismatch. No keys, no signing, no wr
   python3 script/verify-trade-filler.py --rpc URL --block N --deployment FILE   # FILE has reactor, filler,
                                                                                 # reactorFeeOwner, feeRecipient,
                                                                                 # reactorFeeController
+  python3 script/verify-trade-filler.py --reactor-only --rpc URL --block N --deployment FILE
+                                                    # the reactor alone, before any filler: FILE has reactor,
+                                                    # reactorFeeOwner and reactorFeeController
+  python3 script/verify-trade-filler.py --preflight [--manifest FILE] [--allow-pending]
+                                                    # offline: manifest against Launch's record and the router
   python3 script/verify-trade-filler.py --self-test                             # offline, no network
+
+Every live run first runs the preflight: the manifest's permit2, USDC, Launch hook, app fee recipient (Launch's
+treasury) and reactor fee owner (Launch's timelock) must equal Launch's deployment record for the chain, and its
+routerCodeHash must be the reproduced router runtime whose PERMIT2 immutable holds the manifest permit2. The live run
+then reads the router at the pinned block and requires that code hash and those PERMIT2 bytes.
   python3 script/verify-trade-filler.py --self-test-reactor-flipped             # offline; must report MISMATCH
 """
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -385,12 +396,219 @@ def reactor_self_test(flip):
     return ok
 
 
+LAUNCH_RECORDS = 'lib/mercuri-launch-contracts/deployments'
+ROUTER_REPORT = 'docs/reports/2026-09-27-trade-router-comparison.json'
+ROUTER_ARTIFACT = 'out/trade-router/UniversalRouter.sol/UniversalRouter.json'
+PENDING_PREFIX = 'REQUIRED_'
+# Manifest key -> Launch record key; each must be equal.
+LAUNCH_FIELDS = {'permit2': 'permit2', 'usdc': 'usdc', 'launchHook': 'launchHook', 'appRecipient': 'treasury'}
+# Owner choices that may still be pending sentinels during review.
+CHOICES = ('reactorFeeOwner', 'executionFee', 'feeRecipient')
+
+
+def pending(value):
+    return isinstance(value, str) and value.startswith(PENDING_PREFIX)
+
+
+def router_names():
+    names = {}
+
+    def visit(node):
+        if isinstance(node, dict):
+            if node.get('nodeType') == 'VariableDeclaration' and node.get('mutability') == 'immutable':
+                names[str(node['id'])] = node['name']
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    for path in sorted((root / 'out/trade-router').glob('*/*.json')):
+        visit(json.loads(path.read_text()).get('ast', {}))
+    return names
+
+
+def router_runtime(chain):
+    """The reproduced router runtime for `chain`, its PERMIT2 offsets and the report's entry for that network.
+
+    Rebuilt from the pinned router build with every immutable taken from the router comparison report, which records
+    the bytes observed on chain (sha256). Returns (runtime, permit2 offsets, report network entry, report immutables).
+    """
+    report = load(ROUTER_REPORT)
+    artifact = load(ROUTER_ARTIFACT)
+    names = router_names()
+    proofs = {entry['chainId']: entry['immutables'] for entry in report['immutableProof']}
+    network = next((n for n in report['networks'] if n['chainId'] == chain), None)
+    if network is None or chain not in proofs:
+        raise SystemExit(f'router report has no entry for chain {chain}')
+    code = bytearray.fromhex(artifact['deployedBytecode']['object'].removeprefix('0x'))
+    offsets = []
+    for key, refs in artifact['deployedBytecode']['immutableReferences'].items():
+        value = bytes.fromhex(proofs[chain][names[key]].removeprefix('0x'))
+        for ref in refs:
+            if len(value) != ref['length']:
+                raise SystemExit(f'router immutable {names[key]} has the wrong length')
+            code[ref['start']:ref['start'] + ref['length']] = value
+            if names[key] == 'PERMIT2':
+                offsets.append(ref['start'])
+    if not offsets:
+        raise SystemExit('router artifact has no PERMIT2 immutable')
+    return bytes(code), offsets, network, proofs[chain]
+
+
+def check_router_code(live, manifest, label):
+    """A router runtime is accepted when its keccak is the manifest's routerCodeHash and every PERMIT2 slot holds the
+    manifest permit2. Prints and returns the verdict."""
+    _, offsets, _, _ = router_runtime(manifest['chainId'])
+    ok = True
+    keccak = cast_keccak(live)
+    if keccak.lower() != str(manifest.get('routerCodeHash', '')).lower():
+        print(f'{label}: router code hash {keccak} != manifest routerCodeHash {manifest.get("routerCodeHash")}')
+        ok = False
+    word = address_word(manifest['permit2'])
+    for offset in offsets:
+        if live[offset:offset + 32] != word:
+            print(f'{label}: router PERMIT2 at offset {offset} is 0x{live[offset:offset + 32].hex()}, not the manifest permit2')
+            ok = False
+    if ok:
+        print(f'{label}: router code hash {keccak} and PERMIT2 at offsets {offsets} match the manifest')
+    return ok
+
+
+def preflight(manifest, rehearsal=False):
+    """Offline cross-checks of a manifest. Returns (problems, pending choices); prints each result.
+
+    With `rehearsal` (a loopback anvil fork only) the reactor fee owner is an anvil account, not Launch's timelock.
+    """
+    problems = []
+    chain = manifest.get('chainId')
+    record_path = root / LAUNCH_RECORDS / f'{chain}.json'
+    if not record_path.exists():
+        return [f'no Launch deployment record {record_path.relative_to(root)}'], []
+    record = json.loads(record_path.read_text())
+    if record.get('chainId') != chain:
+        problems.append(f'Launch record chainId {record.get("chainId")} != manifest {chain}')
+    for key, record_key in LAUNCH_FIELDS.items():
+        value = manifest.get(key)
+        if not is_address(value) or value.lower() != str(record.get(record_key)).lower():
+            problems.append(f'manifest {key} {value!r} != Launch record {record_key} {record.get(record_key)}')
+    waiting = [key for key in CHOICES if pending(manifest.get(key))]
+    owner = manifest.get('reactorFeeOwner')
+    if rehearsal:
+        print(f'preflight {chain}: WARNING: LOCAL REHEARSAL; reactorFeeOwner {owner} is not checked against the timelock')
+    elif 'reactorFeeOwner' not in waiting and (not is_address(owner) or owner.lower() != record['timelock'].lower()):
+        problems.append(f'manifest reactorFeeOwner {owner!r} != Launch record timelock {record["timelock"]}')
+    if 'executionFee' not in waiting:
+        try:
+            execution_fee(manifest)
+        except SystemExit as error:
+            problems.append(str(error))
+    recipient = manifest.get('feeRecipient')
+    if 'feeRecipient' not in waiting and (not is_address(recipient) or int(recipient, 16) == 0):
+        problems.append(f'manifest feeRecipient is not a nonzero address: {recipient!r}')
+    if not is_address(manifest.get('reactorFeeController', ZERO_ADDRESS)):
+        problems.append(f'manifest reactorFeeController is not an address: {manifest.get("reactorFeeController")!r}')
+    try:
+        runtime, offsets, network, immutables = router_runtime(chain)
+        if hashlib.sha256(runtime).hexdigest() != network['contracts']['router']['sha256']:
+            problems.append('reproduced router runtime differs from the bytes the router report observed on chain')
+        if str(manifest.get('router', '')).lower() != network['contracts']['router']['address'].lower():
+            problems.append(f'manifest router {manifest.get("router")} != report {network["contracts"]["router"]["address"]}')
+        if immutables['PERMIT2'].lower() != '0x' + address_word(str(manifest.get('permit2', ZERO_ADDRESS))).hex():
+            problems.append('router report PERMIT2 immutable is not the manifest permit2')
+        if not check_router_code(runtime, manifest, f'preflight {chain}'):
+            problems.append('manifest routerCodeHash or permit2 does not match the reproduced router')
+    except (SystemExit, KeyError, ValueError) as error:
+        problems.append(f'router: {error}')
+    for problem in problems:
+        print(f'preflight {chain}: FAIL {problem}')
+    for key in waiting:
+        print(f'preflight {chain}: PENDING owner choice {key} = {manifest[key]}')
+    if not problems:
+        print(f'preflight {chain}: manifest matches Launch record {record_path.relative_to(root)} and the reproduced router')
+    return problems, waiting
+
+
+def run_preflight(manifest, allowed_pending, rehearsal=False):
+    problems, waiting = preflight(manifest, rehearsal)
+    blocked = [key for key in waiting if key not in allowed_pending]
+    if blocked:
+        print(f'preflight {manifest.get("chainId")}: owner choices still pending: {", ".join(blocked)}')
+    return not problems and not blocked
+
+
+def required_reactor_fields(deployment, reactor_only):
+    """The deployment record keys a live run needs."""
+    keys = ['reactor', 'reactorFeeOwner', 'reactorFeeController'] + ([] if reactor_only else ['filler', 'feeRecipient'])
+    missing = [key for key in keys if not is_address(deployment.get(key))]
+    if missing:
+        raise SystemExit(f'deployment record lacks {", ".join(missing)}')
+
+
+def preflight_self_test():
+    """Both manifests pass with only their owner choices pending; each tampered field and a pending choice fail."""
+    import copy
+    ok = True
+    for path, expected in (('deployments/manifest-5042002.json', ['feeRecipient']),
+                           ('deployments/manifest-5042.json', ['executionFee', 'feeRecipient'])):
+        manifest = load(path)
+        problems, waiting = preflight(manifest)
+        if problems or waiting != expected:
+            print(f'{path}: expected a clean preflight with {expected} pending, got {problems} {waiting}')
+            ok = False
+        if run_preflight(manifest, ()):
+            print(f'{path}: pending owner choices were NOT refused without --allow-pending')
+            ok = False
+    base = load('deployments/manifest-5042002.json')
+    other = '0x00000000000000000000000000000000000000Ab'
+    cases = {key: other for key in ('permit2', 'usdc', 'launchHook', 'appRecipient', 'reactorFeeOwner', 'router')}
+    cases.update(routerCodeHash='0x' + '11' * 32, executionFee=100_001, feeRecipient='0x' + '0' * 40,
+                 reactorFeeController='none', chainId=1)
+    mainnet_owner = load(f'{LAUNCH_RECORDS}/5042.json')['timelock']
+    tampered_cases = list(cases.items()) + [('reactorFeeOwner', mainnet_owner)]
+    for key, value in tampered_cases:
+        manifest = copy.deepcopy(base)
+        manifest[key] = value
+        problems, _ = preflight(manifest)
+        if not problems:
+            print(f'tampered {key}={value!r}: NOT refused')
+            ok = False
+        else:
+            print(f'tampered {key}={value!r}: refused')
+    # The testnet router runtime fails the mainnet manifest (another EIP-712 domain) and a flipped PERMIT2 byte fails.
+    runtime, offsets, _, _ = router_runtime(5042002)
+    if check_router_code(runtime, load('deployments/manifest-5042.json'), 'testnet router vs mainnet manifest'):
+        ok = False
+    flipped = bytearray(runtime)
+    flipped[offsets[0] + 31] ^= 0x01
+    if check_router_code(bytes(flipped), base, 'router with a flipped PERMIT2 byte'):
+        ok = False
+    for deployment, reactor_only, good in (
+        ({'reactor': other, 'reactorFeeOwner': other, 'reactorFeeController': ZERO_ADDRESS}, True, True),
+        ({'reactor': other, 'reactorFeeOwner': other, 'reactorFeeController': ZERO_ADDRESS}, False, False),
+        ({'reactor': other, 'reactorFeeOwner': other}, True, False),
+    ):
+        try:
+            required_reactor_fields(deployment, reactor_only)
+            accepted = True
+        except SystemExit as error:
+            print(f'deployment record (reactor-only={reactor_only}) refused: {error}')
+            accepted = False
+        ok &= accepted == good
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--rpc', default=DEFAULT_RPC)
     parser.add_argument('--block', type=int)
     parser.add_argument('--deployment', help='JSON with reactor, filler, reactorFeeOwner, reactorFeeController and feeRecipient')
     parser.add_argument('--manifest', default='deployments/manifest-5042002.json')
+    parser.add_argument('--reactor-only', action='store_true', help='verify the reactor alone, before any filler exists')
+    parser.add_argument('--preflight', action='store_true', help='offline: manifest against Launch record and router')
+    parser.add_argument('--allow-pending', action='store_true', help='with --preflight: owner choices may be sentinels')
+    parser.add_argument('--rehearsal', action='store_true',
+                        help='loopback anvil fork only: the reactor fee owner is an anvil account, not the timelock')
     parser.add_argument('--self-test', action='store_true', help='offline: unmodified bytes must match, a flipped immutable byte must not')
     parser.add_argument('--self-test-flipped', action='store_true', help='offline: verify with one immutable byte flipped; exits non-zero')
     parser.add_argument('--self-test-flipped-fee', action='store_true', help='offline: verify with one executionFee byte flipped; exits non-zero')
@@ -415,19 +633,32 @@ def main():
         if not fee_controller_self_test():
             print('self-test FAILED: the reactor feeController check did not behave as required')
             sys.exit(1)
+        if not preflight_self_test():
+            print('self-test FAILED: the manifest preflight did not behave as required')
+            sys.exit(1)
         sets = immutable_set_self_test()
         reactor_good = reactor_self_test(False)
         reactor_bad = reactor_self_test(True)
         if not good or bad or not sets or not reactor_good or reactor_bad:
             print('self-test FAILED: verifier did not behave as required')
             sys.exit(1)
-        print('self-test ok: unmodified runtimes match; a flipped filler usdc, executionFee or feeRecipient byte and a flipped reactor function-pointer byte are rejected')
+        print('self-test ok: unmodified runtimes match; a flipped filler usdc, executionFee or feeRecipient byte and a flipped reactor function-pointer byte are rejected; the reactor feeController check and the manifest preflight refuse every tampered value')
         return
+    if args.preflight:
+        sys.exit(0 if run_preflight(load(args.manifest), CHOICES if args.allow_pending else ()) else 1)
     if args.block is None or not args.deployment:
         parser.error('--block and --deployment are required')
 
     manifest = load(args.manifest)
     deployment = json.loads(Path(args.deployment).read_text())
+    required_reactor_fields(deployment, args.reactor_only)
+    # The reactor step comes before the keeper is chosen (D2 before D3), so only its own choice must be made.
+    if args.rehearsal:
+        client = rpc_call(args.rpc, 'web3_clientVersion', [])
+        if 'anvil' not in client.lower():
+            raise SystemExit(f'--rehearsal needs a loopback anvil RPC; {args.rpc} reports {client!r}')
+    if not run_preflight(manifest, ('executionFee', 'feeRecipient') if args.reactor_only else (), args.rehearsal):
+        raise SystemExit('preflight failed; nothing was read from the chain')
     chain = int(rpc_call(args.rpc, 'eth_chainId', []), 16)
     if chain != manifest['chainId']:
         raise SystemExit(f'chain id {chain} != manifest {manifest["chainId"]}')
@@ -439,10 +670,13 @@ def main():
         return bytes.fromhex(rpc_call(args.rpc, 'eth_getCode', [address, tag]).removeprefix('0x'))
 
     owner = required_owner(manifest, deployment)
-    fee_recipient = required_fee_recipient(manifest, deployment)
     ok = verify_reactor(args, manifest, owner, tag, code(deployment['reactor']))
-    filler = load('out/MercuriOrderFiller.sol/MercuriOrderFiller.json')
-    ok &= verify('filler', 'filler', filler, manifest_values(manifest, deployment['reactor'], fee_recipient), code(deployment['filler']))
+    if not args.reactor_only:
+        fee_recipient = required_fee_recipient(manifest, deployment)
+        filler = load('out/MercuriOrderFiller.sol/MercuriOrderFiller.json')
+        values = manifest_values(manifest, deployment['reactor'], fee_recipient)
+        ok &= verify('filler', 'filler', filler, values, code(deployment['filler']))
+        ok &= check_router_code(code(manifest['router']), manifest, f'router at block {args.block}')
     onchain = rpc_call(args.rpc, 'eth_call', [{'to': deployment['reactor'], 'data': OWNER_SELECTOR}, tag])
     onchain = '0x' + onchain[-40:]
     if onchain.lower() != owner.lower():

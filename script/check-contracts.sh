@@ -14,6 +14,15 @@ bash script/build-trade-router.sh
 forge fmt --check
 forge build
 python3 script/check-natspec.py
+# Both manifests must agree with Launch's records and the reproduced router; only owner choices may be pending, and
+# without --allow-pending a pending choice must be refused.
+python3 script/verify-trade-filler.py --preflight --allow-pending
+python3 script/verify-trade-filler.py --preflight --allow-pending --manifest deployments/manifest-5042.json
+if pending=$(python3 script/verify-trade-filler.py --preflight 2>&1); then
+  echo 'verify-trade-filler.py --preflight accepted a manifest with a pending owner choice' >&2
+  exit 1
+fi
+grep -q 'owner choices still pending' <<<"$pending" || { echo "preflight failed without a pending report: $pending" >&2; exit 1; }
 # Runtime identity: the verifier must accept the rebuilt filler runtime and reject one flipped immutable byte.
 python3 script/verify-trade-filler.py --self-test
 # Non-zero exit alone could be a crash, so require the verifier's own mismatch report as well.

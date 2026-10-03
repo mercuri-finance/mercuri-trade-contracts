@@ -38,9 +38,11 @@ contract DeployOrderFiller is TradeManifest {
     function run() external returns (MercuriOrderFiller filler) {
         _requireTestnet();
         string memory manifest = _manifest();
-        // Owner choices first: refuse a sentinel before reading anything else. The fee owner is checked on the reactor.
+        string memory launchRecord = _launchRecord();
+        _requireLaunchRecord(manifest, launchRecord);
+        // Owner choices next: refuse a sentinel before reading TRADE_REACTOR. The fee owner is checked on the reactor.
         address feeOwner = _reactorFeeOwner(manifest);
-        _requireTimelockOwner(feeOwner, _launchRecord(), _rehearsal());
+        _requireTimelockOwner(feeOwner, launchRecord, _rehearsal());
         address feeRecipient = _feeRecipient(manifest);
         address reactor = vm.envAddress("TRADE_REACTOR");
         address router = _address(manifest, ".router");
@@ -51,7 +53,7 @@ contract DeployOrderFiller is TradeManifest {
         uint256 executionFee = _executionFee(manifest);
         address feeController = _reactorFeeController(manifest);
         _requireReactor(reactor, permit2, feeOwner, feeController, vm.envBytes32("TRADE_REACTOR_CODEHASH"));
-        _requireCode("router", router);
+        _requireRouter(router, manifest);
         _requireCode("permit2", permit2);
         _requireCode("usdc", usdc);
         _requireCode("launchHook", launchHook);

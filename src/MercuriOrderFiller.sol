@@ -24,12 +24,13 @@ interface IOrderSwapRouter {
 /// @dev Immutable: no owner, pause, upgrade or rescue path. The execution fee comes from the USDC side (see
 ///      `executionFee`). Tokens sent to this contract outside a fill never subsidize another order or the fee. Orders
 ///      are bound to their reactor and cosigner, not to this contract, so a replacement filler can settle orders that
-///      are already signed. Only the configured keeper (`feeRecipient`) can call `fill`. The keeper cosigns each order
-///      exclusive to this filler, and the caller of `fill` chooses the pool, so an open `fill` would let a copier route
-///      a keeper-cosigned order through a pool of its choice (for example around Launch's hook fee) or race the keeper
-///      for its own transaction. Restricting the caller keeps settlement and pool choice with the keeper. Replacing the
-///      filler, including rotating the keeper key, therefore means deploying a new filler and switching the keeper to
-///      it by configuration.
+///      are already signed. Native value is accepted only from the reactor (its end-of-fill refund) and is never spent.
+///      Only the configured keeper (`feeRecipient`) can call `fill`. The keeper cosigns each order exclusive to this
+///      filler, and the caller of `fill` chooses the pool, so an open `fill` would let a copier route a keeper-cosigned
+///      order through a pool of its choice (for example around Launch's hook fee) or race the keeper for its own
+///      transaction. Restricting the caller keeps settlement and pool choice with the keeper. Replacing the filler,
+///      including rotating the keeper key, therefore means deploying a new filler and switching the keeper to it by
+///      configuration.
 contract MercuriOrderFiller is IReactorCallback {
     using SafeERC20 for IERC20;
     using V3DutchOrderLib for V3DutchOrder;
@@ -65,6 +66,9 @@ contract MercuriOrderFiller is IReactorCallback {
     bool private active;
     /// @dev This contract's input-token balance when the current fill started; zero outside a fill.
     uint256 private inputBaseline;
+    /// @dev Output the current fill's swap delivered above what it had to (`required`); zero outside a fill. The most
+    ///      `fill` pays the trader on top of the reactor's outputs.
+    uint256 private outputSurplus;
 
     /// @notice Emitted once for each order settled through this filler.
     /// @param orderHash the trader-signed order hash, as the reactor's `Fill` event carries it
@@ -84,6 +88,8 @@ contract MercuriOrderFiller is IReactorCallback {
     error ExecutionFeeTooHigh();
     /// @notice `fill` was called by an address other than the configured keeper (`feeRecipient`).
     error NotKeeper();
+    /// @notice Native value was sent by an address other than the reactor.
+    error NotReactor();
 
     /// @notice Fixes the settlement dependencies, fee recipients and execution fee for this filler's life.
     /// @dev Reverts `ZeroAddress` if any address is zero and `ExecutionFeeTooHigh` above `MAX_EXECUTION_FEE`.
@@ -121,6 +127,17 @@ contract MercuriOrderFiller is IReactorCallback {
         feeRecipient = feeRecipient_;
     }
 
+    /// @notice Accepts native value from the reactor only.
+    /// @dev The reactor refunds its whole native balance to the filler at the end of `executeWithCallback`. On Arc
+    ///      native value is USDC, so any dust on the reactor (a 1-wei send or a 1-unit ERC-20 USDC transfer) is
+    ///      refunded here, after the callback's input checks and the reactor's output transfers. Refusing it would
+    ///      revert every fill. The value stays in this contract unspent, like a donation: `fill` pays the trader at
+    ///      most the swap's own surplus, so it never subsidizes the fill it arrives in, and the next fill's baselines
+    ///      include it, so no later fill can spend it either. There is no rescue path.
+    receive() external payable {
+        if (msg.sender != address(reactor)) revert NotReactor();
+    }
+
     /// @notice Fills one signed order: the trader receives every output above what the reactor takes; a fixed USDC
     ///         execution fee is taken from the order's USDC side (the input on a buy, the output on a sell) and paid
     ///         to `feeRecipient`.
@@ -147,8 +164,11 @@ contract MercuriOrderFiller is IReactorCallback {
 
         // Only this fill's surplus belongs to its signer. Unsolicited donations neither subsidize orders nor prevent
         // the next user's fill. On a sell the callback kept the execution fee in USDC output; on a buy, in USDC input.
+        // The balance can also hold the reactor's native refund (USDC on Arc), so the payout is capped at the swap's
+        // own surplus, and the balance bound keeps any token that debits more than it sends off the donations.
         uint256 leftover =
             output.balanceOf(address(this)) - outputBaseline - (address(output) == usdc ? executionFee : 0);
+        if (leftover > outputSurplus) leftover = outputSurplus;
         if (leftover > 0) output.safeTransfer(order.info.swapper, leftover);
         input.forceApprove(address(permit2), 0);
         permit2.approve(address(input), address(router), 0, 0);
@@ -161,12 +181,14 @@ contract MercuriOrderFiller is IReactorCallback {
         emit OrderFilled(order.hash(), order.info.swapper, keccak256(abi.encode(key)));
         active = false;
         inputBaseline = 0;
+        outputSurplus = 0;
     }
 
     /// @notice Settles the reactor's resolved order against the supplied pool.
     /// @dev Only the configured reactor can call this during an active fill. It leaves exactly `executionFee` USDC in
     ///      this contract for `fill` to pay: a buy swaps the input less the app and execution fees; a sell requires
-    ///      the swap to yield the reactor's outputs plus the execution fee.
+    ///      the swap to yield the reactor's outputs plus the execution fee. It records the output the swap delivered
+    ///      above that as `outputSurplus`, the most `fill` pays the trader on top of the reactor's outputs.
     /// @param orders Reactor's resolved orders; exactly one is accepted, with output-token fee outputs allowed.
     /// @param callbackData ABI-encoded pool key supplied to `fill`.
     function reactorCallback(ResolvedOrder[] memory orders, bytes memory callbackData) external {
@@ -201,9 +223,14 @@ contract MercuriOrderFiller is IReactorCallback {
         permit2.approve(input, address(router), uint160(amount - kept), uint48(block.timestamp));
         (bytes memory commands, bytes[] memory inputs) =
             _recipe(key, input, output, amount - appFee - kept, appFee, required, order.info.swapper);
+        uint256 outputBefore = IERC20(output).balanceOf(address(this));
         router.execute(commands, inputs, order.info.deadline);
         // Fixed input orders reject liquidity exhaustion instead of refunding a partial fill.
         if (IERC20(input).balanceOf(address(this)) != inputBaseline + kept) revert InvalidOrder();
+        // The router enforced a swap of at least `required`; a taxed output token can still deliver less here.
+        uint256 received = IERC20(output).balanceOf(address(this)) - outputBefore;
+        if (received < required) revert InvalidOrder();
+        outputSurplus = received - required;
         IERC20(output).forceApprove(address(reactor), minimum);
     }
 

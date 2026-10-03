@@ -8,10 +8,14 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
 import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
 import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
+import {ISignatureTransfer} from "permit2/src/interfaces/ISignatureTransfer.sol";
 import {IReactor} from "../lib/uniswapx/src/interfaces/IReactor.sol";
 import {IReactorCallback} from "../lib/uniswapx/src/interfaces/IReactorCallback.sol";
 import {SignedOrder, ResolvedOrder} from "../lib/uniswapx/src/base/ReactorStructs.sol";
-import {V3DutchOrder, V3DutchOrderLib} from "../lib/uniswapx/src/lib/V3DutchOrderLib.sol";
+import {V3DutchOrder, V3DutchOrderLib, V3DutchInput} from "../lib/uniswapx/src/lib/V3DutchOrderLib.sol";
+import {NonlinearDutchDecayLib} from "../lib/uniswapx/src/lib/NonlinearDutchDecayLib.sol";
+import {MathExt} from "../lib/uniswapx/src/lib/MathExt.sol";
+import {FixedPointMathLib} from "../lib/uniswapx/lib/solmate/src/utils/FixedPointMathLib.sol";
 import {IOrderSwapRouter} from "./interfaces/IOrderSwapRouter.sol";
 
 /// @notice Settles one signed UniswapX order through one Arc v4 USDC pool. The signed trader receives every output
@@ -30,6 +34,9 @@ import {IOrderSwapRouter} from "./interfaces/IOrderSwapRouter.sol";
 contract MercuriOrderFiller is IReactorCallback {
     using SafeERC20 for IERC20;
     using V3DutchOrderLib for V3DutchOrder;
+    using NonlinearDutchDecayLib for V3DutchInput;
+    using MathExt for uint256;
+    using FixedPointMathLib for uint256;
 
     /// @notice App fee in basis points of the USDC side, fixed at 50 bps.
     /// @dev Charged on listed (non-Launch) pools only. A buy pays it on the gross signed input, which includes the
@@ -108,6 +115,15 @@ contract MercuriOrderFiller is IReactorCallback {
     error NotKeeper();
     /// @notice Native value was sent by an address other than the reactor.
     error NotReactor();
+    /// @notice The order's deadline has passed; the reactor would refuse it (`DeadlineReached`).
+    error OrderExpired();
+    /// @notice The order's Permit2 nonce is already used or cancelled; Permit2 would refuse it (`InvalidNonce`).
+    error NonceUsed();
+    /// @notice The trader holds less of the input token than the reactor would take for this order in this block.
+    error SwapperBalanceTooLow();
+    /// @notice The trader's input-token allowance to Permit2 is below what the reactor would take for this order in
+    ///         this block.
+    error SwapperAllowanceTooLow();
 
     /// @notice Fixes the settlement dependencies, fee recipients and execution fee for this filler's life.
     /// @dev Reverts `ZeroAddress` if any address is zero and `ExecutionFeeTooHigh` above `MAX_EXECUTION_FEE`.
@@ -161,7 +177,10 @@ contract MercuriOrderFiller is IReactorCallback {
     ///         to `feeRecipient`.
     /// @dev Only the configured keeper (`feeRecipient`) may call this; any other caller reverts `NotKeeper` before the
     ///      order is touched. The reactor enforces its signature, nonce and deadline; this call reverts atomically,
-    ///      paying no fee, if the trader's signed net minimum is unmet.
+    ///      paying no fee, if the trader's signed net minimum is unmet. Before the reactor runs, `_requireFundable`
+    ///      refuses an order the reactor would refuse at the input transfer (passed deadline, used nonce, too little
+    ///      balance or Permit2 allowance), so a trader who moves funds, revokes the approval or cancels the nonce after
+    ///      the keeper's simulation costs the keeper a cheap, typed revert rather than a deep one in the reactor.
     /// @param signed User-signed UniswapX V3 Dutch order and signature.
     /// @param key One USDC pool used for this fill.
     function fill(SignedOrder calldata signed, PoolKey calldata key) external {
@@ -174,6 +193,7 @@ contract MercuriOrderFiller is IReactorCallback {
 
         IERC20 output = IERC20(order.baseOutputs[0].token);
         IERC20 input = IERC20(address(order.baseInput.token));
+        _requireFundable(order, input);
         uint256 beforeBalance = output.balanceOf(order.info.swapper);
         active = true;
         inputBaseline = input.balanceOf(address(this));
@@ -250,6 +270,54 @@ contract MercuriOrderFiller is IReactorCallback {
         if (received < required) revert InsufficientOutput();
         outputSurplus = received - required;
         IERC20(output).forceApprove(address(reactor), minimum);
+    }
+
+    /// @dev Refuses, before the reactor runs, an order the reactor would refuse when it pulls the input through Permit2:
+    ///      the deadline has passed (`OrderExpired`), the Permit2 nonce bit is set (`NonceUsed`), or the trader's input
+    ///      balance (`SwapperBalanceTooLow`) or allowance to Permit2 (`SwapperAllowanceTooLow`) is below the amount the
+    ///      reactor would take in this block. It only reads: `permit2`'s nonce bitmap (the reactor's own Permit2: the
+    ///      deployment script requires `reactor.permit2() == permit2`) and the input token's `balanceOf` and
+    ///      `allowance`, both static calls. It can only make a fill revert earlier, never let through one the reactor
+    ///      refuses. A token whose views overstate passes here and fails in Permit2 as before; one whose views
+    ///      understate or revert only blocks its own orders, and `fill` already calls its `balanceOf`. The gas of
+    ///      those views is bounded by the transaction the keeper chose to send for that order.
+    /// @param order Decoded signed order.
+    /// @param input The order's input token.
+    function _requireFundable(V3DutchOrder memory order, IERC20 input) private view {
+        if (order.info.deadline < block.timestamp) revert OrderExpired();
+        address swapper = order.info.swapper;
+        uint256 nonce = order.info.nonce;
+        if (ISignatureTransfer(address(permit2)).nonceBitmap(swapper, nonce >> 8) & (1 << (nonce & 0xff)) != 0) {
+            revert NonceUsed();
+        }
+        uint256 amount = _inputAmount(order);
+        if (input.balanceOf(swapper) < amount) revert SwapperBalanceTooLow();
+        if (input.allowance(swapper, address(permit2)) < amount) revert SwapperAllowanceTooLow();
+    }
+
+    /// @dev Returns the input the reactor takes for `order` in this block, resolved as `V3DutchOrderReactor._resolve`
+    ///      resolves it: the cosigned input when nonzero, the base-fee adjustment bounded to `maxAmount`, then the
+    ///      input curve at `block.number` (the reactor's block number on any chain but Arbitrum's, Arc included). A
+    ///      cosigned input above the signed start is left for the reactor to refuse (`InvalidCosignerInput`). The
+    ///      order is not modified.
+    /// @param order Decoded signed order.
+    /// @return amount Input amount the reactor would transfer from the trader.
+    function _inputAmount(V3DutchOrder memory order) private view returns (uint256 amount) {
+        V3DutchInput memory base = order.baseInput;
+        amount = base.startAmount;
+        uint256 cosigned = order.cosignerData.inputAmount;
+        if (cosigned != 0 && cosigned <= amount) amount = cosigned;
+        uint256 adjustment = base.adjustmentPerGweiBaseFee;
+        if (adjustment != 0) {
+            // Rounded in the trader's favour, as the reactor's `_computeDelta`.
+            int256 gasDeltaWei = block.basefee.sub(order.startingBaseFee);
+            int256 delta = gasDeltaWei >= 0
+                ? int256(adjustment.mulDivDown(uint256(gasDeltaWei), 1 gwei))
+                : -int256(adjustment.mulDivUp(uint256(-gasDeltaWei), 1 gwei));
+            amount = amount.boundedAdd(delta, 0, base.maxAmount);
+        }
+        V3DutchInput memory adjusted = V3DutchInput(base.token, amount, base.curve, base.maxAmount, adjustment);
+        amount = adjusted.decay(order.cosignerData.decayStartBlock, block.number).amount;
     }
 
     /// @dev Returns the trader's output plus any reactor protocol fee. Fees must be in the output token: the whole

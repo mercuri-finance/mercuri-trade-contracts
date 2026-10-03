@@ -296,7 +296,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         Market memory m = _market(true, false);
         SignedOrder memory signed = _order(USDC, address(m.token), 100e6, 1, 3);
         m.key.currency0 = Currency.wrap(address(0x1234));
-        vm.expectRevert();
+        vm.expectRevert(MercuriOrderFiller.PoolMismatch.selector);
         _fill(filler, signed, m.key);
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
     }
@@ -306,7 +306,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         SignedOrder memory sell = _order(address(token), USDC, 100e6, 1, 4);
         token.configure(1000, address(0), "");
         uint256 beforeBalance = token.balanceOf(trader);
-        vm.expectRevert();
+        vm.expectRevert(MercuriOrderFiller.InputNotConsumed.selector);
         _fill(filler, sell, m.key);
         assertEq(token.balanceOf(trader), beforeBalance);
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
@@ -324,7 +324,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         uint256 beforeKeeper = IERC20(USDC).balanceOf(feeRecipient);
         token.configure(1000, address(0), "");
         uint256 beforeUsdc = IERC20(USDC).balanceOf(trader);
-        vm.expectRevert();
+        vm.expectRevert(MercuriOrderFiller.InsufficientOutput.selector);
         _fill(filler, buy, m.key);
         assertEq(IERC20(USDC).balanceOf(trader), beforeUsdc);
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
@@ -336,7 +336,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         (Market memory m, AdversarialTradeToken token) = _adversarialMarket(true);
         SignedOrder memory sell = _order(address(token), USDC, 100e6, 1, 7);
         uint256 beforeBalance = token.balanceOf(trader);
-        vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+        vm.expectRevert(MercuriOrderFiller.InputNotConsumed.selector);
         _fill(filler, sell, m.key);
         assertEq(token.balanceOf(trader), beforeBalance);
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
@@ -396,7 +396,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         token.configure(1000, address(0), "");
         uint256 beforeBalance = token.balanceOf(trader);
         SignedOrder memory signed = _order(address(token), USDC, 100e6, 1, 31);
-        vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+        vm.expectRevert(MercuriOrderFiller.InputNotConsumed.selector);
         _fill(filler, signed, m.key);
         assertEq(token.balanceOf(address(filler)), 100e6);
         assertEq(token.balanceOf(trader), beforeBalance);
@@ -497,7 +497,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         Market memory m = _market(true, false);
         SignedOrder memory signed = _order(USDC, address(m.token), 100e6, 1, 52);
         uint256 before = IERC20(USDC).balanceOf(trader);
-        vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+        vm.expectRevert(MercuriOrderFiller.FeeOutputUnsupported.selector);
         _fill(filler, signed, m.key);
         assertEq(IERC20(USDC).balanceOf(trader), before);
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
@@ -517,7 +517,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         uint256 start = block.number;
         SignedOrder memory signed = _expiringOrder(address(m.token), USDC, 1000000e18, 1, 62, start, 0);
         vm.roll(start + EXPIRY_BLOCKS + 1);
-        vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector); // owed > uint128
+        vm.expectRevert(MercuriOrderFiller.AmountOverflow.selector); // owed > uint128
         _fill(filler, signed, m.key);
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
     }
@@ -616,7 +616,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
         try filler.fill(signed, m.key) {
             filled = true;
         } catch (bytes memory err) {
-            assertEq(bytes4(err), MercuriOrderFiller.InvalidOrder.selector, "dead order must fail as InvalidOrder");
+            assertEq(bytes4(err), MercuriOrderFiller.AmountOverflow.selector, "dead order must fail as AmountOverflow");
         }
         assertEq(filled, offset <= EXPIRY_BLOCKS, "fills iff inside the window");
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0) != 0, filled);
@@ -686,7 +686,7 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
             if (offset <= EXPIRY_BLOCKS) {
                 _fill(filler, signed, m.key);
             } else {
-                vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+                vm.expectRevert(MercuriOrderFiller.AmountOverflow.selector);
                 _fill(filler, signed, m.key);
             }
             assertTrue(vm.revertToState(snap));
@@ -706,6 +706,28 @@ contract UniswapXFillerTest is UniswapXFillerHarness {
             _executionFee(),
             feeRecipient
         );
+    }
+
+    /// Each refusal names its cause: an order whose single output goes to someone other than its signer, or with two
+    /// outputs, is refused before the reactor is called, with nothing moved and the nonce unused.
+    function test_orderRejectsInvalidOutputs() public {
+        Market memory m = _market(true, false);
+        uint256 net = _netQuote(m, true, 100e6, _executionFee());
+        V3DutchOrder memory order = abi.decode(_order(USDC, address(m.token), 100e6, net, 42).order, (V3DutchOrder));
+        order.baseOutputs[0].recipient = address(0xbeef);
+        SignedOrder memory elsewhere = _resign(order, USDC, 100e6, 42);
+        vm.expectRevert(MercuriOrderFiller.InvalidOutputs.selector);
+        _fill(filler, elsewhere, m.key);
+        order = abi.decode(_order(USDC, address(m.token), 100e6, net, 43).order, (V3DutchOrder));
+        V3DutchOutput[] memory two = new V3DutchOutput[](2);
+        two[0] = order.baseOutputs[0];
+        two[1] = order.baseOutputs[0];
+        order.baseOutputs = two;
+        order.cosignerData.outputAmounts = new uint256[](2);
+        SignedOrder memory doubled = _resign(order, USDC, 100e6, 43);
+        vm.expectRevert(MercuriOrderFiller.InvalidOutputs.selector);
+        _fill(filler, doubled, m.key);
+        assertEq(XPermit2(address(permit2)).nonceBitmap(trader, 0), 0);
     }
 }
 
@@ -895,7 +917,7 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
                 uint256 nonce = 120 + route * 2 + under;
                 SignedOrder memory signed = _order(USDC, address(m.token), amount, 1, nonce);
                 Snap memory before = _snap(m, filler, address(this));
-                vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+                vm.expectRevert(MercuriOrderFiller.InputTooSmallForFees.selector);
                 _fill(filler, signed, m.key);
                 _assertUnchanged(before, _snap(m, filler, address(this)), "too-small buy");
                 assertFalse(_nonceUsed(nonce), "nonce unused");
@@ -1030,6 +1052,7 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
             assertEq(caller.reentries(), 1, "re-entry attempted once");
             assertEq(caller.attempts(), 5);
             assertEq(caller.successes(), 0, "every re-entry refused");
+            assertEq(bytes4(caller.nestedFillError()), MercuriOrderFiller.Reentered.selector, "nested fill refused");
             assertEq(afterFill.caller - before.caller, fee, "fee paid exactly once");
             assertEq(before.traderUsdc - afterFill.traderUsdc, 100e6, "only the first order spent input");
             assertFalse(_nonceUsed(161 + i * 2), "second order untouched");
@@ -1123,7 +1146,7 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
             // Orders are signed before vm.expectRevert: signing reads Permit2, which would be the "next call".
             if (buy) {
                 SignedOrder memory small = _order(USDC, address(m.token), _exactFeeInput(launch, fee), 1, nonce);
-                vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+                vm.expectRevert(MercuriOrderFiller.InputTooSmallForFees.selector);
                 _fill(filler, small, m.key);
             } else {
                 uint256 got = _netQuote(m, false, amount, 0);
@@ -1165,7 +1188,7 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
         _fill(filler, signed, m.key);
         // Too small for the app fee plus the execution fee.
         signed = _order(USDC, address(m.token), _exactFeeInput(false, fee), 1, 201);
-        vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+        vm.expectRevert(MercuriOrderFiller.InputTooSmallForFees.selector);
         _fill(filler, signed, m.key);
         // A sell one unit short of owed + fee.
         uint256 got = _netQuote(launchSell, false, 1000000e18, 0);
@@ -1186,7 +1209,7 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
         // Input-token protocol fee.
         reactor.setProtocolFeeController(address(new MockFeeController(makeAddr("uniswap fee"), 5, true)));
         signed = _order(USDC, address(m.token), 100e6, net, 205);
-        vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+        vm.expectRevert(MercuriOrderFiller.FeeOutputUnsupported.selector);
         _fill(filler, signed, m.key);
         reactor.setProtocolFeeController(address(0));
         // Dead expiring order (+21).
@@ -1194,7 +1217,7 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
         uint256 head = block.number;
         SignedOrder memory expired = _order(USDC, address(m.token), 100e6, net, 207);
         vm.roll(head + EXPIRY_BLOCKS + 1);
-        vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+        vm.expectRevert(MercuriOrderFiller.AmountOverflow.selector);
         _fill(filler, dead, m.key);
         // Past the deadline.
         vm.warp(block.timestamp + 1 days + 1);
@@ -1348,7 +1371,7 @@ contract UniswapXFillerExecFeeTest is UniswapXFillerHarness {
         // Signed before vm.expectRevert: signing reads Permit2, which would be the "next call".
         SignedOrder memory tiny = _order(input, output, amount, 1, 250);
         if (buy && amount <= appFee + fee) {
-            vm.expectRevert(MercuriOrderFiller.InvalidOrder.selector);
+            vm.expectRevert(MercuriOrderFiller.InputTooSmallForFees.selector);
             _fill(f, tiny, m.key);
             _assertUnchanged(before, _snap(m, f, address(this)), "too-small buy");
             assertFalse(_nonceUsed(250));

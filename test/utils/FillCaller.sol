@@ -26,6 +26,8 @@ contract FillCaller {
     uint256 public reentries;
     uint256 public attempts;
     uint256 public successes;
+    /// Revert data of the first re-entry attempt in each `reenter`: the nested `fill`.
+    bytes public nestedFillError;
 
     constructor(MercuriOrderFiller filler_, address usdc_) {
         filler = filler_;
@@ -47,7 +49,11 @@ contract FillCaller {
     function reenter() public {
         reentries++;
         SignedOrder memory second = SignedOrder(armedOrder, armedSig);
-        _try(address(filler), abi.encodeCall(MercuriOrderFiller.fill, (second, armedKey)));
+        (bool nested, bytes memory reason) =
+            address(filler).call(abi.encodeCall(MercuriOrderFiller.fill, (second, armedKey)));
+        attempts++;
+        if (nested) successes++;
+        nestedFillError = reason;
         _try(address(filler), abi.encodeCall(MercuriOrderFiller.reactorCallback, (new ResolvedOrder[](0), "")));
         _try(address(reactor), abi.encodeCall(IReactor.executeWithCallback, (second, "")));
         bytes[] memory inputs = new bytes[](1);

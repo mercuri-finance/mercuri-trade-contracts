@@ -221,7 +221,7 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
 
     /// Fills a late-cosigned expiring buy `offset` blocks after the cosigning head (even seeds land inside the window, odd
     /// ones past it). Inside the window an outside filler is refused as `NoExclusiveOverride` and ours fills through +20;
-    /// from +21 ours is refused as `InvalidOrder`. The filler stays empty and a refused order leaves the nonce unused.
+    /// from +21 ours is refused as `AmountOverflow`. The filler stays empty and a refused order leaves the nonce unused.
     function exerciseExpiring(uint256 offset) external {
         require(msg.sender == address(handler) || msg.sender == address(this), "handler only");
         offset = offset % 2 == 0 ? offset / 2 % (EXPIRY_BLOCKS + 1) : EXPIRY_BLOCKS + 1 + offset / 2 % 20; // both sides of +20
@@ -261,7 +261,7 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         } else {
             (bool ok, bytes memory err) = _tryFill(signed, m.key, nonce);
             assertFalse(ok, "expired order filled");
-            assertEq(bytes4(err), MercuriOrderFiller.InvalidOrder.selector, "expiry reverted for another reason");
+            assertEq(bytes4(err), MercuriOrderFiller.AmountOverflow.selector, "expiry reverted for another reason");
             expiredRejections++;
             assertEq(IERC20(USDC).balanceOf(trader), beforeInput, "expired fill spent input");
             assertEq(
@@ -294,7 +294,9 @@ contract TradeInvariantsTest is UniswapXFillerHarness {
         uint256 beforeBitmap = XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8);
         (bool ok, bytes memory err) = _tryFill(signed, m.key, nonce);
         assertFalse(ok, "input-fee fill succeeded");
-        assertEq(bytes4(err), MercuriOrderFiller.InvalidOrder.selector, "input-fee fill reverted for another reason");
+        assertEq(
+            bytes4(err), MercuriOrderFiller.FeeOutputUnsupported.selector, "input-fee fill reverted for another reason"
+        );
         inputFeeRejections++;
         assertEq(IERC20(USDC).balanceOf(trader), beforeUSDC, "input-fee fill spent input");
         assertEq(XPermit2(address(permit2)).nonceBitmap(trader, nonce >> 8), beforeBitmap, "input-fee nonce used");

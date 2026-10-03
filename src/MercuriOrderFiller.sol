@@ -78,8 +78,28 @@ contract MercuriOrderFiller is IReactorCallback {
 
     /// @notice A constructor dependency or the fee recipient is the zero address.
     error ZeroAddress();
-    /// @notice The order, its outputs or the pool do not fit this filler, or a fill is already in progress.
-    error InvalidOrder();
+    /// @notice `fill` was entered while a fill is already in progress.
+    error Reentered();
+    /// @notice The order does not have exactly one output to its signer in a token other than its input, or the
+    ///         reactor resolved an output with no recipient.
+    error InvalidOutputs();
+    /// @notice The reactor resolved other than exactly one order for the callback.
+    error InvalidOrderCount();
+    /// @notice The pool's currencies are not the order's input and output, or neither of them is USDC.
+    error PoolMismatch();
+    /// @notice The input or the output owed does not fit in 128 bits, as the output of a late-cosigned order past its
+    ///         window does.
+    error AmountOverflow();
+    /// @notice A buy's USDC input does not exceed the app fee plus the execution fee.
+    error InputTooSmallForFees();
+    /// @notice The filler did not receive exactly the signed input (a taxed input token) or the swap did not spend all
+    ///         of it (the pool ran out of liquidity); a fixed-input order is never partly filled.
+    error InputNotConsumed();
+    /// @notice The swap delivered less output to this contract than it must hand back, as a taxed output token does.
+    error InsufficientOutput();
+    /// @notice The reactor's protocol fee is in a token other than the output; the input goes whole to the swap and
+    ///         fees, so such a fee cannot be paid.
+    error FeeOutputUnsupported();
     /// @notice The callback came from someone other than the reactor, or outside a fill.
     error ForbiddenCallback();
     /// @notice The trader's balance rose by less than the order's signed minimum output.
@@ -148,10 +168,10 @@ contract MercuriOrderFiller is IReactorCallback {
     /// @param key One USDC pool used for this fill.
     function fill(SignedOrder calldata signed, PoolKey calldata key) external {
         if (msg.sender != feeRecipient) revert NotKeeper();
-        if (active) revert InvalidOrder();
+        if (active) revert Reentered();
         V3DutchOrder memory order = abi.decode(signed.order, (V3DutchOrder));
         if (order.baseOutputs.length != 1 || order.baseOutputs[0].recipient != order.info.swapper) {
-            revert InvalidOrder();
+            revert InvalidOutputs();
         }
 
         IERC20 output = IERC20(order.baseOutputs[0].token);
@@ -193,32 +213,32 @@ contract MercuriOrderFiller is IReactorCallback {
     /// @param callbackData ABI-encoded pool key supplied to `fill`.
     function reactorCallback(ResolvedOrder[] memory orders, bytes memory callbackData) external {
         if (msg.sender != address(reactor) || !active) revert ForbiddenCallback();
-        if (orders.length != 1) revert InvalidOrder();
+        if (orders.length != 1) revert InvalidOrderCount();
         ResolvedOrder memory order = orders[0];
         PoolKey memory key = abi.decode(callbackData, (PoolKey));
         address input = address(order.input.token);
         address output = order.outputs[0].token;
         if (input == output || output == address(0) || order.outputs[0].recipient != order.info.swapper) {
-            revert InvalidOrder();
+            revert InvalidOutputs();
         }
         if (!((input == Currency.unwrap(key.currency0) && output == Currency.unwrap(key.currency1))
                     || (input == Currency.unwrap(key.currency1) && output == Currency.unwrap(key.currency0)))) {
-            revert InvalidOrder();
+            revert PoolMismatch();
         }
-        if (input != usdc && output != usdc) revert InvalidOrder();
+        if (input != usdc && output != usdc) revert PoolMismatch();
         bool app = address(key.hooks) != launchHook;
         bool buy = input == usdc;
         uint256 amount = order.input.amount;
         uint256 minimum = _owed(order, output);
         // A sell's swap must also yield the execution fee on top of the reactor's outputs.
         uint256 required = buy ? minimum : minimum + executionFee;
-        if (amount > type(uint128).max || required > type(uint128).max) revert InvalidOrder();
+        if (amount > type(uint128).max || required > type(uint128).max) revert AmountOverflow();
         uint256 appFee = app && buy ? amount * APP_FEE_BPS / BPS : 0;
         // A buy keeps the execution fee from its USDC input, so the input must exceed both fees.
         uint256 kept = buy ? executionFee : 0;
-        if (buy && amount <= appFee + executionFee) revert InvalidOrder();
+        if (buy && amount <= appFee + executionFee) revert InputTooSmallForFees();
         // A taxed input must not spend pre-existing donated funds to fill the gap.
-        if (IERC20(input).balanceOf(address(this)) != inputBaseline + amount) revert InvalidOrder();
+        if (IERC20(input).balanceOf(address(this)) != inputBaseline + amount) revert InputNotConsumed();
         IERC20(input).forceApprove(address(permit2), amount - kept);
         permit2.approve(input, address(router), uint160(amount - kept), uint48(block.timestamp));
         (bytes memory commands, bytes[] memory inputs) =
@@ -226,10 +246,10 @@ contract MercuriOrderFiller is IReactorCallback {
         uint256 outputBefore = IERC20(output).balanceOf(address(this));
         router.execute(commands, inputs, order.info.deadline);
         // Fixed input orders reject liquidity exhaustion instead of refunding a partial fill.
-        if (IERC20(input).balanceOf(address(this)) != inputBaseline + kept) revert InvalidOrder();
+        if (IERC20(input).balanceOf(address(this)) != inputBaseline + kept) revert InputNotConsumed();
         // The router enforced a swap of at least `required`; a taxed output token can still deliver less here.
         uint256 received = IERC20(output).balanceOf(address(this)) - outputBefore;
-        if (received < required) revert InvalidOrder();
+        if (received < required) revert InsufficientOutput();
         outputSurplus = received - required;
         IERC20(output).forceApprove(address(reactor), minimum);
     }
@@ -242,9 +262,10 @@ contract MercuriOrderFiller is IReactorCallback {
     /// @return owed Total the reactor will take from this contract.
     function _owed(ResolvedOrder memory order, address output) private pure returns (uint256 owed) {
         uint256 n = order.outputs.length;
-        if (n == 0) revert InvalidOrder();
+        if (n == 0) revert InvalidOutputs();
         for (uint256 i; i < n; ++i) {
-            if (order.outputs[i].token != output || order.outputs[i].recipient == address(0)) revert InvalidOrder();
+            if (order.outputs[i].token != output) revert FeeOutputUnsupported();
+            if (order.outputs[i].recipient == address(0)) revert InvalidOutputs();
             owed += order.outputs[i].amount;
         }
     }

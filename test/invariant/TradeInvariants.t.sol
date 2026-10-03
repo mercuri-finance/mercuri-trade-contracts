@@ -47,8 +47,13 @@ contract TradeSequenceHandler {
         suite.feeFill(seed);
     }
 
-    function expiring(uint256 offset) external {
-        suite.exerciseExpiring(offset);
+    /// Settles one late-cosigned order inside its window and refuses one past it. The reachability checks in
+    /// `afterInvariant` run per run, so a per-call coin flip between the two sides left about one run in 850 with no
+    /// expired-order refusal (TRD-06); pairing them makes both depend only on this selector being called.
+    function expiring(uint256 seed) external {
+        uint256 even = seed >> 1 << 1;
+        suite.exerciseExpiring(even); // even: inside the window, an outside filler refused, ours fills
+        suite.exerciseExpiring(even | 1); // odd: past the window, ours refused
     }
 }
 

@@ -97,7 +97,9 @@ Pinned sources it builds against:
 
 ## Parameters
 
-Fixed in the filler's bytecode at deployment; a change means a new filler.
+Fixed in the filler's bytecode at deployment; a change means a new filler (see
+[`docs/runbooks/filler-replacement.md`](docs/runbooks/filler-replacement.md)). That includes a new Launch hook: pools of
+any hook other than the filler's `launchHook` are charged the app fee and lose Launch's referral credit.
 
 | Parameter | Value |
 | --- | --- |
@@ -168,9 +170,11 @@ arguments match the manifest; it never overwrites a record.
 | | |
 | --- | --- |
 | [`docs/reports/2026-10-02-order-filler-release.md`](docs/reports/2026-10-02-order-filler-release.md) | Release evidence for the filler candidate: source revision, tests, gas, reviewer questions and open items. |
-| Mutability | The filler is immutable: no owner, pause, upgrade or rescue path. Replacing it, including rotating the keeper key, means deploying a new filler and switching the keeper by configuration. |
+| Mutability | The filler is immutable: no owner, pause, upgrade or rescue path. Replacing it, including rotating the keeper key, means deploying a new filler and switching the keeper by configuration: [`docs/runbooks/filler-replacement.md`](docs/runbooks/filler-replacement.md). |
+| Governance | The reactor's only owner is Launch's timelock, with power over a 0 to 5 bps output fee controller; the keeper and cosigner are off-chain keys. What each can do: [`SECURITY.md`](SECURITY.md). |
 
-The filler has not been independently reviewed yet, and no third-party audit has been performed. To report a
+The filler was independently reviewed on 3 October 2026 and every finding was fixed or decided (release report,
+section 18). That was not an audit by a security firm; no third-party audit has been performed yet. To report a
 vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## License

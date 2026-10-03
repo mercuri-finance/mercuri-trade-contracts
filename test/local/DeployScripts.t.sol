@@ -52,6 +52,10 @@ contract FillerHarness is DeployOrderFiller {
     function feeController(string memory manifest) external view returns (address) {
         return _reactorFeeController(manifest);
     }
+
+    function requireTimelockOwner(address owner, string memory launchRecord, bool rehearsal) external view {
+        _requireTimelockOwner(owner, launchRecord, rehearsal);
+    }
 }
 
 /// @dev Exposes the reactor script's post-deployment check.
@@ -73,9 +77,13 @@ contract DeployScriptsTest is Test {
         vm.chainId(5042002);
     }
 
+    /// The reactor fee owner is decided (Launch's testnet timelock, read from Launch's record); the keeper address is
+    /// still the owner's choice at D3.
     function test_manifestShipsSentinel() public view {
         string memory manifest = vm.readFile("deployments/manifest-5042002.json");
-        assertEq(vm.parseJsonString(manifest, ".reactorFeeOwner"), "REQUIRED_AT_D2_OWNER_GO");
+        string memory launchRecord = vm.readFile("lib/mercuri-launch-contracts/deployments/5042002.json");
+        assertEq(vm.parseJsonAddress(manifest, ".reactorFeeOwner"), vm.parseJsonAddress(launchRecord, ".timelock"));
+        assertEq(vm.parseJsonAddress(manifest, ".reactorFeeOwner"), 0x41129B5215cA24b29a4cABcaE26d3569744DEe2E);
         assertEq(vm.parseJsonString(manifest, ".feeRecipient"), "REQUIRED_AT_D3_OWNER_GO");
         assertEq(vm.parseJsonUint(manifest, ".executionFee"), 30_000);
     }
@@ -106,18 +114,43 @@ contract DeployScriptsTest is Test {
 
     // The scripts read TRADE_LOCAL_REHEARSAL; no test in this contract sets it, so an unset variable means false.
     // A lingering real-shell value is overridden below only for the tests that need a fixed value.
-    function test_reactorScriptRefusesShippedManifest() public {
+    /// With the decided owner the reactor script deploys a reactor owned by Launch's timelock with no fee controller.
+    function test_reactorScriptDeploysWithTimelockOwner() public {
         vm.setEnv("TRADE_LOCAL_REHEARSAL", "false");
+        vm.etch(PERMIT2, hex"00"); // the script requires code at permit2
         DeployTestnetReactor script = new DeployTestnetReactor();
-        vm.expectRevert(TradeManifest.ReactorFeeOwnerNotChosen.selector);
-        script.run();
+        V3DutchOrderReactor reactor = script.run();
+        assertEq(reactor.owner(), 0x41129B5215cA24b29a4cABcaE26d3569744DEe2E);
+        assertEq(address(reactor.feeController()), address(0));
+        assertEq(address(reactor.permit2()), PERMIT2);
     }
 
+    /// The filler script still refuses the shipped manifest: the keeper address is a sentinel.
     function test_fillerScriptRefusesShippedManifest() public {
         vm.setEnv("TRADE_LOCAL_REHEARSAL", "false");
         DeployOrderFiller script = new DeployOrderFiller();
-        vm.expectRevert(TradeManifest.ReactorFeeOwnerNotChosen.selector);
+        vm.expectRevert(TradeManifest.FeeRecipientNotChosen.selector);
         script.run();
+    }
+
+    /// TRD-01: any reactor fee owner other than the record's timelock is refused; a rehearsal owner is not checked.
+    function test_reactorFeeOwnerMustBeLaunchTimelock() public {
+        FillerHarness h = new FillerHarness();
+        string memory launchRecord = vm.readFile("lib/mercuri-launch-contracts/deployments/5042002.json");
+        address timelock = 0x41129B5215cA24b29a4cABcaE26d3569744DEe2E;
+        h.requireTimelockOwner(timelock, launchRecord, false);
+        // Launch's testnet treasury (also its guardian and deployer) is not the timelock.
+        address treasury = vm.parseJsonAddress(launchRecord, ".treasury");
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorFeeOwnerNotTimelock.selector, treasury, timelock));
+        h.requireTimelockOwner(treasury, launchRecord, false);
+        // The mainnet timelock is not the testnet one.
+        address mainnetTimelock =
+            vm.parseJsonAddress(vm.readFile("lib/mercuri-launch-contracts/deployments/5042.json"), ".timelock");
+        vm.expectRevert(
+            abi.encodeWithSelector(TradeManifest.ReactorFeeOwnerNotTimelock.selector, mainnetTimelock, timelock)
+        );
+        h.requireTimelockOwner(mainnetTimelock, launchRecord, false);
+        h.requireTimelockOwner(ANVIL_1, launchRecord, true);
     }
 
     /// The script's copy of the bound must never drift from the filler's, or a manifest could pass here and fail

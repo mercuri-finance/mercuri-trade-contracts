@@ -4,11 +4,14 @@ pragma solidity ^0.8.26;
 import {Script, console2} from "forge-std/Script.sol";
 
 /// @notice Shared manifest reader for the Trade testnet deployment scripts. Holds no key and never broadcasts.
-/// @dev Owner choices (`reactorFeeOwner`, `feeRecipient`) ship as sentinel strings and are refused until replaced
-///      with an address; the loopback rehearsal override is honoured only on anvil (see `_resolveChoice`).
+/// @dev Owner choices ship as sentinel strings and are refused until replaced with an address; the loopback rehearsal
+///      override is honoured only on anvil (see `_resolveChoice`). `reactorFeeOwner` is decided: Launch's
+///      TimelockController on the same network, required to equal `timelock` in Launch's deployment record.
 abstract contract TradeManifest is Script {
     uint256 internal constant TESTNET_CHAIN_ID = 5042002;
     string internal constant MANIFEST_PATH = "deployments/manifest-5042002.json";
+    /// @dev Launch's tracked deployment records, `<chainId>.json`, from the pinned Launch submodule.
+    string internal constant LAUNCH_RECORDS = "lib/mercuri-launch-contracts/deployments/";
     /// @dev Mirrors MercuriOrderFiller.MAX_EXECUTION_FEE so a bad manifest fails before any broadcast.
     uint256 internal constant MAX_EXECUTION_FEE = 100_000;
 
@@ -21,6 +24,7 @@ abstract contract TradeManifest is Script {
     error RehearsalOwnerNotAnvilAccount(address owner);
     error ReactorFeeControllerNotAddress();
     error ReactorMismatch(string what);
+    error ReactorFeeOwnerNotTimelock(address owner, address timelock);
 
     /// @dev Refuses any chain other than Arc testnet. A local fork must keep chain id 5042002.
     function _requireTestnet() internal view {
@@ -33,6 +37,26 @@ abstract contract TradeManifest is Script {
 
     function _address(string memory manifest, string memory key) internal pure returns (address) {
         return vm.parseJsonAddress(manifest, key);
+    }
+
+    /// @dev Launch's deployment record for the current chain.
+    function _launchRecord() internal view returns (string memory) {
+        return vm.readFile(string.concat(LAUNCH_RECORDS, vm.toString(block.chainid), ".json"));
+    }
+
+    function _rehearsal() internal view returns (bool) {
+        return vm.envOr("TRADE_LOCAL_REHEARSAL", false);
+    }
+
+    /// @dev The reactor fee owner must be Launch's timelock from the record, read rather than restated, so the reactor
+    ///      shares Launch's governance delay. A loopback rehearsal owner is an anvil account and is not checked.
+    function _requireTimelockOwner(address owner, string memory launchRecord, bool rehearsal) internal view {
+        if (rehearsal) {
+            console2.log("WARNING: LOCAL REHEARSAL on anvil. reactorFeeOwner is not Launch's timelock");
+            return;
+        }
+        address timelock = vm.parseJsonAddress(launchRecord, ".timelock");
+        if (owner != timelock) revert ReactorFeeOwnerNotTimelock(owner, timelock);
     }
 
     function _requireCode(string memory name, address account) internal view {

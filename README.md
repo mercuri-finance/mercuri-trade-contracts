@@ -48,9 +48,10 @@ None yet. Trade adds no deployed contract of its own today. The first will be th
 the pinned UniswapX reactor, on Arc testnet first. That needs its own review, deployment record and release evidence
 in this repository before orders open on either network.
 
-The testnet inputs are in [`deployments/manifest-5042002.json`](deployments/manifest-5042002.json). The two owner
-choices, the reactor fee owner and the execution fee recipient, ship as sentinels and the deployment scripts refuse
-to run until they are set.
+The testnet inputs are in [`deployments/manifest-5042002.json`](deployments/manifest-5042002.json). The reactor fee
+owner is Launch's TimelockController on the same network, and the deployment scripts require it to equal `timelock` in
+Launch's deployment record. The execution fee recipient (the keeper) ships as a sentinel, and the filler script
+refuses to run until it is set.
 
 | Dependency | Address (testnet, chain 5042002) | Mutability |
 | --- | --- | --- |

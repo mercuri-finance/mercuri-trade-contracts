@@ -16,6 +16,7 @@ contract DeployTestnetReactor is TradeManifest {
         string memory manifest = _manifest();
         address permit2 = _address(manifest, ".permit2");
         address feeOwner = _reactorFeeOwner(manifest);
+        _requireTimelockOwner(feeOwner, _launchRecord(), _rehearsal());
         address feeController = _reactorFeeController(manifest);
         _requireCode("permit2", permit2);
 

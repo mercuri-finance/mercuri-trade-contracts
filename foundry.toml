@@ -18,7 +18,7 @@ compilation_restrictions = [
     { paths = "lib/mercuri-launch-contracts/lib/v4-periphery/src/PositionManager.sol", optimizer_runs = 500 },
     { paths = "src/**", optimizer_runs = 200 },
 ]
-fs_permissions = [{ access = "read", path = "./out" }, { access = "read", path = "./deployments" }, { access = "read-write", path = "./test-export" }]
+fs_permissions = [{ access = "read", path = "./out" }, { access = "read", path = "./deployments" }, { access = "read", path = "./lib/mercuri-launch-contracts/deployments" }, { access = "read-write", path = "./test-export" }]
 # TOOLCHAIN QUIRK: forge 1.4.3 narrows vm.getCode/deployCode's "available artifacts" to only what the
 # currently-selected test's own import graph reaches (foundry-rs/foundry#12231, fixed upstream in #12927 but not
 # in this pinned version). V4Fixture's PositionManager is deployed via deployCode from a file imported only by

@@ -11,10 +11,10 @@ import {IOrderSwapRouter} from "../src/interfaces/IOrderSwapRouter.sol";
 
 /// @notice Deploys the immutable MercuriOrderFiller against the reactor named in TRADE_REACTOR. Contains no key: pass
 ///         `--account` or `--ledger`.
-/// @dev The reactor fee owner must still parse as an address because the reactor deployment is part of the same
-///      release, and the execution fee recipient (the keeper's transaction address) must be chosen in the manifest.
-///      That address is also the only one allowed to call `fill` (spec D20), so it must be the keeper that will
-///      submit fills. TRADE_REACTOR_CODEHASH is required as well.
+/// @dev The reactor fee owner must be Launch's timelock from Launch's deployment record, because the reactor deployment
+///      is part of the same release, and the execution fee recipient (the keeper's transaction address) must be chosen
+///      in the manifest. That address is also the only one allowed to call `fill` (spec D20), so it must be the keeper
+///      that will submit fills. TRADE_REACTOR_CODEHASH is required as well.
 contract DeployOrderFiller is TradeManifest {
     /// @dev TRADE_REACTOR is operator input, so it is proven to be the reactor from the reactor step: same permit2,
     ///      same fee owner, the expected protocol fee controller (zero unless the manifest names one) and runtime code
@@ -38,8 +38,10 @@ contract DeployOrderFiller is TradeManifest {
     function run() external returns (MercuriOrderFiller filler) {
         _requireTestnet();
         string memory manifest = _manifest();
-        // Refuse to run while the owner choice is still the sentinel, even though the filler does not use it.
+        // Owner choices first: refuse a sentinel before reading anything else. The fee owner is checked on the reactor.
         address feeOwner = _reactorFeeOwner(manifest);
+        _requireTimelockOwner(feeOwner, _launchRecord(), _rehearsal());
+        address feeRecipient = _feeRecipient(manifest);
         address reactor = vm.envAddress("TRADE_REACTOR");
         address router = _address(manifest, ".router");
         address permit2 = _address(manifest, ".permit2");
@@ -47,7 +49,6 @@ contract DeployOrderFiller is TradeManifest {
         address launchHook = _address(manifest, ".launchHook");
         address appRecipient = _address(manifest, ".appRecipient");
         uint256 executionFee = _executionFee(manifest);
-        address feeRecipient = _feeRecipient(manifest);
         address feeController = _reactorFeeController(manifest);
         _requireReactor(reactor, permit2, feeOwner, feeController, vm.envBytes32("TRADE_REACTOR_CODEHASH"));
         _requireCode("router", router);

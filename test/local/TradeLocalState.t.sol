@@ -14,14 +14,34 @@ import {
 import {IReactor} from "../../lib/uniswapx/src/interfaces/IReactor.sol";
 import {ERC20 as XERC20} from "../../lib/uniswapx/lib/solmate/src/tokens/ERC20.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol";
+import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @dev Offline state export for the Go/Anvil late-cosigning test. Never broadcast. Four trader-signed, uncosigned
 ///      limit orders (buy and sell on a Launch pool and on a listed, hookless pool) carry the single-point expiry curve
 ///      and name the filler's validator with the signed condition (spec D22: version 1, limit, the order's pool, no
 ///      trigger), exactly as the web app submits them. The backend keeper cosigns them at fill time with Anvil's second
 ///      development key. The export holds the reactor, the filler and the validator the filler deployed.
+///      For the pool stop capacity (spec §10 amendments, D30) it also names the Launch system the capacity reader
+///      reads: the LiquidityLocker holding the Launch market's graduation position, the GraduationManager proxy
+///      and its implementation, the PositionManager and the FeeManager. A decoy pool for the same Launch token
+///      (the Launch hook, another tick spacing, initialised as the GraduationManager, with liquidity of its own)
+///      is the pool an order could be pinned to while the locked position is another pool's: the reader must
+///      refuse it (key mismatch). Its pool id sorts below the real pool's.
 contract TradeLocalStateTest is UniswapXFillerHarness {
     using V3DutchOrderLib for V3DutchOrder;
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
+
+    /// bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)
+    bytes32 internal constant IMPLEMENTATION_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
 
     /// Anvil development account 1; the Go test signs with its public dev key.
     address internal constant LOCAL_COSIGNER = 0x70997970C51812dc3A010C7d01b50e0d17dc79C8;
@@ -41,6 +61,18 @@ contract TradeLocalStateTest is UniswapXFillerHarness {
         Market memory listed = _market(false, false);
         _serializeMarket("launch", launch);
         _serializeMarket("listed", listed);
+        // A fresh Launch pool locks about 18,000 USDC, so its stop capacity (κ · f · Y_lock) is about 36 USDC and
+        // one wallet's quarter of it about 9 USDC, below the 10 USDC order minimum. The Launch market is traded
+        // first (8,000 USDC bought through the router, the tokens passed on), which raises the locked position's
+        // USDC side to about 26,000 USDC: a wallet's share then admits one minimum-size stop-loss.
+        uint256 held = launch.token.balanceOf(trader);
+        _execute(launch, true, 8_000e6, 0, abi.encode(uint256(uint160(trader))));
+        uint256 bought = launch.token.balanceOf(trader) - held;
+        vm.prank(trader);
+        launch.token.transfer(bob, bought); // the trader keeps the tokens it held, so the Go test's sizes stand
+        PoolKey memory decoy = _decoyPool(launch);
+        vm.serializeUint(KEY, "decoyFee", decoy.fee);
+        vm.serializeInt(KEY, "decoyTickSpacing", decoy.tickSpacing);
         _exportOrder("launchBuy", launch, true, 1);
         _exportOrder("launchSell", launch, false, 2);
         _exportOrder("listedBuy", listed, true, 3);
@@ -69,6 +101,13 @@ contract TradeLocalStateTest is UniswapXFillerHarness {
         vm.serializeAddress(KEY, "quoter", address(quoter));
         vm.serializeAddress(KEY, "poolManager", address(poolManager));
         vm.serializeAddress(KEY, "launchHook", address(hook));
+        vm.serializeAddress(KEY, "liquidityLocker", address(locker));
+        vm.serializeAddress(KEY, "graduationManager", address(gm));
+        vm.serializeAddress(
+            KEY, "graduationManagerImpl", address(uint160(uint256(vm.load(address(gm), IMPLEMENTATION_SLOT))))
+        );
+        vm.serializeAddress(KEY, "positionManager", address(posm));
+        vm.serializeAddress(KEY, "feeManager", address(feeManager));
         vm.serializeAddress(KEY, "cosigner", LOCAL_COSIGNER);
         vm.serializeAddress(KEY, "trader", trader);
         vm.serializeAddress(KEY, "feeRecipient", feeRecipient);
@@ -77,6 +116,45 @@ contract TradeLocalStateTest is UniswapXFillerHarness {
         vm.createDir("test-export/trade-orders", true);
         vm.writeJson(output, "test-export/trade-orders/anvil-order.json");
         vm.dumpState("test-export/trade-orders/anvil-state.json");
+    }
+
+    /// A second pool for the Launch market's token under the Launch hook, at the market's price: only the
+    /// GraduationManager may initialise a Launch-hook pool, so it is initialised as the GraduationManager (as an
+    /// upgraded one could), and holds about 1,000 USDC of full-range liquidity that no locker holds. The tick
+    /// spacing is the first whose pool id sorts below the real pool's, so an order for the token is pinned to it
+    /// once the index lists it.
+    function _decoyPool(Market memory m) internal returns (PoolKey memory k) {
+        bytes32 real = PoolId.unwrap(m.key.toId());
+        // A copy, not an alias of m.key.
+        k = PoolKey(m.key.currency0, m.key.currency1, m.key.fee, m.key.tickSpacing, m.key.hooks);
+        for (int24 ts = 1; ts < 200; ++ts) {
+            k.tickSpacing = ts;
+            if (ts != m.key.tickSpacing && PoolId.unwrap(k.toId()) < real) break;
+        }
+        require(PoolId.unwrap(k.toId()) < real, "no decoy spacing");
+        (uint160 sqrtP,,,) = poolManager.getSlot0(m.key.toId());
+        vm.prank(address(gm));
+        poolManager.initialize(k, sqrtP);
+        uint256 q96 = 1 << 96;
+        uint256 usdcAmount = 1_000e6;
+        uint128 liquidity =
+            uint128(m.usdcIs0 ? FullMath.mulDiv(usdcAmount, sqrtP, q96) : FullMath.mulDiv(usdcAmount, q96, sqrtP));
+        PoolModifyLiquidityTest lp = new PoolModifyLiquidityTest(poolManager);
+        uint256 held = m.token.balanceOf(bob); // read before the prank, which the next external call consumes
+        vm.prank(bob);
+        m.token.transfer(address(this), held);
+        m.token.approve(address(lp), type(uint256).max);
+        IERC20(USDC).approve(address(lp), type(uint256).max);
+        lp.modifyLiquidity(
+            k,
+            ModifyLiquidityParams(
+                TickMath.minUsableTick(k.tickSpacing),
+                TickMath.maxUsableTick(k.tickSpacing),
+                int256(uint256(liquidity)),
+                0
+            ),
+            ""
+        );
     }
 
     function _serializeMarket(string memory name, Market memory m) internal {

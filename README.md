@@ -159,6 +159,10 @@ reproduced router; `--preflight` runs that check alone, offline, and the gate ru
 the verifier's self-tests. The mainnet manifest, [`deployments/manifest-5042.json`](deployments/manifest-5042.json), is
 for review only: its owner choices are sentinels and the deployment scripts refuse chain 5042.
 
+[`script/write-trade-record.py`](script/write-trade-record.py) writes `deployments/<chainId>.json` in the shape of
+Launch's deployment records, and only from completed forge broadcasts whose receipts, chain, commit and constructor
+arguments match the manifest; it never overwrites a record.
+
 ## Security
 
 | | |

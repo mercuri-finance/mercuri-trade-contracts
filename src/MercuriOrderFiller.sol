@@ -12,11 +12,7 @@ import {IReactor} from "../lib/uniswapx/src/interfaces/IReactor.sol";
 import {IReactorCallback} from "../lib/uniswapx/src/interfaces/IReactorCallback.sol";
 import {SignedOrder, ResolvedOrder} from "../lib/uniswapx/src/base/ReactorStructs.sol";
 import {V3DutchOrder, V3DutchOrderLib} from "../lib/uniswapx/src/lib/V3DutchOrderLib.sol";
-
-/// @dev The one Universal Router entry point this filler calls: a command list, its inputs and a deadline.
-interface IOrderSwapRouter {
-    function execute(bytes calldata commands, bytes[] calldata inputs, uint256 deadline) external payable;
-}
+import {IOrderSwapRouter} from "./interfaces/IOrderSwapRouter.sol";
 
 /// @notice Settles one signed UniswapX order through one Arc v4 USDC pool. The signed trader receives every output
 ///         above what the reactor takes (its protocol fee) and, on a sell, above the execution fee: a fixed USDC fee
@@ -36,6 +32,8 @@ contract MercuriOrderFiller is IReactorCallback {
     using V3DutchOrderLib for V3DutchOrder;
 
     /// @notice App fee in basis points of the USDC side, fixed at 50 bps.
+    /// @dev Charged on listed (non-Launch) pools only. A buy pays it on the gross signed input, which includes the
+    ///      execution fee; a sell pays it on the swap's USDC output.
     uint256 public constant APP_FEE_BPS = 50;
     /// @notice Upper bound on `executionFee`: 0.10 USDC (6 decimals).
     uint256 public constant MAX_EXECUTION_FEE = 100_000;

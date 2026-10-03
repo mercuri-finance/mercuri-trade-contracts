@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CONTRACTS = ("MercuriOrderFiller",)
+CONTRACTS = {"MercuriOrderFiller": "src/MercuriOrderFiller.sol", "IOrderSwapRouter": "src/interfaces/IOrderSwapRouter.sol"}
 INHERITED = {
     "UPGRADE_INTERFACE_VERSION", "acceptOwnership", "owner", "pendingOwner",
     "proxiableUUID", "transferOwnership", "upgradeToAndCall", "paused",
@@ -29,8 +29,8 @@ def abi_type(item):
 
 failures = []
 checked = 0
-for contract in CONTRACTS:
-    source = (ROOT / "src" / (contract + ".sol")).read_text()
+for contract, path in CONTRACTS.items():
+    source = (ROOT / path).read_text()
     declarations = set(re.findall(r"\bfunction\s+(\w+)\s*\(", source))
     artifact = json.loads((ROOT / "out" / (contract + ".sol") / (contract + ".json")).read_text())
     metadata = artifact["metadata"]

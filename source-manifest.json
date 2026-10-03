@@ -1,6 +1,7 @@
 {
   "algorithm": "sha256",
   "sources": {
-    "src/MercuriOrderFiller.sol": "ec09e0cf181df44f191cb3cb3f6d2c61d045c33a29bafa1c372c953d876a9448"
+    "src/MercuriOrderFiller.sol": "0550d570d79be40bdc38019e6b51a752e980a007aebb09ecdcdae210051efa75",
+    "src/interfaces/IOrderSwapRouter.sol": "a8cffdb5307ab46c5fe166d5a291971835cc73af2cb6813458bb2aad5a96019b"
   }
 }

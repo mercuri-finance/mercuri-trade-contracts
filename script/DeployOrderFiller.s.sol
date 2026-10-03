@@ -6,7 +6,8 @@ import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol"
 import {IReactor} from "../lib/uniswapx/src/interfaces/IReactor.sol";
 import {V3DutchOrderReactor} from "../lib/uniswapx/src/reactors/V3DutchOrderReactor.sol";
 import {TradeManifest} from "./TradeManifest.sol";
-import {MercuriOrderFiller, IOrderSwapRouter} from "../src/MercuriOrderFiller.sol";
+import {MercuriOrderFiller} from "../src/MercuriOrderFiller.sol";
+import {IOrderSwapRouter} from "../src/interfaces/IOrderSwapRouter.sol";
 
 /// @notice Deploys the immutable MercuriOrderFiller against the reactor named in TRADE_REACTOR. Contains no key: pass
 ///         `--account` or `--ledger`.

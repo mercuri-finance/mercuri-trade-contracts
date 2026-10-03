@@ -2,7 +2,8 @@
 pragma solidity ^0.8.26;
 
 import {UniversalRouterHarness} from "./UniversalRouterSwap.t.sol";
-import {MercuriOrderFiller, IOrderSwapRouter} from "../../src/MercuriOrderFiller.sol";
+import {MercuriOrderFiller} from "../../src/MercuriOrderFiller.sol";
+import {IOrderSwapRouter} from "../../src/interfaces/IOrderSwapRouter.sol";
 import {V3DutchOrderReactor} from "../../lib/uniswapx/src/reactors/V3DutchOrderReactor.sol";
 import {IPermit2 as XPermit2} from "../../lib/uniswapx/lib/permit2/src/interfaces/IPermit2.sol";
 import {

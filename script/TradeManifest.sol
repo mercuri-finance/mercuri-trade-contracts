@@ -19,6 +19,8 @@ abstract contract TradeManifest is Script {
     error ExecutionFeeTooHigh(uint256 fee);
     error RehearsalNeedsAnvil();
     error RehearsalOwnerNotAnvilAccount(address owner);
+    error ReactorFeeControllerNotAddress();
+    error ReactorMismatch(string what);
 
     /// @dev Refuses any chain other than Arc testnet. A local fork must keep chain id 5042002.
     function _requireTestnet() internal view {
@@ -77,6 +79,15 @@ abstract contract TradeManifest is Script {
     ) internal view returns (address recipient) {
         recipient = _resolveChoice(manifest, ".feeRecipient", rehearsal, override_, clientVersion);
         if (recipient == address(0)) revert FeeRecipientNotChosen();
+    }
+
+    /// @dev The reactor's protocol fee controller the deployment expects: the manifest's `reactorFeeController`, zero
+    ///      when the key is absent. Zero means the reactor takes no protocol fee; anything else is a reviewed choice.
+    function _reactorFeeController(string memory manifest) internal view returns (address) {
+        if (!vm.keyExistsJson(manifest, ".reactorFeeController")) return address(0);
+        string memory text = vm.parseJsonString(manifest, ".reactorFeeController");
+        if (!_isAddressString(text)) revert ReactorFeeControllerNotAddress();
+        return vm.parseAddress(text);
     }
 
     /// @dev The execution fee (USDC, 6 decimals) is fixed for the filler's life; refuse a value the filler would.

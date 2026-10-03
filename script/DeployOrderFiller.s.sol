@@ -16,16 +16,23 @@ import {IOrderSwapRouter} from "../src/interfaces/IOrderSwapRouter.sol";
 ///      That address is also the only one allowed to call `fill` (spec D20), so it must be the keeper that will
 ///      submit fills. TRADE_REACTOR_CODEHASH is required as well.
 contract DeployOrderFiller is TradeManifest {
-    error ReactorMismatch(string what);
-
     /// @dev TRADE_REACTOR is operator input, so it is proven to be the reactor from the reactor step: same permit2,
-    ///      same fee owner, and runtime code hash equal to TRADE_REACTOR_CODEHASH (the runtime keccak that
-    ///      `verify-trade-filler.py` prints for the reactor, copied by the operator).
-    function _requireReactor(address reactor, address permit2, address feeOwner, bytes32 codeHash) internal view {
+    ///      same fee owner, the expected protocol fee controller (zero unless the manifest names one) and runtime code
+    ///      hash equal to TRADE_REACTOR_CODEHASH (the runtime keccak that `verify-trade-filler.py` prints for the
+    ///      reactor, copied by the operator).
+    function _requireReactor(
+        address reactor,
+        address permit2,
+        address feeOwner,
+        address feeController,
+        bytes32 codeHash
+    ) internal view {
         if (reactor.code.length == 0) revert NoCode("reactor", reactor);
         if (reactor.codehash != codeHash) revert ReactorMismatch("codehash");
-        if (address(V3DutchOrderReactor(payable(reactor)).permit2()) != permit2) revert ReactorMismatch("permit2");
-        if (V3DutchOrderReactor(payable(reactor)).owner() != feeOwner) revert ReactorMismatch("owner");
+        V3DutchOrderReactor deployed = V3DutchOrderReactor(payable(reactor));
+        if (address(deployed.permit2()) != permit2) revert ReactorMismatch("permit2");
+        if (deployed.owner() != feeOwner) revert ReactorMismatch("owner");
+        if (address(deployed.feeController()) != feeController) revert ReactorMismatch("feeController");
     }
 
     function run() external returns (MercuriOrderFiller filler) {
@@ -41,7 +48,8 @@ contract DeployOrderFiller is TradeManifest {
         address appRecipient = _address(manifest, ".appRecipient");
         uint256 executionFee = _executionFee(manifest);
         address feeRecipient = _feeRecipient(manifest);
-        _requireReactor(reactor, permit2, feeOwner, vm.envBytes32("TRADE_REACTOR_CODEHASH"));
+        address feeController = _reactorFeeController(manifest);
+        _requireReactor(reactor, permit2, feeOwner, feeController, vm.envBytes32("TRADE_REACTOR_CODEHASH"));
         _requireCode("router", router);
         _requireCode("permit2", permit2);
         _requireCode("usdc", usdc);
@@ -61,6 +69,7 @@ contract DeployOrderFiller is TradeManifest {
         vm.stopBroadcast();
 
         console2.log("reactorFeeOwner", feeOwner);
+        console2.log("reactorFeeController", feeController);
         console2.log("reactor", reactor);
         console2.log("router", router);
         console2.log("permit2", permit2);

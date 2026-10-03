@@ -6,7 +6,8 @@ deployment immutables substituted, then compares byte for byte with eth_getCode.
 differing offsets and exits non-zero on any mismatch. No keys, no signing, no writes.
 
   python3 script/verify-trade-filler.py --rpc URL --block N --deployment FILE   # FILE has reactor, filler,
-                                                                                # reactorFeeOwner, feeRecipient
+                                                                                # reactorFeeOwner, feeRecipient,
+                                                                                # reactorFeeController
   python3 script/verify-trade-filler.py --self-test                             # offline, no network
   python3 script/verify-trade-filler.py --self-test-reactor-flipped             # offline; must report MISMATCH
 """
@@ -219,6 +220,62 @@ def required_fee_recipient(manifest, deployment):
     return recipient
 
 
+ZERO_ADDRESS = '0x' + '0' * 40
+FEE_CONTROLLER_SELECTOR = '0x6999b377'  # feeController()
+OWNER_SELECTOR = '0x8da5cb5b'  # owner()
+
+
+def is_address(text):
+    return (isinstance(text, str) and len(text) == 42 and text[:2] == '0x'
+            and all(c in '0123456789abcdefABCDEF' for c in text[2:]))
+
+
+def expected_fee_controller(manifest, deployment):
+    """The reactor's protocol fee controller: the manifest value (zero when absent), recorded identically."""
+    controller = manifest.get('reactorFeeController', ZERO_ADDRESS)
+    if not is_address(controller):
+        raise SystemExit(f'manifest reactorFeeController is not an address: {controller!r}')
+    recorded = deployment.get('reactorFeeController')
+    if not is_address(recorded) or recorded.lower() != controller.lower():
+        raise SystemExit(f'deployment reactorFeeController {recorded!r} != manifest {controller}')
+    return controller
+
+
+def check_fee_controller(word, manifest, deployment):
+    """Compares the reactor's `feeController()` return word with the record; prints and returns the verdict."""
+    expected = expected_fee_controller(manifest, deployment)
+    raw = word.removeprefix('0x')
+    if len(raw) != 64 or int(raw[:24] or '0', 16) != 0:
+        print(f'reactor feeController() returned a malformed word {word!r}')
+        return False
+    onchain = '0x' + raw[-40:]
+    if onchain.lower() != expected.lower():
+        print(f'reactor feeController {onchain} != recorded reactorFeeController {expected}')
+        return False
+    print(f'reactor feeController {onchain} matches the record')
+    return True
+
+
+def fee_controller_self_test():
+    """The feeController comparison must accept the recorded value and refuse any other, or a missing record."""
+    zero_word = '0x' + '0' * 64
+    other_word = '0x' + '0' * 62 + 'ee'
+    manifest = {'reactorFeeController': ZERO_ADDRESS}
+    ok = check_fee_controller(zero_word, manifest, {'reactorFeeController': ZERO_ADDRESS})
+    ok &= not check_fee_controller(other_word, manifest, {'reactorFeeController': ZERO_ADDRESS})
+    ok &= check_fee_controller(other_word, {'reactorFeeController': '0x' + '0' * 38 + 'ee'},
+                               {'reactorFeeController': '0x' + '0' * 38 + 'ee'})
+    ok &= check_fee_controller(zero_word, {}, {'reactorFeeController': ZERO_ADDRESS})  # absent manifest key: zero
+    for deployment in ({}, {'reactorFeeController': '0x' + '0' * 38 + 'ee'}):
+        try:
+            check_fee_controller(zero_word, manifest, deployment)
+            print(f'deployment {deployment}: NOT refused')
+            ok = False
+        except SystemExit as error:
+            print(f'deployment {deployment}: refused ({error})')
+    return ok
+
+
 # Offline self-tests stand in for the owner's D3 choice with this placeholder recipient.
 SELF_TEST_RECIPIENT = '0x00000000000000000000000000000000000000bb'
 
@@ -332,7 +389,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--rpc', default=DEFAULT_RPC)
     parser.add_argument('--block', type=int)
-    parser.add_argument('--deployment', help='JSON with reactor, filler, reactorFeeOwner and feeRecipient')
+    parser.add_argument('--deployment', help='JSON with reactor, filler, reactorFeeOwner, reactorFeeController and feeRecipient')
     parser.add_argument('--manifest', default='deployments/manifest-5042002.json')
     parser.add_argument('--self-test', action='store_true', help='offline: unmodified bytes must match, a flipped immutable byte must not')
     parser.add_argument('--self-test-flipped', action='store_true', help='offline: verify with one immutable byte flipped; exits non-zero')
@@ -354,6 +411,9 @@ def main():
         bad = self_test(True) or self_test(True, 'executionFee') or self_test(True, 'feeRecipient')
         if not recipient_input_self_test():
             print('self-test FAILED: a non-hex feeRecipient was not refused cleanly')
+            sys.exit(1)
+        if not fee_controller_self_test():
+            print('self-test FAILED: the reactor feeController check did not behave as required')
             sys.exit(1)
         sets = immutable_set_self_test()
         reactor_good = reactor_self_test(False)
@@ -383,13 +443,15 @@ def main():
     ok = verify_reactor(args, manifest, owner, tag, code(deployment['reactor']))
     filler = load('out/MercuriOrderFiller.sol/MercuriOrderFiller.json')
     ok &= verify('filler', 'filler', filler, manifest_values(manifest, deployment['reactor'], fee_recipient), code(deployment['filler']))
-    onchain = rpc_call(args.rpc, 'eth_call', [{'to': deployment['reactor'], 'data': '0x8da5cb5b'}, tag])
+    onchain = rpc_call(args.rpc, 'eth_call', [{'to': deployment['reactor'], 'data': OWNER_SELECTOR}, tag])
     onchain = '0x' + onchain[-40:]
     if onchain.lower() != owner.lower():
         print(f'reactor owner {onchain} != manifest reactorFeeOwner {owner}')
         ok = False
     else:
         print(f'reactor owner {onchain} matches the manifest')
+    word = rpc_call(args.rpc, 'eth_call', [{'to': deployment['reactor'], 'data': FEE_CONTROLLER_SELECTOR}, tag])
+    ok &= check_fee_controller(word, manifest, deployment)
     sys.exit(0 if ok else 1)
 
 

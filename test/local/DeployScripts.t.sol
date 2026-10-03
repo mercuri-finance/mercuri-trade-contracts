@@ -11,6 +11,7 @@ import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol"
 import {TradeManifest} from "../../script/TradeManifest.sol";
 import {V3DutchOrderReactor} from "../../lib/uniswapx/src/reactors/V3DutchOrderReactor.sol";
 import {IPermit2} from "../../lib/uniswapx/lib/permit2/src/interfaces/IPermit2.sol";
+import {MockFeeController} from "../utils/MockFeeController.sol";
 
 /// @dev Exposes the internal decision logic so tests pass inputs directly and never touch process-wide env vars.
 contract FillerHarness is DeployOrderFiller {
@@ -38,8 +39,25 @@ contract FillerHarness is DeployOrderFiller {
         return MAX_EXECUTION_FEE;
     }
 
-    function requireReactor(address reactor, address permit2, address feeOwner, bytes32 codeHash) external view {
-        _requireReactor(reactor, permit2, feeOwner, codeHash);
+    function requireReactor(
+        address reactor,
+        address permit2,
+        address feeOwner,
+        address feeController,
+        bytes32 codeHash
+    ) external view {
+        _requireReactor(reactor, permit2, feeOwner, feeController, codeHash);
+    }
+
+    function feeController(string memory manifest) external view returns (address) {
+        return _reactorFeeController(manifest);
+    }
+}
+
+/// @dev Exposes the reactor script's post-deployment check.
+contract ReactorHarness is DeployTestnetReactor {
+    function requireDeployed(V3DutchOrderReactor reactor, address feeOwner, address feeController) external view {
+        _requireDeployedReactor(reactor, feeOwner, feeController);
     }
 }
 
@@ -169,22 +187,57 @@ contract DeployScriptsTest is Test {
         FillerHarness h = new FillerHarness();
         V3DutchOrderReactor reactor = new V3DutchOrderReactor(IPermit2(PERMIT2), ANVIL_1);
         bytes32 hash = address(reactor).codehash;
-        h.requireReactor(address(reactor), PERMIT2, ANVIL_1, hash); // accepted
+        h.requireReactor(address(reactor), PERMIT2, ANVIL_1, address(0), hash); // accepted
 
-        vm.expectRevert(abi.encodeWithSelector(DeployOrderFiller.ReactorMismatch.selector, "codehash"));
-        h.requireReactor(address(reactor), PERMIT2, ANVIL_1, bytes32(uint256(1)));
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorMismatch.selector, "codehash"));
+        h.requireReactor(address(reactor), PERMIT2, ANVIL_1, address(0), bytes32(uint256(1)));
 
         // Any other contract, such as the harness itself, is not the reactor.
-        vm.expectRevert(abi.encodeWithSelector(DeployOrderFiller.ReactorMismatch.selector, "codehash"));
-        h.requireReactor(address(h), PERMIT2, ANVIL_1, hash);
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorMismatch.selector, "codehash"));
+        h.requireReactor(address(h), PERMIT2, ANVIL_1, address(0), hash);
 
-        vm.expectRevert(abi.encodeWithSelector(DeployOrderFiller.ReactorMismatch.selector, "permit2"));
-        h.requireReactor(address(reactor), address(0xdead), ANVIL_1, hash);
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorMismatch.selector, "permit2"));
+        h.requireReactor(address(reactor), address(0xdead), ANVIL_1, address(0), hash);
 
-        vm.expectRevert(abi.encodeWithSelector(DeployOrderFiller.ReactorMismatch.selector, "owner"));
-        h.requireReactor(address(reactor), PERMIT2, address(0xbeef), hash);
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorMismatch.selector, "owner"));
+        h.requireReactor(address(reactor), PERMIT2, address(0xbeef), address(0), hash);
 
         vm.expectRevert(abi.encodeWithSelector(TradeManifest.NoCode.selector, "reactor", address(0xabc)));
-        h.requireReactor(address(0xabc), PERMIT2, ANVIL_1, hash);
+        h.requireReactor(address(0xabc), PERMIT2, ANVIL_1, address(0), hash);
+
+        // F2: a reactor whose owner has set a protocol fee controller is refused unless the manifest names it.
+        address controller = address(new MockFeeController(address(0xfee), 5, false));
+        vm.prank(ANVIL_1);
+        reactor.setProtocolFeeController(controller);
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorMismatch.selector, "feeController"));
+        h.requireReactor(address(reactor), PERMIT2, ANVIL_1, address(0), hash);
+        h.requireReactor(address(reactor), PERMIT2, ANVIL_1, controller, hash); // accepted when expected
+    }
+
+    /// The manifest's `reactorFeeController` defaults to zero, must be an address when present, and ships as zero.
+    function test_reactorFeeControllerManifestValue() public {
+        FillerHarness h = new FillerHarness();
+        assertEq(h.feeController("{}"), address(0));
+        assertEq(h.feeController(vm.readFile("deployments/manifest-5042002.json")), address(0));
+        assertEq(
+            h.feeController('{"reactorFeeController":"0x00000000000000000000000000000000000000ee"}'), address(0xee)
+        );
+        vm.expectRevert(TradeManifest.ReactorFeeControllerNotAddress.selector);
+        h.feeController('{"reactorFeeController":"none"}');
+    }
+
+    /// The reactor script checks the reactor it just deployed: owner and fee controller as chosen.
+    function test_reactorScriptChecksDeployedReactor() public {
+        ReactorHarness h = new ReactorHarness();
+        V3DutchOrderReactor reactor = new V3DutchOrderReactor(IPermit2(PERMIT2), ANVIL_1);
+        h.requireDeployed(reactor, ANVIL_1, address(0));
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorMismatch.selector, "owner"));
+        h.requireDeployed(reactor, address(0xbeef), address(0));
+        address controller = address(new MockFeeController(address(0xfee), 5, false));
+        vm.prank(ANVIL_1);
+        reactor.setProtocolFeeController(controller);
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorMismatch.selector, "feeController"));
+        h.requireDeployed(reactor, ANVIL_1, address(0));
+        h.requireDeployed(reactor, ANVIL_1, controller);
     }
 }

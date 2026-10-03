@@ -6,6 +6,7 @@
   "launchHook": "0x87e6BaBAc4598F99f4A0717ad294934455Fe60cc",
   "appRecipient": "0xc914763d1652931dc3874B75387B3886aBAcF891",
   "reactorFeeOwner": "REQUIRED_AT_D2_OWNER_GO",
+  "reactorFeeController": "0x0000000000000000000000000000000000000000",
   "executionFee": 30000,
   "feeRecipient": "REQUIRED_AT_D3_OWNER_GO"
 }

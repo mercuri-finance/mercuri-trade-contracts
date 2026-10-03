@@ -61,15 +61,9 @@ contract TradeLocalStateTest is UniswapXFillerHarness {
         Market memory listed = _market(false, false);
         _serializeMarket("launch", launch);
         _serializeMarket("listed", listed);
-        // A fresh Launch pool locks about 18,000 USDC, so its stop capacity (κ · f · Y_lock) is about 36 USDC and
-        // one wallet's quarter of it about 9 USDC, below the 10 USDC order minimum. The Launch market is traded
-        // first (8,000 USDC bought through the router, the tokens passed on), which raises the locked position's
-        // USDC side to about 26,000 USDC: a wallet's share then admits one minimum-size stop-loss.
-        uint256 held = launch.token.balanceOf(trader);
-        _execute(launch, true, 8_000e6, 0, abi.encode(uint256(uint160(trader))));
-        uint256 bought = launch.token.balanceOf(trader) - held;
-        vm.prank(trader);
-        launch.token.transfer(bob, bought); // the trader keeps the tokens it held, so the Go test's sizes stand
+        // A fresh Launch pool locks about 18,000 USDC, so its stop capacity (κ · f · Y_lock) is about 36 USDC. A
+        // wallet's share is max(25% of it, the 10 USDC order minimum), so the fresh pool admits one minimum-size
+        // stop-loss per wallet as it is: no trade is needed first.
         PoolKey memory decoy = _decoyPool(launch);
         vm.serializeUint(KEY, "decoyFee", decoy.fee);
         vm.serializeInt(KEY, "decoyTickSpacing", decoy.tickSpacing);

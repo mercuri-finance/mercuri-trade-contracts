@@ -23,12 +23,12 @@ import {ResolvedOrder} from "../lib/uniswapx/src/base/ReactorStructs.sol";
 ///      output per input, has risen to the trigger; stop-loss when it has fallen to it. Pool currencies are sorted,
 ///      so the input is currency0 exactly when its address is the lower one:
 ///
-///      | Order           | USDC is   | Input is  | Token price in USDC | Take-profit fires | Stop-loss fires |
-///      | --------------- | --------- | --------- | ------------------- | ----------------- | --------------- |
-///      | Sell token→USDC | currency1 | currency0 | rises with price    | price >= trigger  | price <= trigger|
-///      | Sell token→USDC | currency0 | currency1 | falls with price    | price <= trigger  | price >= trigger|
-///      | Buy USDC→token  | currency0 | currency0 | falls with price    | price >= trigger  | price <= trigger|
-///      | Buy USDC→token  | currency1 | currency1 | rises with price    | price <= trigger  | price >= trigger|
+///      | Order           | USDC is   | Input is  | Token price in USDC | Take-profit fires | Stop-loss fires  |
+///      | --------------- | --------- | --------- | ------------------- | ----------------- | ---------------- |
+///      | Sell token→USDC | currency1 | currency0 | rises with price    | price >= trigger  | price <= trigger |
+///      | Sell token→USDC | currency0 | currency1 | falls with price    | price <= trigger  | price >= trigger |
+///      | Buy USDC→token  | currency0 | currency0 | falls with price    | price >= trigger  | price <= trigger |
+///      | Buy USDC→token  | currency1 | currency1 | rises with price    | price <= trigger  | price >= trigger |
 ///
 ///      ("price" is the pool's `sqrtPriceX96`.) A sell's take-profit therefore fires as the token's USDC price rises
 ///      to the trigger and its stop-loss as it falls; a buy's take-profit as the token's price falls and its

@@ -734,8 +734,16 @@ def check_binding(rpc, tag, manifest, deployment, fee_recipient, factory_code):
     if cast_keccak(factory_code) != CREATE2_FACTORY_CODEHASH:
         print(f'CREATE2 deployer {CREATE2_FACTORY} code hash {cast_keccak(factory_code)} != {CREATE2_FACTORY_CODEHASH}')
         ok = False
-    onchain_validator = '0x' + rpc_call(rpc, 'eth_call', [{'to': filler, 'data': VALIDATOR_SELECTOR}, tag])[-40:]
-    onchain_filler = '0x' + rpc_call(rpc, 'eth_call', [{'to': validator, 'data': FILLER_SELECTOR}, tag])[-40:]
+    def getter(to, selector):
+        """The address a getter returns, or a description of why it returned none (a revert or no code)."""
+        try:
+            word = rpc_call(rpc, 'eth_call', [{'to': to, 'data': selector}, tag]).removeprefix('0x')
+        except SystemExit as error:
+            return f'(reverted: {error})'
+        return '0x' + word[-40:] if len(word) == 64 else f'(returned {len(word) // 2} bytes)'
+
+    onchain_validator = getter(filler, VALIDATOR_SELECTOR)
+    onchain_filler = getter(validator, FILLER_SELECTOR)
     if onchain_validator.lower() != validator or onchain_filler.lower() != filler:
         print(f'binding read on chain: filler.validator() {onchain_validator}, validator.filler() {onchain_filler}')
         ok = False

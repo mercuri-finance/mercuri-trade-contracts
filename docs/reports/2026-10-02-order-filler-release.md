@@ -796,3 +796,78 @@ Open: the isolated re-audit of `ea9006f`; the backend (D22 encoding, validator a
 classification with the validator's errors, ABI copies) and the web app (encoding, trigger as the pool's
 `sqrtPriceX96` in its orientation) must adopt the new vector; `CLAUDE.md`/`AGENTS.md` still describe `src/` as the
 filler alone; real-chain gas; and, unchanged, the go-step items of section 18.
+
+## 21. Re-audit of 5 Oct 2026
+
+A re-audit of `93afe60` on branch `orders/late-cosign` covered `MercuriOrderFiller`, `MercuriOrderValidator`, the
+deployment scripts, the verifier and the record writer, and so the early guard (section 19) and the on-chain order
+validation (section 20). It found no exploitable defect. Funds were safe on every path traced: only the keeper can call
+`fill`, the validator refuses every filler but its own, and the pool binding, full-input and net-output checks, refund
+cap and fee accounting on all four routes hold. It raised six findings, all Low or Info, and an adjudicator confirmed
+each one (C-04 downgraded from Low to Info). The fixes are commits `50bb26d`, `2092494` and `fa31012` from `93afe60`;
+this section, `SECURITY.md` and the runbook follow in the commit after `fa31012`. Nothing was broadcast and no
+transaction was sent to any network. Every deployment below ran on a loopback anvil fork, and `deployments/5042002.json`
+still does not exist. **A focused re-audit of these fixes is pending.**
+
+| Finding | Resolution | Commit | Evidence |
+| --- | --- | --- | --- |
+| C-01 (Low): triggers read the instantaneous spot price, so a third party with no key can push a thin pool through a stop-loss before the keeper's fill | Accepted design limit, documented with no code change (the adjudicator called for none). The scenario assumed a same-block fill, but the keeper cosigns only after the trigger has held for six consecutive finalized blocks (`HoldBlocks = 6`, backend `internal/orders/expiry.go`), so the attacker must hold the price past the trigger for six blocks; the fill reverts unless the trader receives the signed minimum (`NetMinimumNotMet`). The sustained hunt that remains is spec E12, D22 and R9, controlled by the stop-capacity limits of D30 | docs commit after `fa31012` | `SECURITY.md` limits list; runbook "Trigger reads and the six-block hold". Existing `test_compromiseDrill` and `testFuzz_compromiseExtractionBound` prove the band bound |
+| C-02 (Low): the keeper address is fixed for life as the only `fill` caller and the fee recipient, so losing or blocking it stops every open order | Accepted tradeoff of an immutable filler, documented with no code change. The adjudicator rejected splitting the fee recipient: it does not help with a lost key, the main case, and it would break D13, under which the fee pays the keeper's gas. The recovery is a forced pair replacement and a re-sign path for every open order | docs commit after `fa31012` | `SECURITY.md` limits list; runbook "Forced replacement: the keeper address is lost or blocked" (stop, new keeper and pair, switch, re-sign against the new validator with the same terms, cancel the old nonce) and the trigger table row |
+| C-03 (Info): the NatSpec gave an outdated reason for keeper-only `fill` (pool routing, which the D22 pool binding already prevents) and said `_inputAmount` uses `block.number` on every chain except Arbitrum's | The contract NatSpec now states the actual reasons. The pool is not the reason. An open `fill` would let anyone take a cosigned order from the mempool, push the signed pool's price, fill down to the signed minimum and restore the price in one transaction, which is a risk-free sandwich that the six-block hold cannot stop. It would also let copiers race the keeper's own transaction. The `_inputAmount` note names Arbitrum One (42161) and Robinhood Chain (4663), the two chains whose pinned `BlockNumberish` reads ArbSys. Comments only | `50bb26d` | Bytecode identity below: `cmp` of `forge inspect` runtime and creation output before and after, for both contracts: identical. NatSpec 54 ABI entries, 0 failures. `source-manifest.json` updated |
+| C-04 (Info): the filler step compared the reactor's code hash with `TRADE_REACTOR_CODEHASH`, an operator-supplied value, while the router's hash was pinned | Both manifests gain `reactorCodeHash` = `0xd7a5867bd6bea358f040527c10ba7ab2e76ce071e7b7be6181b26a0c1e7e7dcb`. The value is the same on both networks: same permit2, and the same `BlockNumberish` branch on both chain ids. `TradeManifest._reactorCodeHash` reads it and refuses a zero hash (`ReactorCodeHashNotPinned`). `DeployOrderFiller` compares `TRADE_REACTOR` with the pin and no longer reads the environment. `DeployTestnetReactor` refuses, before broadcasting, a deployed reactor whose runtime is not the pin. `verify-trade-filler.py --preflight` reproduces the pin offline from the built reactor with the manifest permit2 and a small via-IR function id (`small` profile, id `0x2`). Live runs require the reactor's keccak to equal the pin, in addition to the byte-for-byte reproduction | `2092494`, `fa31012` | `test_reactorCodeHashPinned`: the reactor step, run end to end, deploys exactly the pin. The pin is the same on chain ids 5042002 and 5042, whatever the owner, and differs for Arbitrum's branch and for another permit2. A zero or missing pin is refused. `test_fillerReactorCheckUsesManifestPin`: a look-alike reactor with the same `permit2()` and `owner()` (the upstream source built for the ArbSys branch) is refused `ReactorMismatch("codehash")` even when the environment names its hash. `test_reactorScriptChecksDeployedReactor` adds the code-hash refusal. Verifier self-test: the pins of both manifests reproduce. A flipped byte fails the live pin check. The preflight refuses a pin of `0x11…11`, the router's hash, zero, a non-hash, a missing key and a tampered permit2. The pin is the hash the section 20 rehearsal recorded for its reactor |
+| C-04, found while fixing it | The first loopback rehearsal of the new check showed that `forge script` had picked the `default`-profile build of `DeployTestnetReactor`. That build embeds the 14,758-byte reactor, not the 11,525-byte `small` reactor that the tests, the section 20 rehearsal and the pin use. The script existed in both profiles, and forge's choice between them is not stable. The new check refused it before broadcasting (`ReactorMismatch("codehash")`). `foundry.toml` now restricts `script/DeployTestnetReactor.s.sol` to 200 optimizer runs, so the script has one fresh artifact, which embeds the `small` reactor. No production bytecode changed | `fa31012` | After the change, the fresh `out/DeployTestnetReactor.s.sol/DeployTestnetReactor.json` embeds the `small` reactor creation code and not the `default` one. The rehearsal reactor's runtime keccak is the pin. Filler and validator `forge inspect` output is unchanged (`cmp`) |
+| C-05 (Info): the filler's CREATE2 through the permissionless standard deployer with `FILLER_SALT = 0` can be replayed first by anyone, which blocked the tooling (`AlreadyDeployed`, no broadcast for the record writer) | `DeployOrderFiller._deployPair` accepts an occupied filler address only when `_requireIdenticalPair` proves both runtimes are byte for byte the ones it would deploy. It deploys a reference pair locally with the same creation code and arguments, outside any broadcast, so the reference is never sent. It moves the two binding words (the filler's `validator`, the validator's `filler`) to the predicted addresses and requires each keccak to equal the code hash on chain. It then prints `ADOPTED` and broadcasts nothing. Anything else is refused: `NoCode("validator")`, `DeploymentMismatch("existing filler runtime")` or `("existing validator runtime")`, and `AlreadyDeployed(validator)` when only the validator address is occupied. `write-trade-record.py --adopted-filler-block N` records such a pair from the build and manifest alone (`fillerAdopted: true`). The verifier, which never depended on who deployed, now requires an adopted pair to be verified at its `fillerDeployBlock` with no filler code one block earlier | `2092494` | `test_deployPairAdoptsIdenticalPredeployedPair`: a copier's replay is adopted with the code untouched and nothing sent through the deployer, and a fresh deployment of the same arguments gives the same two runtimes. `test_deployPairRefusesDifferentPredeployedPair` covers unrelated code, a filler with another `executionFee`, the right filler without its validator, the right filler with a validator bound to another PoolManager, and an occupied validator address with a free filler address; each is refused by name, and the genuine pair is accepted. `test_deployPairLandsAtPrediction`: a second run adopts. Mutation check: swapping either substituted address for the reference's own fails the three pair tests. Record writer self-test 34/34 (eight new adopted-pair cases). Verifier self-test: the adopted-block check |
+| C-06 (Info): dust and donations stay in the filler for good, and pools whose currency is native USDC (`address(0)`) are refused | Intended, documented with no code change. Funds sent to the filler, and the reactor's native refunds, cannot be recovered and never reach a trader or a later fill. A native-currency pool always reverts `PoolMismatch` with nothing moved, so the keeper and the web app must exclude such pools | docs commit after `fa31012` | `SECURITY.md` limits list and "Pause and recovery"; runbook "Pool eligibility". Existing `UniswapXFillerNative` tests (refund cap) |
+
+### Bytecode identity (C-03)
+
+`forge inspect src/<file>:<contract> deployedBytecode` / `bytecode` output was saved before the NatSpec edit (at
+`93afe60`), after it (`50bb26d`) and again after the `foundry.toml` change (`fa31012`), and compared with `cmp`: identical
+in every case. The `out/` artifacts' `bytecode.object` and `deployedBytecode.object` are also unchanged. The output's
+`shasum -a 256` is as in section 20 (raw-byte sha256 and keccak in brackets):
+
+| | `93afe60` = `50bb26d` = `fa31012` |
+| --- | --- |
+| Filler runtime | 13,413 bytes, `155b04c3cd980403f63c606c0af2cbe5e860013119baa7c9784f3ca7176487dc` (raw `befb555a0541dc60970fc6baf694830481a74897f4c238c574e4af0b00e70aba`, keccak `0xe43d4299e1414a04404e30d4c56b101461fb3766b4f2d2f024206ae61b046846`) |
+| Filler creation | 15,671 bytes, `ac00c9f3907ea895d68a2733bd024a84427b1236451eca385eb9c949e06bec8e` (raw `13a955427175cab109877fbdd38cfbcb896fe3a37be006c9781a075cd4187f96`, keccak `0xb6f46f294fe873f02ea0689099cd55c3ad2ae78c8c6a5008174f470011fea0dc`) |
+| Validator runtime | 1,222 bytes, `d622f25c3e10d1bed0ae25210fce66b5675a03522c4e99c4e74793c4fc31e914` (raw `775ee89bffc3fbfefafedb280ce5211d0e616538ee9140fa994e92cf2a9e7f01`, keccak `0xb18208dbc15a470664dfaa844fa5b69568406768d35ec8669ed7559b5f81f9f8`) |
+| Validator creation | 1,440 bytes, `3ddfd93fad45f94150005a3a13dfc0e72d565d8e5575781781d949e64e2461d5` (raw `e4e42b268d669283c65b1aa4afe2c90891c8f52d0c05ace770cd3e9709e9165d`, keccak `0x7f7bf93c20e603073b5abccfa4d5182a5c17aa3c7f55ed81db9a712530957130`) |
+| Reactor runtime (pinned, `small`) | 11,525 bytes, keccak `0xd7a5867bd6bea358f040527c10ba7ab2e76ce071e7b7be6181b26a0c1e7e7dcb` (unchanged since section 20) |
+| `src/MercuriOrderFiller.sol` sha256 | `91a6d70fe2cdd97b4b7b0b50a84da38e70f06d9b8fac6089a1b72eab4ddb4e9f` (was `4ff0fbe4…b2d3`); validator and interface unchanged |
+
+ABI unchanged. The scripts' new error `ReactorCodeHashNotPinned` is in `TradeManifest`, not in a deployed contract.
+`foundry.toml` gains the restriction for `script/DeployTestnetReactor.s.sol` and no other change.
+
+### Loopback rehearsal of an adopted pair at `fa31012`
+
+Anvil forked `https://rpc.testnet.arc.network` at block 65,275,728 on port 8551 (`--fork-header "User-Agent:
+curl/8.7.1"`). Sender anvil account 0, rehearsal owner account 1, rehearsal keeper account 2, copier account 5,
+`--broadcast` to the loopback anvil only:
+
+| Step | Result (fork-only) |
+| --- | --- |
+| `DeployTestnetReactor` | Reactor `0xC37B7C35aD214bB8c11Ee49E3c4483d3B33A7118`, block 65,275,729, artifact `V3DutchOrderReactor.small`, runtime keccak equal to the pin |
+| Copier sends `FILLER_SALT ++ init code` to `0x4e59…956C` | Status 1, block 65,275,730 |
+| `DeployOrderFiller` with `TRADE_REACTOR` | `ADOPTED: the predicted filler and validator already hold exactly this runtime; nothing sent`; "No transactions to broadcast"; the deployer's nonce did not change; filler `0xDE23A3b9E70dF562E6E97Beca6323913CabaaBFE`, validator `0x28Fbd127F04eE06c54f9D26BA4c0FBe98dFBa92E` (the section 20 rehearsal's addresses) |
+| `write-trade-record.py --rehearsal --adopted-filler-block 65275730 --fee-recipient <keeper>` | Record with `fillerAdopted: true`, `fillerDeployBlock` 65,275,730, `sourceRevision` `fa31012b50296a298a8fdaa68f81b1903db8162e`, into the scratchpad |
+| `verify-trade-filler.py --rehearsal --block 65275730` | Exit 0. Reactor MATCH, and its code hash is the manifest pin. "adopted pair: the filler appeared in block 65275730 (no code at 65275729)". Filler MATCH, keccak `0x53a0c31b…2351`; validator MATCH, keccak `0xee298477…e035`. Both CREATE2 derivations and the binding read on chain hold, and the router matches |
+| The record's block moved to 65,275,731 | Exit 1: "the filler already had code at block 65275730" |
+| `anvil_setCode(filler, 0x00)`, then `DeployOrderFiller` again | Exit 1, `DeploymentMismatch("existing filler runtime")`; the verifier exits 1 with the filler MISMATCH |
+
+### Gates at `fa31012`
+
+`TRADE_VECTOR_BACKEND=<backend copy> TRADE_VECTOR_WEBUI=<web app copy> bash script/check-contracts.sh`: exit 0 in 54 s
+(warm build). Upstream sources 110 and 34 match. The source manifest (three files) matches and `forge fmt --check` is
+clean. NatSpec: 54 ABI entries, 0 failures. The preflight is clean for both manifests, each with its `reactorCodeHash`
+reproduced (testnet pending `feeRecipient`, mainnet pending `executionFee` and `feeRecipient`), and a pending choice is
+refused without `--allow-pending`. The verifier self-tests pass, including the new pin and adopted-block checks. Record
+writer self-test 34/34. `forge test --fuzz-seed 0x5042`: 175 passed, 0 failed, 6 skipped (18 suites; `DeployScriptsTest`
+29, up from 25). `order_expiring.json` is identical in the three places (`0bc97dd5…0e3a`, unchanged). Snapshot check:
+129 passed, 1 skipped (`.gas-snapshot` unchanged; the new tests are in `test/local`). The `--stress` run and the
+invariant campaigns were not repeated for this round: no contract bytecode changed, and the changed scripts are covered
+by the default suite and the rehearsal above.
+
+Open: the focused re-audit of these fixes; the order terms shown to traders must state the C-01 residual risk; the web
+app's re-sign flow for a forced replacement (C-02) and the keeper and web app pool eligibility rule for native-currency
+pools (C-06) are requirements on those repositories, not yet evidenced here; and, unchanged, the go-step items of
+sections 18 and 20.

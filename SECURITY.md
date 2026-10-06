@@ -51,10 +51,29 @@ Limits a reviewer should know:
 - On Arc native value is USDC. The reactor refunds its whole native balance to the filler after every fill; the filler
   accepts it from the reactor only, never pays it out, and has no way to return it.
 - The trigger is checked against the signed pool's spot price before the swap, not an oracle (none exists on Arc for
-  these assets). Anyone can move a pool's price within a block; under a key compromise that lets an order fill at the
-  manipulated moment (R9). The signed minimum bounds the cost: the band, for a protected stop.
+  these assets). Anyone can move a pool's price, with no key at all: a third party can sell into a thin pool to push
+  it through a stop-loss and buy back after the fill (re-audit of 5 Oct 2026, C-01). Two bounds hold. The honest keeper
+  cosigns only after the trigger has held for six consecutive finalized blocks (`HoldBlocks = 6` in the keeper), so a
+  push for a block or two is not filled and the attacker must hold the price past the trigger for that long; and the
+  fill reverts unless the trader receives at least the signed minimum (`NetMinimumNotMet`), so the loss on an order is
+  at most its value less that minimum, the trader-signed band times the notional for a protected stop. A sustained hunt
+  that holds the price for six blocks is not prevented on chain: it is an accepted design limit while Arc has no
+  oracle (spec E12, D22, R9), controlled by the keeper's stop-capacity limits per pool (D30) and tight bands on thin
+  pools, and it belongs in the order terms shown to traders. Under a key compromise the hold does not bind (R9).
 - The filler and its validator are bound together (R7). Orders name the validator, so a replacement filler cannot
   settle orders signed for the old one; they stay fillable only through the old pair, by the old keeper key.
+- The keeper address is fixed for the filler's life, and it has two roles: it is the only address allowed to call
+  `fill` and the recipient of every execution fee (C-02). If that key is lost, must be rotated, or the address can no
+  longer transact or receive USDC (for example a blocklist, if Arc's USDC has one), every open order stops: nobody else
+  may call `fill`, and a fee transfer that reverts reverts the fill. No funds are at risk, because inputs stay in the
+  traders' wallets and an order lasts at most 30 days. Recovery is a new filler and validator, and every trader with an
+  open order must sign again against the new validator; the steps are in the runbook (forced replacement). The fee is
+  deliberately not split to another address: it is paid to the keeper so that it funds the keeper's gas (spec D13), and
+  a separate recipient would not help the main case, a lost key.
+- Pools whose currency is native USDC (`address(0)`) cannot be traded through orders (C-06). The callback requires the
+  pool's currencies to be exactly the order's input and output, one of them the ERC-20 USDC address, and Permit2 inputs
+  are never `address(0)`, so such an order always reverts `PoolMismatch` and nothing moves. The keeper and the web app
+  must not offer orders on those pools.
 
 ## Griefing defence
 
@@ -93,9 +112,12 @@ Residual risk:
 
 The filler has no pause. Fills stop when the keeper stops cosigning and stops calling `fill`, which is the incident
 lever. Orders already signed stay valid Permit2 signatures until their deadline; a trader cancels one by invalidating
-its nonce with Permit2 (`invalidateUnorderedNonces`). Tokens or native value sent to the
-filler outside a fill, and the reactor's native refunds, have no rescue path and stay in the filler; they never pay a
-fee or subsidise an order.
+its nonce with Permit2 (`invalidateUnorderedNonces`).
+
+Nothing sent to the filler can be recovered (C-06). Tokens or native value sent to it outside a fill, and the
+reactor's end-of-fill native refunds (native USDC dust on Arc), stay in the filler for good: there is no owner and no
+rescue function. They never pay a fee, subsidise an order or reach a later fill, because every fill measures its
+own balances against a baseline and pays the trader at most that fill's own surplus. Never send funds to the filler.
 
 ## Replacement
 
@@ -118,12 +140,18 @@ by the contract.
 - Release evidence for the filler candidate: `docs/reports/2026-10-02-order-filler-release.md`, including the
   independent audit of 3 October 2026 and its fix round (section 18).
 - Reproducible bytecode: `python3 script/verify-trade-filler.py` after `forge build`, for the reactor, the filler and
-  the validator, with the binding between the last two checked both ways. Until a deployment record exists it runs in
+  the validator, with the binding between the last two checked both ways. The reactor's runtime is pinned in each
+  manifest (`reactorCodeHash`); the deployment scripts and the verifier compare against that pin, never against a hash
+  the operator supplies (C-04).
+- A filler pair that someone else lands first, by replaying the init code through the permissionless CREATE2 deployer,
+  is adopted only when both runtimes are byte for byte the ones the script would deploy; any other code at either
+  address is refused (C-05). Such a pair is the same contract, so it is not a risk to traders. Until a deployment record exists it runs in
   `--self-test` and `--preflight` mode against the freshly built artifacts, the manifests and Launch's deployment
   records.
 - The filler and the validator are immutable, with no owner, pause, upgrade or rescue path; only the configured keeper
   can call `fill`.
 
-An independent review was performed on 3 October 2026 (release report, section 18); the early guard added after it
-(section 19) and the on-chain order validation (section 20) await their own isolated re-review. No professional
-third-party audit has been performed yet.
+An independent review was performed on 3 October 2026 (release report, section 18). A re-audit of 5 October 2026
+covered the early guard (section 19) and the on-chain order validation (section 20) and found no exploitable defect;
+its six Low and Info findings and their resolutions are in section 21. A focused re-audit of those fixes is pending. No
+professional third-party audit has been performed yet.

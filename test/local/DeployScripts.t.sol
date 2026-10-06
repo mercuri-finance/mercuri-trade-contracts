@@ -99,8 +99,8 @@ contract FillerHarness is DeployOrderFiller {
     }
 }
 
-/// @dev The filler script itself, run end to end against a manifest fixture instead of the shipped manifest, whose
-///      keeper is still a sentinel. Everything else in `run()` is the production code path.
+/// @dev The filler script itself, run end to end against a manifest fixture instead of the shipped manifest, so a
+///      test can put a sentinel or another keeper in it. Everything else in `run()` is the production code path.
 contract FillerRunHarness is DeployOrderFiller {
     string internal fixture;
 
@@ -127,34 +127,58 @@ contract ReactorHarness is DeployTestnetReactor {
     }
 }
 
-/// @notice The deployment scripts must refuse the shipped manifest (sentinel owner) and any other chain, and the
-///         rehearsal override must be unreachable outside a loopback anvil.
+/// @notice The deployment scripts must refuse a manifest whose owner choices are sentinels and any other chain, and
+///         the rehearsal override must be unreachable outside a loopback anvil.
 contract DeployScriptsTest is Test {
     address internal constant ANVIL_1 = 0x70997970C51812dc3A010C7d01b50e0d17dc79C8;
     address internal constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
     string internal constant SENTINEL = '{"reactorFeeOwner":"REQUIRED_AT_D2_OWNER_GO"}';
     string internal constant CHOSEN = '{"reactorFeeOwner":"0x00000000000000000000000000000000000000cc"}';
+    /// @dev The testnet keeper's transaction address, the owner's D3 choice recorded in the testnet manifest.
+    address internal constant TESTNET_KEEPER = 0xFFEd2F02Ec860fFF1523375Fb253f0Bb0B7b2Efd;
+    string internal constant RECIPIENT_SENTINEL = "REQUIRED_AT_D3_OWNER_GO";
 
     function setUp() public {
         vm.chainId(5042002);
     }
 
-    /// The reactor fee owner is decided (Launch's testnet timelock, read from Launch's record); the keeper address is
-    /// still the owner's choice at D3.
-    function test_manifestShipsSentinel() public view {
+    /// @dev The shipped testnet manifest with its keeper replaced by the D3 sentinel: a manifest whose keeper choice
+    ///      is still pending, which the shipped one no longer is.
+    function _pendingKeeperManifest() internal view returns (string memory) {
+        string memory shipped = vm.readFile("deployments/manifest-5042002.json");
+        string memory pending = vm.replace(shipped, vm.toString(TESTNET_KEEPER), RECIPIENT_SENTINEL);
+        assertEq(vm.parseJsonString(pending, ".feeRecipient"), RECIPIENT_SENTINEL, "fixture carries the sentinel");
+        return pending;
+    }
+
+    /// The testnet owner choices are made: the reactor fee owner is Launch's testnet timelock (read from Launch's
+    /// record) and the keeper is the testnet keeper, written checksummed. The mainnet manifest keeps its sentinels.
+    function test_manifestShipsOwnerChoices() public view {
         string memory manifest = vm.readFile("deployments/manifest-5042002.json");
         string memory launchRecord = vm.readFile("lib/mercuri-launch-contracts/deployments/5042002.json");
         assertEq(vm.parseJsonAddress(manifest, ".reactorFeeOwner"), vm.parseJsonAddress(launchRecord, ".timelock"));
         assertEq(vm.parseJsonAddress(manifest, ".reactorFeeOwner"), 0x41129B5215cA24b29a4cABcaE26d3569744DEe2E);
-        assertEq(vm.parseJsonString(manifest, ".feeRecipient"), "REQUIRED_AT_D3_OWNER_GO");
+        assertEq(vm.parseJsonAddress(manifest, ".feeRecipient"), TESTNET_KEEPER);
+        // `vm.toString(address)` is the EIP-55 checksummed form, so the manifest's text must be exactly that.
+        assertEq(vm.parseJsonString(manifest, ".feeRecipient"), vm.toString(TESTNET_KEEPER), "keeper not checksummed");
+        assertTrue(TESTNET_KEEPER != address(0));
         assertEq(vm.parseJsonUint(manifest, ".executionFee"), 50_000);
+        string memory mainnet = vm.readFile("deployments/manifest-5042.json");
+        assertEq(vm.parseJsonString(mainnet, ".feeRecipient"), "REQUIRED_AT_MAINNET_OWNER_GO");
+        assertEq(vm.parseJsonString(mainnet, ".executionFee"), "REQUIRED_AT_MAINNET_OWNER_GO");
     }
 
+    /// A sentinel or zero keeper is refused; the shipped testnet keeper and any other address resolve to themselves.
     function test_feeRecipientSentinelRefused() public {
         FillerHarness h = new FillerHarness();
-        string memory manifest = vm.readFile("deployments/manifest-5042002.json");
+        string memory manifest = _pendingKeeperManifest();
         vm.expectRevert(TradeManifest.FeeRecipientNotChosen.selector);
         h.resolveRecipient(manifest, false, address(0), "");
+        vm.expectRevert(TradeManifest.FeeRecipientNotChosen.selector);
+        h.resolveRecipient(vm.readFile("deployments/manifest-5042.json"), false, address(0), "");
+        assertEq(
+            h.resolveRecipient(vm.readFile("deployments/manifest-5042002.json"), false, address(0), ""), TESTNET_KEEPER
+        );
         vm.expectRevert(TradeManifest.FeeRecipientNotChosen.selector);
         h.resolveRecipient('{"feeRecipient":"0x0000000000000000000000000000000000000000"}', false, address(0), "");
         assertEq(
@@ -187,10 +211,10 @@ contract DeployScriptsTest is Test {
         assertEq(address(reactor.permit2()), PERMIT2);
     }
 
-    /// The filler script still refuses the shipped manifest: the keeper address is a sentinel.
-    function test_fillerScriptRefusesShippedManifest() public {
+    /// The filler script refuses a manifest whose keeper is still a sentinel, before it reads TRADE_REACTOR.
+    function test_fillerScriptRefusesSentinelManifest() public {
         vm.setEnv("TRADE_LOCAL_REHEARSAL", "false");
-        DeployOrderFiller script = new DeployOrderFiller();
+        FillerRunHarness script = new FillerRunHarness(_pendingKeeperManifest());
         vm.expectRevert(TradeManifest.FeeRecipientNotChosen.selector);
         script.run();
     }
@@ -571,16 +595,14 @@ contract DeployScriptsTest is Test {
 
     /// C-04 and N-02 (fix re-audit of 6 Oct 2026): `DeployOrderFiller.run()` itself compares TRADE_REACTOR against
     /// the manifest's `reactorCodeHash`, never against TRADE_REACTOR_CODEHASH. The run uses the shipped testnet
-    /// manifest with only the keeper filled in. A look-alike reactor (same getters, Arbitrum block-number branch) is
+    /// manifest, whose keeper is chosen. A look-alike reactor (same getters, Arbitrum block-number branch) is
     /// refused at the reactor check even though the environment names its hash; the genuine reactor passes that check
     /// while the environment names the look-alike's hash, and the run stops at the next check, the router, which has
     /// no code here. Reading the hash from the environment instead fails both halves.
     function test_fillerRunUsesManifestReactorPin() public {
         string memory shipped = vm.readFile("deployments/manifest-5042002.json");
         address timelock = vm.parseJsonAddress(shipped, ".reactorFeeOwner");
-        FillerRunHarness script = new FillerRunHarness(
-            vm.replace(shipped, "REQUIRED_AT_D3_OWNER_GO", "0x00000000000000000000000000000000000000dD")
-        );
+        FillerRunHarness script = new FillerRunHarness(shipped);
         ReactorHarness r = new ReactorHarness();
         address genuine = address(r.newReactor(PERMIT2, timelock));
         assertEq(genuine.codehash, vm.parseJsonBytes32(shipped, ".reactorCodeHash"), "genuine reactor is the pin");

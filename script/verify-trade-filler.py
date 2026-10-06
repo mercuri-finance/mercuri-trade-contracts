@@ -47,6 +47,8 @@ root = Path(__file__).resolve().parents[1]
 DEFAULT_RPC = 'https://rpc.testnet.arc.network'
 SENTINEL = 'REQUIRED_AT_D2_OWNER_GO'
 RECIPIENT_SENTINEL = 'REQUIRED_AT_D3_OWNER_GO'
+# The testnet keeper's transaction address, the owner's D3 choice recorded in the testnet manifest.
+TESTNET_KEEPER = '0xFFEd2F02Ec860fFF1523375Fb253f0Bb0B7b2Efd'
 MAX_EXECUTION_FEE = 100_000
 POINTER = '_getBlockNumberish'
 # The only immutables each contract may carry. A different set in either direction is a reviewed-source change.
@@ -707,20 +709,44 @@ def required_reactor_fields(deployment, reactor_only):
 
 
 def preflight_self_test():
-    """Both manifests pass with only their owner choices pending; each tampered field and a pending choice fail."""
+    """Both manifests pass with only their owner choices pending; each tampered field and a pending choice fail.
+
+    The shipped testnet manifest has every owner choice made, so a pending keeper is tested on a synthetic copy of it
+    with the sentinel put back. The mainnet manifest is review-only and keeps its sentinels.
+    """
     import copy
     ok = True
-    for path, expected in (('deployments/manifest-5042002.json', ['feeRecipient']),
-                           ('deployments/manifest-5042.json', ['executionFee', 'feeRecipient'])):
-        manifest = load(path)
+    base = load('deployments/manifest-5042002.json')
+    pending_keeper = dict(base, feeRecipient=RECIPIENT_SENTINEL)
+    for label, manifest, expected in (('deployments/manifest-5042002.json', base, []),
+                                      ('testnet manifest with the keeper sentinel', pending_keeper, ['feeRecipient']),
+                                      ('deployments/manifest-5042.json', load('deployments/manifest-5042.json'),
+                                       ['executionFee', 'feeRecipient'])):
         problems, waiting = preflight(manifest)
         if problems or waiting != expected:
-            print(f'{path}: expected a clean preflight with {expected} pending, got {problems} {waiting}')
+            print(f'{label}: expected a clean preflight with {expected} pending, got {problems} {waiting}')
             ok = False
-        if run_preflight(manifest, ()):
-            print(f'{path}: pending owner choices were NOT refused without --allow-pending')
+        if run_preflight(manifest, ()) != (not expected):
+            print(f'{label}: preflight without --allow-pending did not {"refuse" if expected else "pass"} it')
             ok = False
-    base = load('deployments/manifest-5042002.json')
+        if expected and not run_preflight(manifest, expected):
+            print(f'{label}: preflight with {expected} allowed pending did not pass')
+            ok = False
+    # The shipped testnet keeper is the chosen keeper address, checksummed and nonzero; the sentinel is refused.
+    keeper = base.get('feeRecipient')
+    checksummed = subprocess.run(['cast', 'to-check-sum-address', str(keeper)], capture_output=True, text=True)
+    if (keeper != TESTNET_KEEPER or not is_address(keeper) or int(keeper, 16) == 0
+            or checksummed.returncode != 0 or checksummed.stdout.strip() != keeper):
+        print(f'deployments/manifest-5042002.json: feeRecipient {keeper!r} is not the checksummed {TESTNET_KEEPER}')
+        ok = False
+    try:
+        required_fee_recipient(pending_keeper, {'feeRecipient': TESTNET_KEEPER})
+        print('feeRecipient sentinel: NOT refused')
+        ok = False
+    except SystemExit as error:
+        print(f'feeRecipient sentinel: refused ({error})')
+    if required_fee_recipient(base, {'feeRecipient': TESTNET_KEEPER.lower()}) != TESTNET_KEEPER:
+        ok = False
     other = '0x00000000000000000000000000000000000000Ab'
     cases = {key: other for key in ('permit2', 'usdc', 'launchHook', 'poolManager', 'appRecipient', 'reactorFeeOwner',
                                     'router')}

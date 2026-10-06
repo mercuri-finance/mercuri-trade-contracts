@@ -370,8 +370,11 @@ def selftest():
     reactor = '0x6cd6aed7978839bbe6d64aff16fd1fa17ffb71bf'
     filler = '0x2d4a9ebb2c5d8cd84627e79f0aa64bb8f15fc3d9'
     keeper = '0x00000000000000000000000000000000000000bb'
+    testnet_keeper = '0xFFEd2F02Ec860fFF1523375Fb253f0Bb0B7b2Efd'  # the testnet keeper, chosen at D3
     base = json.loads((root / 'deployments/manifest-5042002.json').read_text())
     chosen_manifest = dict(base, feeRecipient=keeper)
+    # The shipped testnet manifest names its keeper; a synthetic copy with the sentinel stands for a pending choice.
+    pending_manifest = dict(base, feeRecipient='REQUIRED_AT_D3_OWNER_GO')
 
     filler_code = creation_code(FILLER_ARTIFACT)
     validator_code = creation_code(VALIDATOR_ARTIFACT)
@@ -508,13 +511,17 @@ def selftest():
          must=['filler reactor'])
     case('fee differs', chosen_manifest, reactor_bc(), filler_bc(arguments=filler_args(fee=1)), False,
          must=['executionFee'])
-    case('keeper still a sentinel', base, reactor_bc(), filler_bc(), False, must=['not chosen'])
+    case('keeper still a sentinel', pending_manifest, reactor_bc(), filler_bc(), False, must=['not chosen'])
+    case('shipped testnet keeper', base, reactor_bc(), filler_bc(arguments=filler_args(recipient=testnet_keeper)),
+         True, must=[f'"feeRecipient": "{testnet_keeper}"'])
+    case('shipped testnet keeper, broadcast names another', base, reactor_bc(), filler_bc(), False,
+         must=['broadcast feeRecipient'])
     case('dry run', chosen_manifest, reactor_bc(), filler_bc(), False, must=['dry run'], dry_run=True)
     case('record exists', chosen_manifest, reactor_bc(), filler_bc(), False, must=['archive'], existing=True)
     anvil = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8'
-    case('rehearsal overrides', base, reactor_bc(tx={'arguments': [base['permit2'], anvil]}),
+    case('rehearsal overrides', pending_manifest, reactor_bc(tx={'arguments': [base['permit2'], anvil]}),
          filler_bc(arguments=filler_args(recipient=anvil)), True, extra=['--rehearsal'])
-    case('rehearsal with a non-anvil owner', base, reactor_bc(tx={'arguments': [base['permit2'], keeper]}),
+    case('rehearsal with a non-anvil owner', pending_manifest, reactor_bc(tx={'arguments': [base['permit2'], keeper]}),
          filler_bc(arguments=filler_args(recipient=anvil)), False, extra=['--rehearsal'], must=['anvil'])
     previous = {'chainId': 5042002, 'reactor': reactor, 'deployBlock': 100, 'reactorFeeOwner': base['reactorFeeOwner'],
                 'reactorFeeController': ZERO}
@@ -542,15 +549,23 @@ def selftest():
          extra=['--adopted-filler-block', '99'], must=['precedes reactor block'])
     case('adopted pair and a filler broadcast', chosen_manifest, reactor_bc(), filler_bc(), False,
          extra=['--adopted-filler-block', '150'], must=['exactly one of --filler-broadcast'])
-    case('adopted pair with the keeper still a sentinel', base, reactor_bc(), None, False,
+    case('adopted pair with the keeper still a sentinel', pending_manifest, reactor_bc(), None, False,
          extra=['--adopted-filler-block', '150'], must=['not chosen'])
     case('adopted pair with an operator keeper outside a rehearsal', chosen_manifest, reactor_bc(), None, False,
          extra=['--adopted-filler-block', '150', '--fee-recipient', keeper], must=['rehearsal only'])
-    case('rehearsal adoption', base, reactor_bc(tx={'arguments': [base['permit2'], anvil]}), None, True,
+    case('rehearsal adoption', pending_manifest, reactor_bc(tx={'arguments': [base['permit2'], anvil]}), None, True,
          extra=['--rehearsal', '--adopted-filler-block', '150', '--fee-recipient', anvil],
          must=['"fillerAdopted": true'])
-    case('rehearsal adoption without its keeper', base, reactor_bc(tx={'arguments': [base['permit2'], anvil]}), None,
+    case('rehearsal adoption without its keeper', pending_manifest, reactor_bc(tx={'arguments': [base['permit2'], anvil]}), None,
          False, extra=['--rehearsal', '--adopted-filler-block', '150'], must=['--fee-recipient'])
+    # The shipped testnet keeper is a checksummed, nonzero address; the mainnet manifest's keeper is still pending.
+    shipped = base['feeRecipient']
+    mainnet = json.loads((root / 'deployments/manifest-5042.json').read_text())
+    cases.append(('shipped testnet keeper is checksummed and chosen',
+                  shipped == testnet_keeper and is_address(shipped) and int(shipped, 16) != 0
+                  and checksum(shipped) == shipped, f'feeRecipient {shipped!r}', None))
+    cases.append(('mainnet keeper still a sentinel', mainnet['feeRecipient'] == 'REQUIRED_AT_MAINNET_OWNER_GO',
+                  f'feeRecipient {mainnet["feeRecipient"]!r}', None))
     with tempfile.TemporaryDirectory() as d:
         argv = [sys.executable, __file__, '--manifest', str(root / 'deployments/manifest-5042002.json'),
                 '--reactor-broadcast', 'x', '--filler-broadcast', 'y', '--rehearsal', '--source-revision', revision,

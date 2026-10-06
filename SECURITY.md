@@ -154,5 +154,6 @@ by the contract.
 
 An independent review was performed on 3 October 2026 (release report, section 18). A re-audit of 5 October 2026
 covered the early guard (section 19) and the on-chain order validation (section 20) and found no exploitable defect;
-its six Low and Info findings and their resolutions are in section 21. A focused re-audit of those fixes is pending. No
-professional third-party audit has been performed yet.
+its six Low and Info findings and their resolutions are in section 21. A focused re-audit of those fixes on 6 October
+2026 found one Low and three Info items in the tooling and tests, with no change to any contract; their fixes are also
+in section 21. No professional third-party audit has been performed yet.

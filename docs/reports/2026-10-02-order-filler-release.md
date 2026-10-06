@@ -166,7 +166,7 @@ See the appendix below for full details; section 12 supersedes it for the gate r
 
 ## 12. Final gate run for this packet
 
-Command: `bash script/check-contracts.sh` in `the contracts checkout` at HEAD `4be3452` before this report was committed. Exit code 0. Forge test (source of the 9-suite and per-suite duration figures in section 3): 9 suites, 67 passed, 0 failed, 3 skipped (70 total), seed `0x5042`. Snapshot check: 4 suites, 50 passed, 0 failed, 0 skipped. The `order_expiring.json` copy check printed its skip notice because `TRADE_VECTOR_BACKEND` and `TRADE_VECTOR_WEBUI` were not set in this shell. The `--stress` variant was not re-run for this packet.
+Command: `bash script/check-contracts.sh` in the repository root at HEAD `4be3452` before this report was committed. Exit code 0. Forge test (source of the 9-suite and per-suite duration figures in section 3): 9 suites, 67 passed, 0 failed, 3 skipped (70 total), seed `0x5042`. Snapshot check: 4 suites, 50 passed, 0 failed, 0 skipped. The `order_expiring.json` copy check printed its skip notice because `TRADE_VECTOR_BACKEND` and `TRADE_VECTOR_WEBUI` were not set in this shell. The `--stress` variant was not re-run for this packet.
 
 ## 13. Scope for the independent reviewer
 
@@ -807,7 +807,8 @@ cap and fee accounting on all four routes hold. It raised six findings, all Low 
 each one (C-04 downgraded from Low to Info). The fixes are commits `50bb26d`, `2092494` and `fa31012` from `93afe60`;
 this section, `SECURITY.md` and the runbook follow in the commit after `fa31012`. Nothing was broadcast and no
 transaction was sent to any network. Every deployment below ran on a loopback anvil fork, and `deployments/5042002.json`
-still does not exist. **A focused re-audit of these fixes is pending.**
+still does not exist. A focused re-audit of these fixes followed on 6 October 2026 ("Fix re-audit of 6 Oct 2026"
+below).
 
 | Finding | Resolution | Commit | Evidence |
 | --- | --- | --- | --- |
@@ -871,3 +872,39 @@ Open: the focused re-audit of these fixes; the order terms shown to traders must
 app's re-sign flow for a forced replacement (C-02) and the keeper and web app pool eligibility rule for native-currency
 pools (C-06) are requirements on those repositories, not yet evidenced here; and, unchanged, the go-step items of
 sections 18 and 20.
+
+### Fix re-audit of 6 Oct 2026
+
+A focused re-audit of `d210cff` against `93afe60` judged C-01, C-02 and C-06 accepted as documented and C-03 and C-05
+fixed. It rebuilt both commits from clean worktrees and found the filler and validator bytecode identical. It found
+C-04 partial and raised three new findings: N-01 (Low), N-02 and N-03 (Info). An adjudicator confirmed all four. The
+fixes are three commits after `d210cff`, each with a regression test that failed before its change. No file in `src/`
+changed, nothing was broadcast, and the only chain used was a loopback anvil.
+
+| Finding | Resolution | Commit | Evidence |
+| --- | --- | --- | --- |
+| C-04 partial and N-02 (Info): the C-04 regression test called `_requireReactor` with the pin as an argument and never ran `DeployOrderFiller.run()`. With `run()` reverted to `vm.envBytes32("TRADE_REACTOR_CODEHASH")`, all 29 tests still passed | `test_fillerRunUsesManifestReactorPin` runs `DeployOrderFiller.run()` end to end against the shipped testnet manifest with only the keeper filled in. The production `run()` path is unchanged: `TradeManifest._manifest()` becomes `virtual` so that a test harness can supply the fixture, and no script overrides it. A look-alike reactor (same `permit2()`, `owner()` and fee controller, built for the ArbSys branch) is refused `ReactorMismatch("codehash")` even when `TRADE_REACTOR_CODEHASH` names its hash. The genuine reactor passes the reactor check while the environment names the look-alike's hash, and the run stops at the next check, `NoCode("router")` | `c108507` | Mutation check: with `run()` switched back to the environment read, `DeployScriptsTest` gives 29 passed, 1 failed (the new test: the look-alike passed the reactor check and reached the router). Restored, 30 passed |
+| N-01 (Low): since `fa31012` the reactor builds in one profile, so a clean build writes `V3DutchOrderReactor.json` with no profile suffix. The verifier globbed `V3DutchOrderReactor.*.json` and found nothing, so on a clean checkout both preflights failed, the self-test failed and a live reactor check crashed. It passed only on stale 2 Oct artifacts | `reactor_artifacts()` reads exactly `out/V3DutchOrderReactor.sol/V3DutchOrderReactor.json`. It never reads profile-suffixed leftovers, and it refuses the artifact unless its metadata says via-IR with 200 optimizer runs, so a stale or differently configured build cannot reproduce the pin. A missing artifact is a clear refusal, not a crash. `verify_reactor` compares against that one artifact. `check-contracts.sh` runs `forge clean` before building | `0c48561` | New verifier self-test (part of `--self-test`, so of the gate). The artifact is found on a clean single-profile build and chosen over stale `.default` and `.small` files. A 44,444,444-run artifact is refused, and suffixed leftovers alone are refused. Against the old glob all four cases fail. Clean build check: a fresh copy of the tree (`git archive` plus the fix, no `out/` or `cache/`) was built with `--threads 2`, which wrote only `V3DutchOrderReactor.json`. There, `--preflight --allow-pending` passed for both manifests, reproducing the pin with function id `0x2`. `--self-test` passed, and `--self-test-reactor-flipped` reported the pointer mismatch. On a loopback `anvil --chain-id 5042002 --prune-history`, a reactor deployed from that artifact with the manifest permit2 and the testnet timelock passed `--reactor-only` at block 1 (MATCH 11,525 bytes, keccak equal to the pin, owner and fee controller as recorded). The pre-fix verifier on the same tree fails the preflight and the self-test and exits on the flipped test with "no V3DutchOrderReactor artifacts" |
+| N-03 (Info): an adopted-pair record named the reactor's sender as `deployer`, although someone else sent the filler's CREATE2. A `SECURITY.md` sentence about `--self-test` and `--preflight` mode had moved under the C-05 bullet | An adopted record has no `deployer` key. It carries `reactorDeployer`, the sender of the reactor's CREATE, and a later adoption on such a record reads it back. The runbook and the writer's docstring say so. The `SECURITY.md` sentence is back under the reproducible-bytecode bullet, and the C-05 bullet states what an adopted record carries | `3f9815f` | Record writer self-test 35/35, up from 34. Three cases require `reactorDeployer` and refuse any `deployer` key: adopted on a reactor broadcast, adopted on a recorded reactor, and adopted on a recorded adopted pair. Before the change 32/35 passed |
+
+#### Bytecode identity
+
+`forge inspect src/<file>:<contract> bytecode` and `deployedBytecode` were saved at `d210cff` before any change. They
+were saved again after the gate's `forge clean` rebuild at `3f9815f`, and `cmp` found them identical. The output
+`shasum -a 256` values are unchanged from the table above: filler creation `ac00c9f3…ec8e`, filler runtime
+`155b04c3…87dc`, validator creation `3ddfd93f…61d5`, validator runtime `d622f25c…e914`. The reactor pin
+`0xd7a5867b…7dcb` reproduces from the clean build. `foundry.toml` is unchanged.
+
+#### Gates at `3f9815f`
+
+`forge clean`, then `FOUNDRY_THREADS=2 TRADE_VECTOR_BACKEND=<backend copy> TRADE_VECTOR_WEBUI=<web app copy> bash
+script/check-contracts.sh`, which now runs `forge clean` itself, gave exit 0 in 4 min 20 s, from an empty `out/`.
+Upstream sources 110 and 34 match. The source manifest matches and `forge fmt --check` is clean. NatSpec: 54 ABI
+entries, 0 failures. Both preflights pass with the pin reproduced from `V3DutchOrderReactor.json`, and a pending
+choice is refused without `--allow-pending`. Every verifier self-test passes, including the new artifact cases. Record
+writer self-test 35/35. `forge test --fuzz-seed 0x5042`: 176 passed, 0 failed, 6 skipped across 18 suites
+(`DeployScriptsTest` 30). `order_expiring.json` is identical in the three places (`0bc97dd5…0e3a`). Snapshot check:
+129 passed, 1 skipped. The `--stress` run and the invariant campaigns were not repeated, because no contract bytecode
+changed.
+
+Open: an independent look at these three commits, and the items listed above that are unrelated to them.

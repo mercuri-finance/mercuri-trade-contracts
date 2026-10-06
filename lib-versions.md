@@ -36,10 +36,11 @@ for `V3DutchOrderReactor`. Sources are unchanged, accompanied by licenses and `s
 context remappings; deployed Mercurifi imports use their existing prefixes.
 
 The reactor and `src/MercuriOrderFiller.sol` are not deployed: no deployment record exists, and the testnet inputs in
-`deployments/manifest-5042002.json` still hold the owner-choice sentinels. The filler builds typed single-pool R1–R4
-swaps, enforces net output and full input consumption, and sends surplus to the signed trader. It is a release
-candidate with evidence in `docs/reports/2026-10-02-order-filler-release.md`: independently reviewed on 3 October 2026
-(section 18), re-audited with its validator on 5 October 2026 and its fixes on 6 October 2026 (section 21).
+`deployments/manifest-5042002.json` still hold the owner-choice sentinels. The filler builds typed single-pool swaps on
+its four routes (buy and sell, on Launch and on listed pools), enforces net output and full input consumption, and sends
+surplus to the signed trader. It is a release candidate with evidence in
+`docs/reports/2026-10-02-order-filler-release.md`: independently reviewed on 3 October 2026 (section 18), re-audited
+with its validator on 5 October 2026 and its fixes on 6 October 2026 (section 21).
 
 ## Reproducible source identity
 

@@ -6,20 +6,24 @@ its own new validator (spec D22). Signed orders do not move to the new pair: eac
 trader's signature, and that validator accepts only its own filler. Open orders stay fillable only through the old pair,
 by the old keeper key, until they expire (at most 30 days) or their traders sign again (spec R7).
 
-Nothing here authorises a broadcast. Each deployment is its own owner go, with `--account` or `--ledger`, testnet
-first.
+Spec codes (D22, R7 and the like) refer to the order triggers design,
+`docs/superpowers/specs/2026-10-02-trade-order-triggers-design.md` in the Mercurifi workspace; re-audit codes C-01 to
+C-06 refer to the release report, section 21.
+
+Nothing here authorizes a broadcast. Each deployment needs its own specific release authorization from the owner, with
+`--account` or `--ledger`, testnet first.
 
 ## When a new filler is needed
 
 | Trigger | Why it needs a new filler |
 | --- | --- |
-| A filler bug fix | The bytecode cannot change |
-| Keeper key rotation, planned or after a compromise; a lost keeper key; a keeper address that can no longer send transactions or receive USDC | `feeRecipient` is both the fee recipient and the only address allowed to call `fill`, fixed for the filler's life. Follow [Forced replacement](#forced-replacement-the-keeper-address-is-lost-or-blocked) |
-| An execution fee change | `executionFee` is an immutable, bounded by `MAX_EXECUTION_FEE` (0.10 USDC) |
-| A new Launch hook | `launchHook` is an immutable. Pools of any other hook take the listed-pool path: they pay the app fee and the trader loses Launch's referral credit |
-| A new route (another router entry point, more than one pool per fill) | The swap recipe is fixed in the filler |
-| A validator change (a new condition version or kind, another price source) | The validator is fixed for the filler's life and the filler names it |
-| A new app fee recipient | `appRecipient` is an immutable; it must stay Launch's treasury |
+| A filler bug fix | The bytecode cannot change. |
+| Keeper key rotation, planned or after a compromise; a lost keeper key; a keeper address that can no longer send transactions or receive USDC | `feeRecipient` is both the fee recipient and the only address allowed to call `fill`, fixed for the filler's life. Follow [Forced replacement](#forced-replacement-the-keeper-address-is-lost-or-blocked). |
+| An execution fee change | `executionFee` is an immutable, bounded by `MAX_EXECUTION_FEE` (0.10 USDC). |
+| A new Launch hook | `launchHook` is an immutable. Pools of any other hook take the listed-pool path: they pay the app fee and the trader loses Launch's referral credit. |
+| A new route (another router entry point, more than one pool per fill) | The swap recipe is fixed in the filler. |
+| A validator change (a new condition version or kind, another price source) | The validator is fixed for the filler's life and the filler names it. |
+| A new app fee recipient | `appRecipient` is an immutable; it must stay Launch's treasury. |
 
 A new reactor is a different, larger change: every open order must be signed again by its trader.
 
@@ -28,7 +32,7 @@ A new reactor is a different, larger change: every open order must be signed aga
 1. **Manifest.** Change only what the trigger needs in `deployments/manifest-<chainId>.json` (for a keeper rotation,
    `feeRecipient`), in a reviewed commit. Run `python3 script/verify-trade-filler.py --preflight` and
    `bash script/check-contracts.sh`; both must pass with no pending owner choice.
-2. **Rehearse.** On a loopback anvil fork of the target network, run the deployment with `TRADE_LOCAL_REHEARSAL=true`,
+2. **Rehearse.** On a loopback Anvil fork of the target network, run the deployment with `TRADE_LOCAL_REHEARSAL=true`,
    write the record with `script/write-trade-record.py --rehearsal --out-dir <scratch>` and verify it with
    `verify-trade-filler.py --rehearsal`. Nothing from the rehearsal goes into `deployments/`.
 3. **Deploy.** Keep the reactor. Run `script/DeployOrderFiller.s.sol` with `TRADE_REACTOR` from the current record.
@@ -42,11 +46,11 @@ A new reactor is a different, larger change: every open order must be signed aga
    `verify-trade-filler.py --reactor-only` before any filler is deployed against it.
 
    The standard deployer is permissionless and the filler's init code is public once the transaction is pending, so
-   someone can land the same pair first (re-audit C-05). The pair is then the one we would deploy, so it is safe, and
-   the operator's transaction reverts or is never needed. Run the script again: it finds the occupied address, checks
-   that the filler and validator runtimes are byte for byte the ones it would deploy, prints `ADOPTED` and broadcasts
-   nothing. Any other code at either address is refused (`DeploymentMismatch`, `NoCode` or `AlreadyDeployed`) and
-   needs investigation before anything else is sent.
+   someone can land the same pair first (re-audit C-05). The pair is then the one the script would deploy, so it is
+   safe, and the operator's transaction reverts or is never needed. Run the script again: it finds the occupied address,
+   checks that the filler and validator runtimes are byte for byte the ones it would deploy, prints `ADOPTED` and
+   broadcasts nothing. Any other code at either address is refused (`DeploymentMismatch`, `NoCode` or `AlreadyDeployed`)
+   and needs investigation before anything else is sent.
 4. **Record.** Archive the current `deployments/<chainId>.json` as `deployments/archive/<chainId>-<deployBlock>.json`,
    then run `script/write-trade-record.py --filler-broadcast broadcast/DeployOrderFiller.s.sol/<chainId>/run-latest.json
    --previous-record deployments/archive/<chainId>-<deployBlock>.json` (or `--reactor-broadcast` for a new reactor).
@@ -124,6 +128,6 @@ The cosigner address is in each signed order, so a new cosigner applies to order
    the web app puts it in new orders.
 2. Keep the old key available to the keeper only for orders signed with it, until they expire or are cancelled. After a
    compromise, do not wait: ask the affected traders to cancel (Permit2 `invalidateUnorderedNonces`) and sign again.
-   With the keeper key as well, the old cosigner key can fill their stored orders through our filler and signed pool
-   once each condition holds on chain, at no less than the signed minimum.
+   With the keeper key as well, the old cosigner key can fill their stored orders through the Mercurifi filler and
+   signed pool once each condition holds on chain, at no less than the signed minimum.
 3. No contract changes: the filler and the reactor do not store the cosigner.

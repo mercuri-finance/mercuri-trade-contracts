@@ -46,7 +46,7 @@ validator, which checks each order's signed condition on chain.
 ## Deployment
 
 None yet. Trade adds no deployed contract of its own today. The first will be the filler for the hosted keeper and the
-order validator it deploys, with our own pinned UniswapX reactor, on Arc testnet first. That needs its own review,
+order validator it deploys, with Trade's own pinned UniswapX reactor, on Arc testnet first. That needs its own review,
 deployment record and release evidence in this repository before orders open on either network. Mainnet will run its
 own reactor too, owned by Launch's timelock, never the existing Uniswap-owned one.
 
@@ -116,7 +116,7 @@ any hook other than the filler's `launchHook` are charged the app fee and lose L
 
 | Parameter | Value |
 | --- | --- |
-| App fee | 50 bps of the USDC side on listed pools (`APP_FEE_BPS`); none on Launch pools, which pay Launch's hook fee. On a buy it is computed on the gross signed input, which includes the execution fee |
+| App fee | 50 bps of the USDC side on listed pools (`APP_FEE_BPS`); none on Launch pools, which pay Launch's hook fee; on a buy, computed on the gross signed input, which includes the execution fee |
 | Execution fee | at most 0.10 USDC (`MAX_EXECUTION_FEE`); the testnet manifest sets 0.05 USDC; zero disables it |
 | Execution fee recipient | the keeper's transaction address, also the only address allowed to call `fill` |
 | App fee recipient | the treasury, the same one Launch uses |

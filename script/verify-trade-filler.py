@@ -57,6 +57,10 @@ EXPECTED_IMMUTABLES = {
     'reactor': {'permit2', POINTER},
 }
 FILLER_ARTIFACT = 'out/MercuriOrderFiller.sol/MercuriOrderFiller.json'
+# foundry.toml restricts script/DeployTestnetReactor.s.sol to the `small` profile, so the reactor is built once, with no
+# profile suffix in its artifact name.
+REACTOR_ARTIFACT = 'out/V3DutchOrderReactor.sol/V3DutchOrderReactor.json'
+REACTOR_OPTIMIZER_RUNS = 200
 VALIDATOR_ARTIFACT = 'out/MercuriOrderValidator.sol/MercuriOrderValidator.json'
 CREATE2_FACTORY = '0x4e59b44847b379578588920ca78fbf26c0b4956c'
 CREATE2_FACTORY_CODEHASH = '0x2fa86add0aed31f33a762c9d88e807c475bd51d0f52bd0955754b2608f7e4989'
@@ -213,8 +217,24 @@ def load(path):
     return json.loads((root / path).read_text())
 
 
-def reactor_artifacts():
-    return sorted((root / 'out/V3DutchOrderReactor.sol').glob('V3DutchOrderReactor.*.json'))
+def reactor_artifacts(out=None):
+    """The reactor step's artifact, as a one-element list.
+
+    foundry.toml builds script/DeployTestnetReactor.s.sol in the 200-run profile only, so forge writes the reactor once,
+    as V3DutchOrderReactor.json with no profile suffix. Profile-suffixed files (`.default.json`, `.small.json`) are
+    leftovers of an earlier two-profile build that the current configuration no longer produces, and are never read.
+    The artifact's own compiler settings must be via-IR with 200 optimizer runs, so a stale or differently configured
+    build is refused instead of reproducing the pin from code the reactor step would not deploy (fix re-audit N-01).
+    """
+    path = out / 'V3DutchOrderReactor.sol' / 'V3DutchOrderReactor.json' if out else root / REACTOR_ARTIFACT
+    if not path.exists():
+        raise SystemExit(f'no V3DutchOrderReactor artifact at {path.name}; run forge build (a clean build writes it)')
+    settings = (json.loads(path.read_text()).get('metadata') or {}).get('settings') or {}
+    runs = (settings.get('optimizer') or {}).get('runs')
+    if settings.get('viaIR') is not True or runs != REACTOR_OPTIMIZER_RUNS:
+        raise SystemExit(f'{path.name} (viaIR {settings.get("viaIR")!r}, runs {runs!r}) is not the via-IR '
+                         f'{REACTOR_OPTIMIZER_RUNS}-run reactor step; run forge clean and forge build')
+    return [path]
 
 
 def uint_word(value):
@@ -248,24 +268,17 @@ def validator_values(manifest, filler):
 
 
 def verify_reactor(args, manifest, owner, tag, live):
-    """The compiler profile is selected by forge, so try each built variant and accept an exact match."""
+    """The live reactor must equal the reactor step's built runtime (see `reactor_artifacts`) byte for byte."""
     word = address_word(manifest['permit2'])
     ctor = subprocess.run(
         ['cast', 'abi-encode', 'constructor(address,address)', manifest['permit2'], owner],
         capture_output=True, text=True, check=True,
     ).stdout.strip().removeprefix('0x')
-    first = None
-    for path in reactor_artifacts():
-        artifact = json.loads(path.read_text())
-        creation = '0x' + artifact['bytecode']['object'].removeprefix('0x') + ctor
-        simulated = bytes.fromhex(rpc_call(args.rpc, 'eth_call', [{'data': creation}, tag]).removeprefix('0x'))
-        expected, _ = expected_runtime(artifact, {'permit2': word}, 'reactor', simulated)
-        if expected == live:
-            return verify(f'reactor ({path.name})', 'reactor', artifact, {'permit2': word}, live, simulated)
-        first = first or (path, artifact, simulated)
-    path, artifact, simulated = first
-    verify(f'reactor ({path.name})', 'reactor', artifact, {'permit2': word}, live, simulated)
-    return False
+    (path,) = reactor_artifacts()
+    artifact = json.loads(path.read_text())
+    creation = '0x' + artifact['bytecode']['object'].removeprefix('0x') + ctor
+    simulated = bytes.fromhex(rpc_call(args.rpc, 'eth_call', [{'data': creation}, tag]).removeprefix('0x'))
+    return verify(f'reactor ({path.name})', 'reactor', artifact, {'permit2': word}, live, simulated)
 
 
 def is_bytes32(text):
@@ -278,8 +291,8 @@ def reproduce_reactor_pin(manifest):
     the id in its `_getBlockNumberish` pointer slots, hashes to the manifest's reactorCodeHash; None if none does.
 
     Offline there is no constructor to simulate, so every small id (the same bound the live check applies) is tried
-    for every built profile, lowest id first. The deploy script's test (`test_reactorCodeHashPinned`) shows that the
-    reactor step really deploys that runtime on both Arc chain ids.
+    for the reactor step's artifact, lowest id first. The deploy script's test (`test_reactorCodeHashPinned`) shows
+    that the reactor step really deploys that runtime on both Arc chain ids.
     """
     pin = str(manifest.get('reactorCodeHash', '')).lower()
     word = address_word(str(manifest.get('permit2', ZERO_ADDRESS)))
@@ -484,7 +497,7 @@ def simulated_reactor_runtime(artifact, permit2_word, pointer_id):
 
 
 def reactor_self_test(flip):
-    """Exercise the function-pointer path for every built reactor profile.
+    """Exercise the function-pointer path for the reactor step's artifact.
 
     Unmodified, the live code equals the simulation and must MATCH. With flip, one byte of the pointer slot in the
     live code differs from the simulation (a different compiler profile or a tampered runtime) and must MISMATCH.
@@ -493,8 +506,6 @@ def reactor_self_test(flip):
     manifest = load('deployments/manifest-5042002.json')
     word = address_word(manifest['permit2'])
     artifacts = reactor_artifacts()
-    if not artifacts:
-        raise SystemExit('no V3DutchOrderReactor artifacts in out/; run forge build')
     ok = True
     for path in artifacts:
         artifact = json.loads(path.read_text())
@@ -841,6 +852,46 @@ def adopted_self_test():
     return ok
 
 
+def reactor_artifact_self_test():
+    """Which reactor artifact the verifier reads (fix re-audit N-01). foundry.toml builds the reactor step in the 200-run
+    profile only, so a clean build writes one unsuffixed V3DutchOrderReactor.json. It must be found on its own, chosen
+    over profile-suffixed leftovers of an earlier two-profile build, and refused when its settings are not via-IR with
+    200 runs; suffixed leftovers alone are no artifact at all."""
+    import tempfile
+    real = json.loads(reactor_artifacts()[0].read_text())
+    other_profile = json.loads(json.dumps(real))
+    other_profile['metadata']['settings']['optimizer']['runs'] = 44444444
+    ok = True
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d)
+        folder = out / 'V3DutchOrderReactor.sol'
+        folder.mkdir()
+
+        def outcome():
+            try:
+                return [p.name for p in reactor_artifacts(out)]
+            except SystemExit as error:
+                return f'refused: {error}'
+
+        def expect(label, want):
+            nonlocal ok
+            got = outcome()
+            good = got == want if isinstance(want, list) else isinstance(got, str) and want in got
+            print(f'  {"PASS" if good else "FAIL"}  reactor artifact: {label} -> {got}')
+            ok &= good
+
+        (folder / 'V3DutchOrderReactor.json').write_text(json.dumps(real))
+        expect('clean single-profile build', ['V3DutchOrderReactor.json'])
+        (folder / 'V3DutchOrderReactor.default.json').write_text(json.dumps(other_profile))
+        (folder / 'V3DutchOrderReactor.small.json').write_text(json.dumps(real))
+        expect('stale profile-suffixed leftovers beside it', ['V3DutchOrderReactor.json'])
+        (folder / 'V3DutchOrderReactor.json').write_text(json.dumps(other_profile))
+        expect('artifact built with other optimizer runs', 'not the via-IR 200-run reactor step')
+        (folder / 'V3DutchOrderReactor.json').unlink()
+        expect('only suffixed leftovers', 'run forge build')
+    return ok
+
+
 def reactor_pin_self_test():
     """Both manifests' pins reproduce offline; the pinned runtime passes the live pin check, a flipped byte fails."""
     ok = True
@@ -910,6 +961,9 @@ def main():
             sys.exit(1)
         if not preflight_self_test():
             print('self-test FAILED: the manifest preflight did not behave as required')
+            sys.exit(1)
+        if not reactor_artifact_self_test():
+            print('self-test FAILED: the reactor artifact selection did not behave as required')
             sys.exit(1)
         if not reactor_pin_self_test():
             print('self-test FAILED: the reactor code hash pin did not behave as required')

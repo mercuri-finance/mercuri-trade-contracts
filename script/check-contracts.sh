@@ -10,6 +10,9 @@ fi
 
 python3 script/check-trade-sources.py
 python3 script/check-local-source.py
+# Every check below reads out/. Start from an empty one so no artifact the current configuration no longer builds (a
+# profile-suffixed reactor from an earlier two-profile build, say) can satisfy a check (fix re-audit N-01).
+forge clean
 bash script/build-trade-router.sh
 forge fmt --check
 forge build

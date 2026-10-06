@@ -197,8 +197,8 @@ section 18). A re-audit of 5 October 2026 covered the early guard (section 19) a
 (section 20) and found no exploitable defect; its findings, and a focused re-audit of their fixes on 6 October 2026,
 are in section 21.
 
-These reviews were not an audit by a security firm; no third-party audit has been performed yet. Weigh that before
-relying on the contracts. To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
+These were AI-assisted reviews, not an audit by a security firm; no third-party audit has been performed yet. Weigh
+that before relying on the contracts. To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## License
 

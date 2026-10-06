@@ -908,3 +908,17 @@ writer self-test 35/35. `forge test --fuzz-seed 0x5042`: 176 passed, 0 failed, 6
 changed.
 
 Open: an independent look at these three commits, and the items listed above that are unrelated to them.
+
+#### Style-conformance pass
+
+A second style pass on 6 October 2026 brought the NatSpec of `src/` and the deployment scripts, and the README,
+SECURITY.md, CONTRIBUTING.md, lib-versions.md, AGENTS.md, CLAUDE.md and the replacement runbook, into the form of the
+deployed Launch contracts (`contracts/launch`), measured from Launch's own sources. An independent reviewer compared
+both repositories line by line and passed the result in its third round. Comments, whitespace and declaration order
+changed; no code did. `forge inspect` creation and runtime bytecode of the filler and the validator, saved before the
+pass from a clean build and again after the gate's `forge clean` rebuild, are identical (`cmp`), with the `shasum -a
+256` values in the table above. NatSpec: 54 ABI entries, 0 failures; `forge fmt --check` clean; `source-manifest.json`
+updated for the three changed sources. The gate (`FOUNDRY_THREADS=2`, vector copies set) exited 0 in 250 s:
+`forge test --fuzz-seed 0x5042` 176 passed, 0 failed, 6 skipped; snapshot check 129 passed, 1 skipped; record writer
+self-test 35/35; `order_expiring.json` identical in the three places (`0bc97dd5…0e3a`). The README and lib-versions
+now also record the 5 and 6 October re-audits that this section already stated.

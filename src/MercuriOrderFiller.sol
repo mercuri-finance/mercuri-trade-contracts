@@ -65,13 +65,13 @@ contract MercuriOrderFiller is IReactorCallback {
     ///      reduces the trader's signed minimum, and zero disables the transfer.
     uint256 public immutable executionFee;
     /// @notice Recipient of the execution fee: the keeper's transaction address, fixed for this filler's life.
-    /// @dev Also the only address allowed to call `fill`. The pool is not the reason: the callback swaps only through
-    ///      the pool the trader signed, whoever calls. Only this filler can settle an order (its validator refuses any
-    ///      other), so an open `fill` would let anyone take a cosigned order from the mempool and, in one transaction,
-    ///      push the signed pool's price (through a take-profit or stop-loss trigger, or just against a limit), fill
-    ///      there down to the signed minimum and restore the price: a risk-free sandwich that the keeper's off-chain
-    ///      six-block hold cannot stop, because it happens inside one transaction. It would also let copiers race the
-    ///      keeper's own fill transaction and leave the keeper paying for the reverted one.
+    /// @dev Also the only address allowed to call `fill`. Only this filler can settle an order (its validator refuses
+    ///      any other), so an open `fill` would let anyone take a cosigned order from the mempool and, in one
+    ///      transaction, push the signed pool's price (through a take-profit or stop-loss trigger, or just against a
+    ///      limit), fill there down to the signed minimum and restore the price: a risk-free sandwich that the keeper's
+    ///      off-chain six-block hold cannot stop, because it happens inside one transaction. It would also let copiers
+    ///      race the keeper's own fill transaction and leave the keeper paying for the reverted one. Routing is not the
+    ///      concern: the callback swaps only through the pool the trader signed, whoever calls.
     address public immutable feeRecipient;
     /// @notice Order validator every order must name; it accepts no other filler.
     /// @dev Deployed by the constructor with CREATE2 from this address with `VALIDATOR_SALT`, bound to this filler and

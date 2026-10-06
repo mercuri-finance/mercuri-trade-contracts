@@ -17,10 +17,20 @@ is the validator, at the CREATE2 address from the filler with `VALIDATOR_SALT` a
 with `(filler, poolManager)`. The constructor arguments must equal the manifest. Anything else is refused and nothing
 is written. A dry run (`dry-run/`, no receipts) is refused.
 
+The standard deployer is permissionless, so someone can replay the filler's init code before the operator's
+transaction lands (re-audit C-05). DeployOrderFiller then adopts the pair, broadcasts nothing and leaves no filler
+broadcast to read. `--adopted-filler-block N` records that pair instead: the filler is the CREATE2 address of the built
+filler with the manifest's arguments (the recorded reactor and the manifest's keeper), the validator is its CREATE2
+deployment, `fillerDeployBlock` is N, the block in which the pair appeared, and the record carries
+`fillerAdopted: true`. Nothing here reads the chain: verify-trade-filler.py at block N then requires every byte of
+both runtimes to match and the filler to have had no code at block N - 1, so a wrong N or a different pair is refused.
+
   python3 script/write-trade-record.py --reactor-broadcast FILE --filler-broadcast FILE [--manifest FILE]
                                        [--out-dir deployments] [--source-revision SHA]
   python3 script/write-trade-record.py --filler-broadcast FILE --previous-record FILE   # a replacement filler on
                                                                                         # the recorded reactor
+  python3 script/write-trade-record.py --reactor-broadcast FILE --adopted-filler-block N   # (or --previous-record)
+                                       # a pair someone else landed first; verify it at block N before trusting it
   python3 script/write-trade-record.py ... --rehearsal --out-dir DIR    # loopback anvil rehearsal: overrides allowed,
                                                                         # never into deployments/
   python3 script/write-trade-record.py --self-test
@@ -183,7 +193,7 @@ def chosen(manifest, key, value, rehearsal):
 def build(args, manifest, revision):
     chain = manifest['chainId']
     if args.reactor_broadcast:
-        reactor, block, _, reactor_args, _ = completed_create(
+        reactor, block, reactor_deployer, reactor_args, _ = completed_create(
             args.reactor_broadcast, 'V3DutchOrderReactor', chain, revision)
         if len(reactor_args) != 2:
             raise Refused(f'reactor constructor arguments {reactor_args} are not (permit2, owner)')
@@ -196,11 +206,14 @@ def build(args, manifest, revision):
         if previous.get('chainId') != chain:
             raise Refused(f'previous record chainId {previous.get("chainId")} != manifest {chain}')
         reactor, block = previous['reactor'], int(previous['deployBlock'])
+        reactor_deployer = previous.get('deployer')
         owner, controller = previous['reactorFeeOwner'], previous['reactorFeeController']
         if not args.rehearsal and not same(owner, manifest.get('reactorFeeOwner')):
             raise Refused(f'previous record reactorFeeOwner {owner} != manifest {manifest.get("reactorFeeOwner")}')
         if not same(controller, manifest.get('reactorFeeController', ZERO)):
             raise Refused(f'previous record reactorFeeController {controller} != manifest')
+    if args.adopted_filler_block is not None:
+        return adopted(args, manifest, revision, chain, reactor, block, reactor_deployer, owner, controller)
     filler, filler_block, deployer, filler_args, filler_tx = completed_create(
         args.filler_broadcast, 'MercuriOrderFiller', chain, revision)
     if len(filler_args) != 9:
@@ -259,6 +272,59 @@ def build(args, manifest, revision):
     }
 
 
+def adopted(args, manifest, revision, chain, reactor, block, deployer, owner, controller):
+    """The record for a pair that someone else landed by replaying the filler's init code (re-audit C-05).
+
+    Every address follows from the build and the manifest, so nothing is taken from the copier's transaction. The
+    verifier must then prove the bytes on chain at `fillerDeployBlock`.
+    """
+    filler_block = args.adopted_filler_block
+    if filler_block < block:
+        raise Refused(f'adopted filler block {filler_block} precedes reactor block {block}')
+    fee = manifest.get('executionFee')
+    if type(fee) is not int:
+        raise Refused(f'manifest executionFee is not chosen ({fee!r}); no record for a deployment that skipped it')
+    if args.rehearsal:
+        if not is_address(args.fee_recipient):
+            raise Refused('a rehearsal adoption needs --fee-recipient, the anvil account the rehearsal keeper used')
+        recipient = chosen(manifest, 'feeRecipient', args.fee_recipient, True)
+    else:
+        if args.fee_recipient is not None:
+            raise Refused('--fee-recipient is for a rehearsal only; the keeper is the manifest feeRecipient')
+        recipient = chosen(manifest, 'feeRecipient', str(manifest.get('feeRecipient')), False)
+    if not is_address(deployer):
+        raise Refused(f'no deployer for the release (reactor deployer {deployer!r})')
+    arguments = [reactor, manifest['router'], manifest['permit2'], manifest['usdc'], manifest['launchHook'],
+                 manifest['appRecipient'], str(fee), recipient, manifest['poolManager']]
+    init = creation_code(FILLER_ARTIFACT) + b''.join(word(a) for a in arguments)
+    filler = checksum(create2_address(CREATE2_FACTORY, FILLER_SALT, init))
+    validator = validator_address(filler, manifest['poolManager'])
+    if not is_address(controller):
+        raise Refused(f'reactorFeeController {controller!r} is not an address')
+    return {
+        'appRecipient': checksum(manifest['appRecipient']),
+        'chainId': chain,
+        'deployBlock': block,
+        'deployer': checksum(deployer),
+        'executionFee': fee,
+        'feeRecipient': checksum(recipient),
+        'filler': filler,
+        'fillerAdopted': True,
+        'fillerDeployBlock': filler_block,
+        'launchHook': checksum(manifest['launchHook']),
+        'permit2': checksum(manifest['permit2']),
+        'poolManager': checksum(manifest['poolManager']),
+        'reactor': checksum(reactor),
+        'reactorFeeController': checksum(controller),
+        'reactorFeeOwner': checksum(owner),
+        'router': checksum(manifest['router']),
+        'sourceRevision': revision,
+        'usdc': checksum(manifest['usdc']),
+        'validator': checksum(validator),
+        'version': VERSION,
+    }
+
+
 def source_revision(args):
     if args.source_revision:
         return args.source_revision
@@ -273,6 +339,8 @@ def source_revision(args):
 def write(args):
     if bool(args.reactor_broadcast) == bool(args.previous_record):
         raise Refused('give exactly one of --reactor-broadcast and --previous-record')
+    if bool(args.filler_broadcast) == (args.adopted_filler_block is not None):
+        raise Refused('give exactly one of --filler-broadcast and --adopted-filler-block')
     out_dir = Path(args.out_dir).resolve()
     if args.rehearsal and out_dir == (root / 'deployments').resolve():
         raise Refused('a rehearsal record never goes into deployments/; pass --out-dir')
@@ -367,10 +435,11 @@ def selftest():
             if previous is not None:
                 (d / 'prev.json').write_text(json.dumps(previous))
                 argv += ['--previous-record', str(d / 'prev.json')]
-            fpath = d / ('dry-run' if dry_run else '.') / 'f.json'
-            fpath.parent.mkdir(exist_ok=True)
-            fpath.write_text(json.dumps(fbc))
-            argv += ['--filler-broadcast', str(fpath)]
+            if fbc is not None:
+                fpath = d / ('dry-run' if dry_run else '.') / 'f.json'
+                fpath.parent.mkdir(exist_ok=True)
+                fpath.write_text(json.dumps(fbc))
+                argv += ['--filler-broadcast', str(fpath)]
             if existing:
                 (d / 'out').mkdir()
                 (d / 'out' / '5042002.json').write_text('{}\n')
@@ -445,6 +514,29 @@ def selftest():
                 'reactorFeeController': ZERO}
     case('replacement filler on the recorded reactor', chosen_manifest, None,
          filler_bc(receipt={'blockNumber': hex(500)}), True, previous=previous, must=['"fillerDeployBlock": 500'])
+    # C-05: a pair someone else landed first. Its addresses are the ones our own broadcast would have recorded.
+    own = filler_bc()['transactions'][0]
+    own_filler = checksum(own['contractAddress'])
+    own_validator = checksum(own['additionalContracts'][0]['address'])
+    case('adopted pair', chosen_manifest, reactor_bc(), None, True, extra=['--adopted-filler-block', '150'],
+         must=['"fillerAdopted": true', '"fillerDeployBlock": 150', f'"filler": "{own_filler}"',
+               f'"validator": "{own_validator}"', '"deployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"'])
+    case('adopted pair on the recorded reactor', chosen_manifest, None, None, True,
+         previous=dict(previous, deployer='0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266'),
+         extra=['--adopted-filler-block', '600'], must=['"fillerAdopted": true', '"fillerDeployBlock": 600'])
+    case('adopted pair before the reactor', chosen_manifest, reactor_bc(), None, False,
+         extra=['--adopted-filler-block', '99'], must=['precedes reactor block'])
+    case('adopted pair and a filler broadcast', chosen_manifest, reactor_bc(), filler_bc(), False,
+         extra=['--adopted-filler-block', '150'], must=['exactly one of --filler-broadcast'])
+    case('adopted pair with the keeper still a sentinel', base, reactor_bc(), None, False,
+         extra=['--adopted-filler-block', '150'], must=['not chosen'])
+    case('adopted pair with an operator keeper outside a rehearsal', chosen_manifest, reactor_bc(), None, False,
+         extra=['--adopted-filler-block', '150', '--fee-recipient', keeper], must=['rehearsal only'])
+    case('rehearsal adoption', base, reactor_bc(tx={'arguments': [base['permit2'], anvil]}), None, True,
+         extra=['--rehearsal', '--adopted-filler-block', '150', '--fee-recipient', anvil],
+         must=['"fillerAdopted": true'])
+    case('rehearsal adoption without its keeper', base, reactor_bc(tx={'arguments': [base['permit2'], anvil]}), None,
+         False, extra=['--rehearsal', '--adopted-filler-block', '150'], must=['--fee-recipient'])
     with tempfile.TemporaryDirectory() as d:
         argv = [sys.executable, __file__, '--manifest', str(root / 'deployments/manifest-5042002.json'),
                 '--reactor-broadcast', 'x', '--filler-broadcast', 'y', '--rehearsal', '--source-revision', revision,
@@ -472,12 +564,15 @@ def main():
     parser.add_argument('--out-dir', default=str(root / 'deployments'))
     parser.add_argument('--source-revision', help='full commit SHA; default: git HEAD of a clean tree')
     parser.add_argument('--rehearsal', action='store_true', help='loopback anvil rehearsal: anvil owner overrides')
+    parser.add_argument('--adopted-filler-block', type=int,
+                        help='record the pair someone else landed first, which appeared in this block (C-05)')
+    parser.add_argument('--fee-recipient', help='with --rehearsal and --adopted-filler-block: the rehearsal keeper')
     parser.add_argument('--self-test', action='store_true')
     args = parser.parse_args()
     if args.self_test:
         selftest()
-    if not args.filler_broadcast:
-        parser.error('--filler-broadcast is required')
+    if not args.filler_broadcast and args.adopted_filler_block is None:
+        parser.error('--filler-broadcast or --adopted-filler-block is required')
     try:
         write(args)
     except Refused as error:

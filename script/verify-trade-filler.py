@@ -23,9 +23,16 @@ eth_call.
   python3 script/verify-trade-filler.py --self-test                             # offline, no network
 
 Every live run first runs the preflight: the manifest's permit2, USDC, Launch hook, app fee recipient (Launch's
-treasury) and reactor fee owner (Launch's timelock) must equal Launch's deployment record for the chain, and its
-routerCodeHash must be the reproduced router runtime whose PERMIT2 immutable holds the manifest permit2. The live run
-then reads the router at the pinned block and requires that code hash and those PERMIT2 bytes.
+treasury) and reactor fee owner (Launch's timelock) must equal Launch's deployment record for the chain, its
+routerCodeHash must be the reproduced router runtime whose PERMIT2 immutable holds the manifest permit2, and its
+reactorCodeHash must be the built reactor's runtime with the manifest permit2 and a small via-IR function id. The live
+run then reads the router at the pinned block and requires that code hash and those PERMIT2 bytes, and requires the
+reactor's runtime, reproduced byte for byte, to hash to reactorCodeHash. The reactor hash is never operator input.
+
+Who sent the filler's CREATE2 does not matter here: the standard deployer is permissionless, and a pair that someone
+else landed first by replaying the init code is accepted exactly when every byte matches (spec D22, re-audit C-05).
+A record written for such an adopted pair carries `fillerAdopted: true`; the live run then also requires the filler to
+have had no code one block before `fillerDeployBlock`, so the recorded block is the one in which the pair appeared.
   python3 script/verify-trade-filler.py --self-test-reactor-flipped             # offline; must report MISMATCH
 """
 import argparse
@@ -259,6 +266,39 @@ def verify_reactor(args, manifest, owner, tag, live):
     path, artifact, simulated = first
     verify(f'reactor ({path.name})', 'reactor', artifact, {'permit2': word}, live, simulated)
     return False
+
+
+def is_bytes32(text):
+    return (isinstance(text, str) and len(text) == 66 and text[:2] == '0x'
+            and all(c in '0123456789abcdefABCDEF' for c in text[2:]))
+
+
+def reproduce_reactor_pin(manifest):
+    """The (artifact name, function id) whose reactor runtime, with the manifest permit2 in its permit2 immutable and
+    the id in its `_getBlockNumberish` pointer slots, hashes to the manifest's reactorCodeHash; None if none does.
+
+    Offline there is no constructor to simulate, so every small id (the same bound the live check applies) is tried
+    for every built profile, lowest id first. The deploy script's test (`test_reactorCodeHashPinned`) shows that the
+    reactor step really deploys that runtime on both Arc chain ids.
+    """
+    pin = str(manifest.get('reactorCodeHash', '')).lower()
+    word = address_word(str(manifest.get('permit2', ZERO_ADDRESS)))
+    artifacts = [(path.name, json.loads(path.read_text())) for path in reactor_artifacts()]
+    for pointer_id in range(0x100):
+        for name, artifact in artifacts:
+            if cast_keccak(simulated_reactor_runtime(artifact, word, pointer_id)).lower() == pin:
+                return name, pointer_id
+    return None
+
+
+def check_reactor_pin(live, manifest, label):
+    """A live reactor runtime is accepted only when its keccak is the manifest's reactorCodeHash."""
+    keccak = cast_keccak(live)
+    if keccak.lower() != str(manifest.get('reactorCodeHash', '')).lower():
+        print(f'{label}: reactor code hash {keccak} != manifest reactorCodeHash {manifest.get("reactorCodeHash")}')
+        return False
+    print(f'{label}: reactor code hash {keccak} is the manifest reactorCodeHash')
+    return True
 
 
 def required_owner(manifest, deployment):
@@ -589,6 +629,16 @@ def preflight(manifest, rehearsal=False):
         problems.append(f'manifest feeRecipient is not a nonzero address: {recipient!r}')
     if not is_address(manifest.get('reactorFeeController', ZERO_ADDRESS)):
         problems.append(f'manifest reactorFeeController is not an address: {manifest.get("reactorFeeController")!r}')
+    pin = manifest.get('reactorCodeHash')
+    if not is_bytes32(pin) or int(pin, 16) == 0:
+        problems.append(f'manifest reactorCodeHash is not a nonzero 32-byte hash: {pin!r}')
+    elif is_address(manifest.get('permit2')):
+        found = reproduce_reactor_pin(manifest)
+        if found is None:
+            problems.append(f'manifest reactorCodeHash {pin} is not the built reactor with the manifest permit2')
+        else:
+            print(f'preflight {chain}: reactorCodeHash {pin} reproduced from {found[0]} with the manifest permit2 '
+                  f'and function id {found[1]:#x}')
     try:
         runtime, offsets, network, immutables = router_runtime(chain)
         if hashlib.sha256(runtime).hexdigest() != network['contracts']['router']['sha256']:
@@ -664,12 +714,18 @@ def preflight_self_test():
     cases = {key: other for key in ('permit2', 'usdc', 'launchHook', 'poolManager', 'appRecipient', 'reactorFeeOwner',
                                     'router')}
     cases.update(routerCodeHash='0x' + '11' * 32, executionFee=100_001, feeRecipient='0x' + '0' * 40,
-                 reactorFeeController='none', chainId=1)
+                 reactorFeeController='none', chainId=1, reactorCodeHash='0x' + '11' * 32)
     mainnet_owner = load(f'{LAUNCH_RECORDS}/5042.json')['timelock']
-    tampered_cases = list(cases.items()) + [('reactorFeeOwner', mainnet_owner)]
+    # The router's code hash as the reactor's, a zero hash, a non-hash and a missing pin are refused too (C-04).
+    tampered_cases = list(cases.items()) + [('reactorFeeOwner', mainnet_owner),
+                                            ('reactorCodeHash', base['routerCodeHash']),
+                                            ('reactorCodeHash', '0x' + '0' * 64), ('reactorCodeHash', 'none'),
+                                            ('reactorCodeHash', None)]
     for key, value in tampered_cases:
         manifest = copy.deepcopy(base)
         manifest[key] = value
+        if value is None:
+            del manifest[key]
         problems, _ = preflight(manifest)
         if not problems:
             print(f'tampered {key}={value!r}: NOT refused')
@@ -752,6 +808,57 @@ def check_binding(rpc, tag, manifest, deployment, fee_recipient, factory_code):
     return ok
 
 
+def check_adopted(deployment, block, get_code):
+    """An adopted pair (`fillerAdopted: true`) must be verified at its recorded `fillerDeployBlock`, and the filler
+    must have had no code one block earlier, so the record names the block in which the pair appeared."""
+    if deployment.get('fillerAdopted') is not True:
+        print(f'deployment fillerAdopted is {deployment.get("fillerAdopted")!r}, not true')
+        return False
+    recorded = deployment.get('fillerDeployBlock')
+    if type(recorded) is not int or recorded != block:
+        print(f'adopted pair: verify at fillerDeployBlock {recorded!r}, not block {block}')
+        return False
+    before = str(get_code(deployment['filler'], block - 1)).removeprefix('0x')
+    if before:
+        print(f'adopted pair: the filler already had code at block {block - 1}; fillerDeployBlock is not its block')
+        return False
+    print(f'adopted pair: the filler appeared in block {block} (no code at {block - 1})')
+    return True
+
+
+def adopted_self_test():
+    """The adopted-pair block check accepts the creation block and refuses any later or mismatched block."""
+    filler = '0x00000000000000000000000000000000000000f1'
+
+    def chain(address, block):
+        return '0x' if block < 100 else '0x6080'
+
+    good = {'filler': filler, 'fillerAdopted': True, 'fillerDeployBlock': 100}
+    ok = check_adopted(good, 100, chain)
+    ok &= not check_adopted(dict(good, fillerDeployBlock=101), 101, chain)  # code existed before 101
+    ok &= not check_adopted(good, 101, chain)  # verified at another block than recorded
+    ok &= not check_adopted(dict(good, fillerAdopted='yes'), 100, chain)
+    return ok
+
+
+def reactor_pin_self_test():
+    """Both manifests' pins reproduce offline; the pinned runtime passes the live pin check, a flipped byte fails."""
+    ok = True
+    for path in ('deployments/manifest-5042002.json', 'deployments/manifest-5042.json'):
+        manifest = load(path)
+        found = reproduce_reactor_pin(manifest)
+        if found is None:
+            print(f'{path}: reactorCodeHash NOT reproduced')
+            return False
+        name, pointer_id = found
+        artifact = json.loads((root / 'out/V3DutchOrderReactor.sol' / name).read_text())
+        live = bytearray(simulated_reactor_runtime(artifact, address_word(manifest['permit2']), pointer_id))
+        ok &= check_reactor_pin(bytes(live), manifest, f'{path} pinned reactor')
+        live[len(live) // 2] ^= 0x01
+        ok &= not check_reactor_pin(bytes(live), manifest, f'{path} reactor with one byte flipped')
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--rpc', default=DEFAULT_RPC)
@@ -804,13 +911,19 @@ def main():
         if not preflight_self_test():
             print('self-test FAILED: the manifest preflight did not behave as required')
             sys.exit(1)
+        if not reactor_pin_self_test():
+            print('self-test FAILED: the reactor code hash pin did not behave as required')
+            sys.exit(1)
+        if not adopted_self_test():
+            print('self-test FAILED: the adopted-pair block check did not behave as required')
+            sys.exit(1)
         sets = immutable_set_self_test()
         reactor_good = reactor_self_test(False)
         reactor_bad = reactor_self_test(True)
         if not good or bad or not sets or not reactor_good or reactor_bad:
             print('self-test FAILED: verifier did not behave as required')
             sys.exit(1)
-        print('self-test ok: unmodified runtimes match; a flipped filler usdc, executionFee, feeRecipient or validator byte, a flipped validator filler or poolManager byte and a flipped reactor function-pointer byte are rejected; the CREATE2 formula reproduces EIP-1014; the reactor feeController check and the manifest preflight refuse every tampered value')
+        print('self-test ok: unmodified runtimes match; a flipped filler usdc, executionFee, feeRecipient or validator byte, a flipped validator filler or poolManager byte and a flipped reactor function-pointer byte are rejected; the CREATE2 formula reproduces EIP-1014; the reactor code hash pin reproduces and refuses a flipped byte; the adopted-pair block check holds; the reactor feeController check and the manifest preflight refuse every tampered value')
         return
     if args.preflight:
         sys.exit(0 if run_preflight(load(args.manifest), CHOICES if args.allow_pending else ()) else 1)
@@ -841,7 +954,12 @@ def main():
         return bytes.fromhex(rpc_call(args.rpc, 'eth_getCode', [address, tag]).removeprefix('0x'))
 
     owner = rehearsal_choice(deployment, 'reactorFeeOwner') if args.rehearsal else required_owner(manifest, deployment)
-    ok = verify_reactor(args, manifest, owner, tag, code(deployment['reactor']))
+    reactor_code = code(deployment['reactor'])
+    ok = verify_reactor(args, manifest, owner, tag, reactor_code)
+    ok &= check_reactor_pin(reactor_code, manifest, f'reactor at block {args.block}')
+    if not args.reactor_only and deployment.get('fillerAdopted') is not None:
+        ok &= check_adopted(deployment, args.block, lambda address, block: rpc_call(
+            args.rpc, 'eth_getCode', [address, hex(block)]))
     if not args.reactor_only:
         if args.rehearsal:
             fee_recipient = rehearsal_choice(deployment, 'feeRecipient')

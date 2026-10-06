@@ -9,6 +9,7 @@
   "appRecipient": "0x34E3321e97BBa4F5c7A0aCc6b09C50bE9173912D",
   "reactorFeeOwner": "0x94aFdf4cF8fD025E8421C936f5647a175515eb40",
   "reactorFeeController": "0x0000000000000000000000000000000000000000",
+  "reactorCodeHash": "0xd7a5867bd6bea358f040527c10ba7ab2e76ce071e7b7be6181b26a0c1e7e7dcb",
   "executionFee": "REQUIRED_AT_MAINNET_OWNER_GO",
   "feeRecipient": "REQUIRED_AT_MAINNET_OWNER_GO"
 }

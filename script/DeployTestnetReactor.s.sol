@@ -8,8 +8,9 @@ import {TradeManifest} from "./TradeManifest.sol";
 
 /// @notice Deploys the pinned UniswapX V3 Dutch reactor on Arc testnet. Contains no key: pass `--account` or
 ///         `--ledger`.
-/// @dev After deployment the reactor must report the manifest's fee owner and protocol fee controller (zero unless
-///      the manifest names one), or the run reverts before anything is broadcast.
+/// @dev After deployment the reactor must have the manifest's runtime code hash (`reactorCodeHash`) and report the
+///      manifest's fee owner and protocol fee controller (zero unless the manifest names one), or the run reverts
+///      before anything is broadcast.
 contract DeployTestnetReactor is TradeManifest {
     function run() external returns (V3DutchOrderReactor reactor) {
         _requireTestnet();
@@ -20,12 +21,13 @@ contract DeployTestnetReactor is TradeManifest {
         address feeOwner = _reactorFeeOwner(manifest);
         _requireTimelockOwner(feeOwner, launchRecord, _rehearsal());
         address feeController = _reactorFeeController(manifest);
+        bytes32 codeHash = _reactorCodeHash(manifest);
         _requireCode("permit2", permit2);
 
         vm.startBroadcast();
-        reactor = new V3DutchOrderReactor(IPermit2(permit2), feeOwner);
+        reactor = _newReactor(permit2, feeOwner);
         vm.stopBroadcast();
-        _requireDeployedReactor(reactor, feeOwner, feeController);
+        _requireDeployedReactor(reactor, feeOwner, feeController, codeHash);
 
         console2.log("permit2", permit2);
         console2.log("reactorFeeOwner", feeOwner);
@@ -33,12 +35,21 @@ contract DeployTestnetReactor is TradeManifest {
         console2.log("reactor", address(reactor));
     }
 
-    /// @dev The reactor as deployed must have the chosen owner and fee controller. Forge simulates the whole script
-    ///      before broadcasting, so a failure here sends nothing.
-    function _requireDeployedReactor(V3DutchOrderReactor reactor, address feeOwner, address feeController)
-        internal
-        view
-    {
+    /// @dev The one reactor deployment, with the creation code this script was built with.
+    function _newReactor(address permit2, address feeOwner) internal returns (V3DutchOrderReactor) {
+        return new V3DutchOrderReactor(IPermit2(permit2), feeOwner);
+    }
+
+    /// @dev The reactor as deployed must have the pinned runtime and the chosen owner and fee controller, so a build
+    ///      that would deploy other reactor code (another compiler profile, say) fails here instead of at the filler
+    ///      step. Forge simulates the whole script before broadcasting, so a failure here sends nothing.
+    function _requireDeployedReactor(
+        V3DutchOrderReactor reactor,
+        address feeOwner,
+        address feeController,
+        bytes32 codeHash
+    ) internal view {
+        if (address(reactor).codehash != codeHash) revert ReactorMismatch("codehash");
         if (reactor.owner() != feeOwner) revert ReactorMismatch("owner");
         if (address(reactor.feeController()) != feeController) revert ReactorMismatch("feeController");
     }

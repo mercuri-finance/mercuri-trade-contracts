@@ -40,6 +40,7 @@ abstract contract TradeManifest is Script {
     error Create2FactoryMismatch(bytes32 codeHash);
     error AlreadyDeployed(address account);
     error DeploymentMismatch(string what);
+    error ReactorCodeHashNotPinned();
 
     /// @dev Refuses any chain other than Arc testnet. A local fork must keep chain id 5042002.
     function _requireTestnet() internal view {
@@ -104,6 +105,16 @@ abstract contract TradeManifest is Script {
     function _requireRouter(address router, string memory manifest) internal view {
         if (router.code.length == 0) revert NoCode("router", router);
         if (router.codehash != vm.parseJsonBytes32(manifest, ".routerCodeHash")) revert RouterMismatch("codehash");
+    }
+
+    /// @dev The reactor's runtime keccak pinned in the manifest's `reactorCodeHash`. The runtime is deterministic per
+    ///      chain: its only immutables are the manifest permit2 and a via-IR function id fixed by the build and by the
+    ///      chain id (Arbitrum One and Robinhood Chain aside, which Arc is not). `test_reactorCodeHashPinned` deploys
+    ///      the reactor with this script and requires its code hash to equal the pin for both Arc networks, and
+    ///      `verify-trade-filler.py --preflight` reproduces the pin from the built reactor and the manifest permit2.
+    function _reactorCodeHash(string memory manifest) internal pure returns (bytes32 codeHash) {
+        codeHash = vm.parseJsonBytes32(manifest, ".reactorCodeHash");
+        if (codeHash == bytes32(0)) revert ReactorCodeHashNotPinned();
     }
 
     function _requireCode(string memory name, address account) internal view {

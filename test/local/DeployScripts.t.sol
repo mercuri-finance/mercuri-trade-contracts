@@ -89,12 +89,27 @@ contract FillerHarness is DeployOrderFiller {
     function requireCreate2Factory() external view {
         _requireCreate2Factory();
     }
+
+    function fillerInitCode(FillerArgs memory a) external pure returns (bytes memory) {
+        return _fillerInitCode(a);
+    }
+
+    function reactorCodeHash(string memory manifest) external pure returns (bytes32) {
+        return _reactorCodeHash(manifest);
+    }
 }
 
 /// @dev Exposes the reactor script's post-deployment check.
 contract ReactorHarness is DeployTestnetReactor {
-    function requireDeployed(V3DutchOrderReactor reactor, address feeOwner, address feeController) external view {
-        _requireDeployedReactor(reactor, feeOwner, feeController);
+    function requireDeployed(V3DutchOrderReactor reactor, address feeOwner, address feeController, bytes32 codeHash)
+        external
+        view
+    {
+        _requireDeployedReactor(reactor, feeOwner, feeController, codeHash);
+    }
+
+    function newReactor(address permit2, address feeOwner) external returns (V3DutchOrderReactor) {
+        return _newReactor(permit2, feeOwner);
     }
 }
 
@@ -234,8 +249,111 @@ contract DeployScriptsTest is Test {
         // Any change to an argument moves both addresses.
         (address otherFiller, address otherValidator) = h.predict(_args(address(9)));
         assertTrue(otherFiller != predictedFiller && otherValidator != predictedValidator);
-        vm.expectRevert(abi.encodeWithSelector(TradeManifest.AlreadyDeployed.selector, predictedFiller));
+        // A second run finds its own identical pair and adopts it (C-05) rather than failing.
+        (MercuriOrderFiller again, address againValidator) = h.deployPair(a);
+        assertEq(address(again), predictedFiller);
+        assertEq(againValidator, predictedValidator);
+    }
+
+    /// The pair a copier lands by replaying the init code through the public CREATE2 deployer.
+    function _copierDeploys(FillerHarness h, DeployOrderFiller.FillerArgs memory a) internal {
+        vm.prank(makeAddr("copier"));
+        (bool ok,) = CREATE2_FACTORY.call(abi.encodePacked(bytes32(0), h.fillerInitCode(a)));
+        assertTrue(ok, "copier's CREATE2");
+    }
+
+    /// C-05 (re-audit of 5 Oct 2026): someone replays the filler's init code through the standard deployer before the
+    /// operator. The pair is byte-identical, so the script adopts it, sends nothing, and the result is the pair it
+    /// would have deployed.
+    function test_deployPairAdoptsIdenticalPredeployedPair() public {
+        FillerHarness h = new FillerHarness();
+        DeployOrderFiller.FillerArgs memory a = _args(address(8));
+        (address predictedFiller, address predictedValidator) = h.predict(a);
+        _copierDeploys(h, a);
+        assertGt(predictedFiller.code.length, 0, "copier landed the filler");
+        assertGt(predictedValidator.code.length, 0, "and its validator");
+        bytes32 fillerHash = predictedFiller.codehash;
+        bytes32 validatorHash = predictedValidator.codehash;
+        uint64 factoryNonce = vm.getNonce(CREATE2_FACTORY);
+        vm.recordLogs();
+        (MercuriOrderFiller filler, address validator) = h.deployPair(a);
+        assertEq(address(filler), predictedFiller);
+        assertEq(validator, predictedValidator);
+        assertEq(predictedFiller.codehash, fillerHash, "untouched");
+        assertEq(predictedValidator.codehash, validatorHash, "untouched");
+        assertEq(vm.getNonce(CREATE2_FACTORY), factoryNonce, "nothing went through the deployer");
+        assertEq(address(filler.validator()), validator);
+        assertEq(MercuriOrderValidator(validator).filler(), address(filler));
+        // The same args through a fresh deployment give the same code: the adopted pair is what we would deploy.
+        uint256 snapshot = vm.snapshotState();
+        vm.etch(predictedFiller, "");
+        vm.etch(predictedValidator, "");
+        vm.resetNonce(predictedFiller);
+        vm.resetNonce(predictedValidator);
+        (MercuriOrderFiller fresh, address freshValidator) = h.deployPair(a);
+        assertEq(address(fresh), predictedFiller);
+        assertEq(address(fresh).codehash, fillerHash, "fresh filler runtime equals the adopted one");
+        assertEq(freshValidator.codehash, validatorHash, "fresh validator runtime equals the adopted one");
+        vm.revertToState(snapshot);
+    }
+
+    /// Any code at the predicted addresses other than exactly the expected pair is refused by name: unrelated code, a
+    /// filler built with other immutables, the right filler without its validator, the right filler with a validator
+    /// bound to another pool manager, and an occupied validator address while the filler's is free.
+    function test_deployPairRefusesDifferentPredeployedPair() public {
+        FillerHarness h = new FillerHarness();
+        DeployOrderFiller.FillerArgs memory a = _args(address(8));
+        (address predictedFiller, address predictedValidator) = h.predict(a);
+        // The genuine runtimes, from a copier's deployment that is then rolled back.
+        uint256 snapshot = vm.snapshotState();
+        _copierDeploys(h, a);
+        bytes memory fillerCode = predictedFiller.code;
+        bytes memory validatorCode = predictedValidator.code;
+        vm.revertToState(snapshot);
+        assertEq(predictedFiller.code.length, 0);
+
+        // Unrelated code at the filler address (its validator address is still empty).
+        vm.etch(predictedFiller, hex"00");
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.NoCode.selector, "validator", predictedValidator));
         h.deployPair(a);
+        vm.etch(predictedValidator, validatorCode);
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.DeploymentMismatch.selector, "existing filler runtime"));
+        h.deployPair(a);
+
+        // A filler with one other immutable (the execution fee), with the genuine validator next to it.
+        DeployOrderFiller.FillerArgs memory other = _args(address(8));
+        other.executionFee = 1;
+        MercuriOrderFiller otherFiller = MercuriOrderFiller(payable(_deployed(h, other)));
+        vm.etch(predictedFiller, address(otherFiller).code);
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.DeploymentMismatch.selector, "existing filler runtime"));
+        h.deployPair(a);
+
+        // The genuine filler without its validator.
+        vm.etch(predictedFiller, fillerCode);
+        vm.etch(predictedValidator, "");
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.NoCode.selector, "validator", predictedValidator));
+        h.deployPair(a);
+
+        // The genuine filler with a validator bound to another pool manager.
+        vm.etch(predictedValidator, address(new MercuriOrderValidator(predictedFiller, IPoolManager(address(9)))).code);
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.DeploymentMismatch.selector, "existing validator runtime"));
+        h.deployPair(a);
+
+        // The genuine pair is accepted.
+        vm.etch(predictedValidator, validatorCode);
+        (MercuriOrderFiller filler,) = h.deployPair(a);
+        assertEq(address(filler), predictedFiller);
+
+        // An occupied validator address while the filler address is free cannot come from the filler's constructor.
+        vm.etch(predictedFiller, "");
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.AlreadyDeployed.selector, predictedValidator));
+        h.deployPair(a);
+    }
+
+    /// Deploys `a` through the standard deployer and returns the filler address (for building look-alike code).
+    function _deployed(FillerHarness h, DeployOrderFiller.FillerArgs memory a) internal returns (address filler) {
+        (filler,) = h.predict(a);
+        _copierDeploys(h, a);
     }
 
     /// The post-deployment check refuses a filler off its prediction, a validator other than the filler's own and a
@@ -373,16 +491,68 @@ contract DeployScriptsTest is Test {
     /// The reactor script checks the reactor it just deployed: owner and fee controller as chosen.
     function test_reactorScriptChecksDeployedReactor() public {
         ReactorHarness h = new ReactorHarness();
-        V3DutchOrderReactor reactor = new V3DutchOrderReactor(IPermit2(PERMIT2), ANVIL_1);
-        h.requireDeployed(reactor, ANVIL_1, address(0));
+        V3DutchOrderReactor reactor = h.newReactor(PERMIT2, ANVIL_1);
+        bytes32 hash = address(reactor).codehash;
+        h.requireDeployed(reactor, ANVIL_1, address(0), hash);
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorMismatch.selector, "codehash"));
+        h.requireDeployed(reactor, ANVIL_1, address(0), bytes32(uint256(1)));
         vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorMismatch.selector, "owner"));
-        h.requireDeployed(reactor, address(0xbeef), address(0));
+        h.requireDeployed(reactor, address(0xbeef), address(0), hash);
         address controller = address(new MockFeeController(address(0xfee), 5, false));
         vm.prank(ANVIL_1);
         reactor.setProtocolFeeController(controller);
         vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorMismatch.selector, "feeController"));
-        h.requireDeployed(reactor, ANVIL_1, address(0));
-        h.requireDeployed(reactor, ANVIL_1, controller);
+        h.requireDeployed(reactor, ANVIL_1, address(0), hash);
+        h.requireDeployed(reactor, ANVIL_1, controller, hash);
+    }
+
+    /// C-04 (re-audit of 5 Oct 2026): the reactor's runtime is pinned in each manifest, not supplied by the operator.
+    /// The reactor this script deploys has exactly the pinned hash on both Arc chain ids, whatever its owner (owner and
+    /// fee controller are storage, not code), and the reactor step itself refuses any other runtime.
+    function test_reactorCodeHashPinned() public {
+        FillerHarness f = new FillerHarness();
+        bytes32 testnetPin = f.reactorCodeHash(vm.readFile("deployments/manifest-5042002.json"));
+        bytes32 mainnetPin = f.reactorCodeHash(vm.readFile("deployments/manifest-5042.json"));
+        assertEq(testnetPin, mainnetPin, "same permit2 and the same BlockNumberish branch on both networks");
+        // The reactor step itself, end to end on the testnet chain id, deploys the pinned runtime.
+        vm.setEnv("TRADE_LOCAL_REHEARSAL", "false");
+        vm.etch(PERMIT2, hex"00");
+        V3DutchOrderReactor reactor = new DeployTestnetReactor().run();
+        assertEq(address(reactor).codehash, testnetPin, "testnet reactor runtime");
+        ReactorHarness h = new ReactorHarness();
+        assertEq(address(h.newReactor(PERMIT2, address(0xbeef))).codehash, testnetPin, "owner is not in the code");
+        vm.chainId(5042);
+        assertEq(address(h.newReactor(PERMIT2, ANVIL_1)).codehash, mainnetPin, "mainnet chain id, same runtime");
+        // On a chain whose BlockNumberish reads ArbSys the runtime differs, so the pin is not chain-agnostic by luck.
+        vm.chainId(42161);
+        assertTrue(address(h.newReactor(PERMIT2, ANVIL_1)).codehash != testnetPin, "Arbitrum branch differs");
+        // A reactor built for another permit2 is other code.
+        vm.chainId(5042002);
+        assertTrue(address(h.newReactor(address(0xdead), ANVIL_1)).codehash != testnetPin, "another permit2");
+        // A missing or zero pin is refused before anything is read.
+        vm.expectRevert(TradeManifest.ReactorCodeHashNotPinned.selector);
+        f.reactorCodeHash(string.concat('{"reactorCodeHash":"', vm.toString(bytes32(0)), '"}'));
+        vm.expectRevert();
+        f.reactorCodeHash("{}");
+    }
+
+    /// The filler step's reactor check uses the manifest's pin. A look-alike reactor with the same getters (permit2,
+    /// owner, fee controller) but other runtime, here the same upstream source built for Arbitrum's block-number
+    /// branch, is refused even when the operator's environment names its hash.
+    function test_fillerReactorCheckUsesManifestPin() public {
+        FillerHarness f = new FillerHarness();
+        bytes32 pin = f.reactorCodeHash(vm.readFile("deployments/manifest-5042002.json"));
+        ReactorHarness r = new ReactorHarness();
+        address genuine = address(r.newReactor(PERMIT2, ANVIL_1));
+        f.requireReactor(genuine, PERMIT2, ANVIL_1, address(0), pin);
+        vm.chainId(42161);
+        address lookAlike = address(r.newReactor(PERMIT2, ANVIL_1));
+        vm.chainId(5042002);
+        assertEq(address(V3DutchOrderReactor(payable(lookAlike)).permit2()), PERMIT2);
+        assertEq(V3DutchOrderReactor(payable(lookAlike)).owner(), ANVIL_1);
+        vm.setEnv("TRADE_REACTOR_CODEHASH", vm.toString(lookAlike.codehash));
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorMismatch.selector, "codehash"));
+        f.requireReactor(lookAlike, PERMIT2, ANVIL_1, address(0), pin);
     }
 
     string internal constant TESTNET_RECORD = "lib/mercuri-launch-contracts/deployments/5042002.json";

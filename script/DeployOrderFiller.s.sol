@@ -16,15 +16,18 @@ import {IOrderSwapRouter} from "../src/interfaces/IOrderSwapRouter.sol";
 /// @dev The reactor fee owner must be Launch's timelock from Launch's deployment record, because the reactor deployment
 ///      is part of the same release, and the execution fee recipient (the keeper's transaction address) must be chosen
 ///      in the manifest. That address is also the only one allowed to call `fill` (spec D20), so it must be the keeper
-///      that will submit fills. TRADE_REACTOR_CODEHASH is required as well. The filler goes through the standard
-///      CREATE2 deployer with `FILLER_SALT` and its constructor deploys the validator with CREATE2 from the filler, so
-///      both addresses are predicted before the broadcast and the run reverts unless the deployment lands exactly
-///      there, with the validator bound to this filler and the manifest's PoolManager.
+///      that will submit fills. The reactor's runtime must have the manifest's pinned `reactorCodeHash`. The filler
+///      goes through the standard CREATE2 deployer with `FILLER_SALT` and its constructor deploys the validator with
+///      CREATE2 from the filler, so both addresses are predicted before the broadcast and the run reverts unless the
+///      deployment lands exactly there, with the validator bound to this filler and the manifest's PoolManager.
+///
+///      The standard deployer is permissionless, so anyone can replay the filler's init code first. The pair it
+///      creates is the one this script would deploy, so the script then adopts it and broadcasts nothing, but only
+///      when both runtimes are byte for byte the ones it would deploy; any other code at either address is refused.
 contract DeployOrderFiller is TradeManifest {
     /// @dev TRADE_REACTOR is operator input, so it is proven to be the reactor from the reactor step: same permit2,
     ///      same fee owner, the expected protocol fee controller (zero unless the manifest names one) and runtime code
-    ///      hash equal to TRADE_REACTOR_CODEHASH (the runtime keccak that `verify-trade-filler.py` prints for the
-    ///      reactor, copied by the operator).
+    ///      hash equal to the manifest's reviewed `reactorCodeHash`, never a value the operator supplies.
     function _requireReactor(
         address reactor,
         address permit2,
@@ -101,15 +104,23 @@ contract DeployOrderFiller is TradeManifest {
         if (address(validator.poolManager()) != poolManager) revert DeploymentMismatch("validator poolManager");
     }
 
-    /// @dev Predicts both addresses, refuses an occupied filler address, deploys the filler (and with it the
-    ///      validator) through the standard CREATE2 deployer, and requires the pair to be exactly as predicted.
-    function _deployPair(FillerArgs memory a) internal returns (MercuriOrderFiller filler, address validator) {
-        _requireCreate2Factory();
-        address predictedFiller;
-        (predictedFiller, validator) = _predict(a);
-        if (predictedFiller.code.length != 0) revert AlreadyDeployed(predictedFiller);
-        vm.startBroadcast();
-        filler = new MercuriOrderFiller{salt: FILLER_SALT}(
+    /// @dev The filler deployment itself, with the creation code this script was built with. Without a salt it is a
+    ///      plain CREATE from the caller, which `_requireIdenticalPair` uses for its local reference copy.
+    function _newFiller(FillerArgs memory a, bool create2) internal returns (MercuriOrderFiller) {
+        if (create2) {
+            return new MercuriOrderFiller{salt: FILLER_SALT}(
+                IReactor(a.reactor),
+                IOrderSwapRouter(a.router),
+                IAllowanceTransfer(a.permit2),
+                a.usdc,
+                a.launchHook,
+                a.appRecipient,
+                a.executionFee,
+                a.feeRecipient,
+                IPoolManager(a.poolManager)
+            );
+        }
+        return new MercuriOrderFiller(
             IReactor(a.reactor),
             IOrderSwapRouter(a.router),
             IAllowanceTransfer(a.permit2),
@@ -120,7 +131,75 @@ contract DeployOrderFiller is TradeManifest {
             a.feeRecipient,
             IPoolManager(a.poolManager)
         );
-        vm.stopBroadcast();
+    }
+
+    /// @dev Replaces, in place, every 32-byte word of `code` that holds `from` with `to`, and returns how many it
+    ///      replaced. An address word is twelve zero bytes and twenty address bytes, so it matches only where the
+    ///      compiler wrote that immutable.
+    function _replaceAddressWord(bytes memory code, address from, address to) internal pure returns (uint256 count) {
+        bytes32 fromWord = bytes32(uint256(uint160(from)));
+        bytes32 toWord = bytes32(uint256(uint160(to)));
+        uint256 length = code.length;
+        if (length < 32) return 0;
+        unchecked {
+            for (uint256 i; i <= length - 32; ++i) {
+                bytes32 w;
+                assembly ("memory-safe") {
+                    w := mload(add(add(code, 32), i))
+                }
+                if (w == fromWord) {
+                    assembly ("memory-safe") {
+                        mstore(add(add(code, 32), i), toWord)
+                    }
+                    ++count;
+                    i += 31;
+                }
+            }
+        }
+    }
+
+    /// @dev An occupied predicted address is accepted only when both contracts there are exactly the pair this script
+    ///      would deploy. The expected runtimes come from a reference copy deployed locally with the same creation
+    ///      code and arguments (outside any broadcast, so it is never sent). The two runtimes differ from the
+    ///      reference only in the addresses the pair is bound to: the filler's `validator` immutable and the
+    ///      validator's `filler` immutable. With those words moved to the predicted addresses, each runtime must hash
+    ///      to the code hash found on chain.
+    function _requireIdenticalPair(FillerArgs memory a, address predictedFiller, address predictedValidator) internal {
+        if (predictedValidator.code.length == 0) revert NoCode("validator", predictedValidator);
+        MercuriOrderFiller copy = _newFiller(a, false);
+        address referenceValidator = address(copy.validator());
+        bytes memory fillerCode = address(copy).code;
+        if (_replaceAddressWord(fillerCode, referenceValidator, predictedValidator) == 0) {
+            revert DeploymentMismatch("reference filler binding");
+        }
+        if (keccak256(fillerCode) != predictedFiller.codehash) revert DeploymentMismatch("existing filler runtime");
+        bytes memory validatorCode = referenceValidator.code;
+        if (_replaceAddressWord(validatorCode, address(copy), predictedFiller) == 0) {
+            revert DeploymentMismatch("reference validator binding");
+        }
+        if (keccak256(validatorCode) != predictedValidator.codehash) {
+            revert DeploymentMismatch("existing validator runtime");
+        }
+    }
+
+    /// @dev Predicts both addresses and deploys the filler (and with it the validator) through the standard CREATE2
+    ///      deployer, then requires the pair to be exactly as predicted. If the filler address is already occupied,
+    ///      broadcasts nothing and adopts the pair there only when `_requireIdenticalPair` accepts it. A validator
+    ///      address occupied while the filler's is free cannot come from the filler's constructor and is refused.
+    function _deployPair(FillerArgs memory a) internal returns (MercuriOrderFiller filler, address validator) {
+        _requireCreate2Factory();
+        address predictedFiller;
+        (predictedFiller, validator) = _predict(a);
+        if (predictedFiller.code.length != 0) {
+            _requireIdenticalPair(a, predictedFiller, validator);
+            console2.log("ADOPTED: the predicted filler and validator already hold exactly this runtime; nothing sent");
+            filler = MercuriOrderFiller(payable(predictedFiller));
+        } else {
+            if (validator.code.length != 0) revert AlreadyDeployed(validator);
+            vm.startBroadcast();
+            filler = _newFiller(a, true);
+            vm.stopBroadcast();
+        }
         _requireDeployedPair(filler, predictedFiller, validator, a.poolManager);
     }
 
@@ -143,7 +222,7 @@ contract DeployOrderFiller is TradeManifest {
         a.poolManager = _address(manifest, ".poolManager");
         a.executionFee = _executionFee(manifest);
         address feeController = _reactorFeeController(manifest);
-        _requireReactor(a.reactor, a.permit2, feeOwner, feeController, vm.envBytes32("TRADE_REACTOR_CODEHASH"));
+        _requireReactor(a.reactor, a.permit2, feeOwner, feeController, _reactorCodeHash(manifest));
         _requireRouter(a.router, manifest);
         _requireCode("permit2", a.permit2);
         _requireCode("usdc", a.usdc);

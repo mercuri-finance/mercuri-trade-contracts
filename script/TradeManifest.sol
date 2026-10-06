@@ -5,7 +5,7 @@ import {Script, console2} from "forge-std/Script.sol";
 
 /// @notice Shared manifest reader for the Trade testnet deployment scripts. Holds no key and never broadcasts.
 /// @dev Owner choices ship as sentinel strings and are refused until replaced with an address; the loopback rehearsal
-///      override is honoured only on anvil (see `_resolveChoice`). `reactorFeeOwner` is decided: Launch's
+///      override is honoured only on Anvil (see `_resolveChoice`). `reactorFeeOwner` is decided: Launch's
 ///      TimelockController on the same network, required to equal `timelock` in Launch's deployment record. The filler
 ///      is deployed through the standard CREATE2 deployer with `FILLER_SALT`, and deploys its validator with CREATE2,
 ///      so both addresses are predicted before broadcasting and asserted after.
@@ -67,7 +67,7 @@ abstract contract TradeManifest is Script {
     }
 
     /// @dev The reactor fee owner must be Launch's timelock from the record, read rather than restated, so the reactor
-    ///      shares Launch's governance delay. A loopback rehearsal owner is an anvil account and is not checked.
+    ///      shares Launch's governance delay. A loopback rehearsal owner is an Anvil account and is not checked.
     function _requireTimelockOwner(address owner, string memory launchRecord, bool rehearsal) internal view {
         if (rehearsal) {
             console2.log("WARNING: LOCAL REHEARSAL on anvil. reactorFeeOwner is not Launch's timelock");
@@ -133,7 +133,7 @@ abstract contract TradeManifest is Script {
     /// @dev `reactorFeeOwner` is an owner choice made at deployment time and ships as a sentinel string.
     ///      TRADE_LOCAL_REHEARSAL=true swaps in REACTOR_FEE_OWNER_OVERRIDE for a loopback fork rehearsal only. Because
     ///      the real testnet shares chain id 5042002, the override additionally needs an RPC that reports itself as
-    ///      anvil and an owner that is one of anvil's public default accounts.
+    ///      Anvil and an owner that is one of Anvil's public default accounts.
     function _reactorFeeOwner(string memory manifest) internal returns (address) {
         bool rehearsal = vm.envOr("TRADE_LOCAL_REHEARSAL", false);
         address override_ = rehearsal ? vm.envAddress("REACTOR_FEE_OWNER_OVERRIDE") : address(0);

@@ -14,25 +14,7 @@ import {ResolvedOrder} from "../lib/uniswapx/src/base/ReactorStructs.sol";
 /// @dev The condition is `OrderInfo.additionalValidationData`, inside the trader's Permit2 signature:
 ///      `abi.encode(uint8 version, uint8 kind, bytes32 poolId, uint160 triggerSqrtPriceX96)`. Immutable: no owner,
 ///      pause, upgrade or storage. Deployed by its filler's constructor, so each names the other for life; replacing
-///      either replaces both, and orders signed for the old pair stay fillable only by it. The reactor calls
-///      `validate` before it pulls the input. The pool binding is enforced by the filler, which swaps only through the
-///      pool whose `keccak256(abi.encode(key))` is the signed `poolId` and whose currencies are the order's input and
-///      output; this contract reads that pool's price. The trigger is a v4 `sqrtPriceX96` of the signed pool
-///      (currency1 per currency0, raw units), and is compared with the pool's current spot price before the swap,
-///      inclusive. Take-profit fires when the order's rate, output per input, has risen to the trigger; stop-loss when
-///      it has fallen to it. Pool currencies are sorted, so the input is currency0 exactly when its address is the
-///      lower one. With "price" the pool's `sqrtPriceX96`:
-///        - Sell token→USDC, USDC is currency1, input is currency0 (token price in USDC rises with price):
-///          take-profit fires at price >= trigger, stop-loss at price <= trigger.
-///        - Sell token→USDC, USDC is currency0, input is currency1 (token price in USDC falls with price):
-///          take-profit fires at price <= trigger, stop-loss at price >= trigger.
-///        - Buy USDC→token, USDC is currency0, input is currency0 (token price in USDC falls with price):
-///          take-profit fires at price >= trigger, stop-loss at price <= trigger.
-///        - Buy USDC→token, USDC is currency1, input is currency1 (token price in USDC rises with price):
-///          take-profit fires at price <= trigger, stop-loss at price >= trigger.
-///      A sell's take-profit therefore fires as the token's USDC price rises to the trigger and its stop-loss as it
-///      falls; a buy's take-profit as the token's price falls and its stop-loss as it rises. The spot price can be
-///      moved within a block; the signed minimum output, not this check, bounds what a fill can cost the trader.
+///      either replaces both, and orders signed for the old pair stay fillable only by it.
 contract MercuriOrderValidator is IValidationCallback {
     using StateLibrary for IPoolManager;
 
@@ -80,10 +62,27 @@ contract MercuriOrderValidator is IValidationCallback {
     }
 
     /// @notice Refuses the order unless `filler` settles it and, for a take-profit or stop-loss, the signed pool's
-    ///         price has reached the trigger in the order's direction (see the contract table).
-    /// @dev A view the reactor calls before any transfer. Malformed data reverts with a typed error, never a panic: a
-    ///      word is range-checked before it is narrowed. The order's first output is the trader's; the filler refuses
-    ///      any other shape before calling the reactor.
+    ///         price has reached the trigger in the order's direction.
+    /// @dev A view the reactor calls before any transfer, the input pull included. The pool binding is enforced by
+    ///      the filler, which swaps only through the pool whose `keccak256(abi.encode(key))` is the signed `poolId` and
+    ///      whose currencies are the order's input and output; this contract reads that pool's price. The trigger is a
+    ///      v4 `sqrtPriceX96` of the signed pool (currency1 per currency0, raw units), and is compared with the pool's
+    ///      current spot price before the swap, inclusive. Take-profit fires when the order's rate, output per input,
+    ///      has risen to the trigger; stop-loss when it has fallen to it. Pool currencies are sorted, so the input is
+    ///      currency0 exactly when its address is the lower one. With "price" the pool's `sqrtPriceX96`:
+    ///        - Sell token→USDC, USDC is currency1, input is currency0 (token price in USDC rises with price):
+    ///          take-profit fires at price >= trigger, stop-loss at price <= trigger.
+    ///        - Sell token→USDC, USDC is currency0, input is currency1 (token price in USDC falls with price):
+    ///          take-profit fires at price <= trigger, stop-loss at price >= trigger.
+    ///        - Buy USDC→token, USDC is currency0, input is currency0 (token price in USDC falls with price):
+    ///          take-profit fires at price >= trigger, stop-loss at price <= trigger.
+    ///        - Buy USDC→token, USDC is currency1, input is currency1 (token price in USDC rises with price):
+    ///          take-profit fires at price <= trigger, stop-loss at price >= trigger.
+    ///      A sell's take-profit therefore fires as the token's USDC price rises to the trigger and its stop-loss as it
+    ///      falls; a buy's take-profit as the token's price falls and its stop-loss as it rises. The spot price can be
+    ///      moved within a block; the signed minimum output, not this check, bounds what a fill can cost the trader.
+    ///      Malformed data reverts with a typed error, never a panic: a word is range-checked before it is narrowed.
+    ///      The order's first output is the trader's; the filler refuses any other shape before calling the reactor.
     /// @param orderFiller Address that called the reactor to settle the order.
     /// @param resolvedOrder Order as the reactor resolved it, with its signed `additionalValidationData`.
     function validate(address orderFiller, ResolvedOrder calldata resolvedOrder) external view {

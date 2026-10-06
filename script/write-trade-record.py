@@ -22,7 +22,8 @@ transaction lands (re-audit C-05). DeployOrderFiller then adopts the pair, broad
 broadcast to read. `--adopted-filler-block N` records that pair instead: the filler is the CREATE2 address of the built
 filler with the manifest's arguments (the recorded reactor and the manifest's keeper), the validator is its CREATE2
 deployment, `fillerDeployBlock` is N, the block in which the pair appeared, and the record carries
-`fillerAdopted: true`. Nothing here reads the chain: verify-trade-filler.py at block N then requires every byte of
+`fillerAdopted: true`. Its `deployer` key is replaced by `reactorDeployer`, the sender of the reactor's CREATE,
+because the filler's CREATE2 was not the operator's transaction. Nothing here reads the chain: verify-trade-filler.py at block N then requires every byte of
 both runtimes to match and the filler to have had no code at block N - 1, so a wrong N or a different pair is refused.
 
   python3 script/write-trade-record.py --reactor-broadcast FILE --filler-broadcast FILE [--manifest FILE]
@@ -206,7 +207,8 @@ def build(args, manifest, revision):
         if previous.get('chainId') != chain:
             raise Refused(f'previous record chainId {previous.get("chainId")} != manifest {chain}')
         reactor, block = previous['reactor'], int(previous['deployBlock'])
-        reactor_deployer = previous.get('deployer')
+        # An adopted record names the reactor's sender as reactorDeployer; any other record's deployer sent both.
+        reactor_deployer = previous.get('reactorDeployer') or previous.get('deployer')
         owner, controller = previous['reactorFeeOwner'], previous['reactorFeeController']
         if not args.rehearsal and not same(owner, manifest.get('reactorFeeOwner')):
             raise Refused(f'previous record reactorFeeOwner {owner} != manifest {manifest.get("reactorFeeOwner")}')
@@ -276,7 +278,9 @@ def adopted(args, manifest, revision, chain, reactor, block, deployer, owner, co
     """The record for a pair that someone else landed by replaying the filler's init code (re-audit C-05).
 
     Every address follows from the build and the manifest, so nothing is taken from the copier's transaction. The
-    verifier must then prove the bytes on chain at `fillerDeployBlock`.
+    verifier must then prove the bytes on chain at `fillerDeployBlock`. The record has no `deployer`: that key means
+    the sender of the release's transactions, and the filler's CREATE2 was someone else's. `reactorDeployer` names the
+    sender of the reactor's CREATE instead (fix re-audit N-03).
     """
     filler_block = args.adopted_filler_block
     if filler_block < block:
@@ -305,7 +309,6 @@ def adopted(args, manifest, revision, chain, reactor, block, deployer, owner, co
         'appRecipient': checksum(manifest['appRecipient']),
         'chainId': chain,
         'deployBlock': block,
-        'deployer': checksum(deployer),
         'executionFee': fee,
         'feeRecipient': checksum(recipient),
         'filler': filler,
@@ -315,6 +318,7 @@ def adopted(args, manifest, revision, chain, reactor, block, deployer, owner, co
         'permit2': checksum(manifest['permit2']),
         'poolManager': checksum(manifest['poolManager']),
         'reactor': checksum(reactor),
+        'reactorDeployer': checksum(deployer),
         'reactorFeeController': checksum(controller),
         'reactorFeeOwner': checksum(owner),
         'router': checksum(manifest['router']),
@@ -423,7 +427,8 @@ def selftest():
 
     cases = []
 
-    def case(name, manifest, rbc, fbc, expect_ok, extra=(), must=(), previous=None, dry_run=False, existing=False):
+    def case(name, manifest, rbc, fbc, expect_ok, extra=(), must=(), previous=None, dry_run=False, existing=False,
+             must_not=()):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             (d / 'manifest.json').write_text(json.dumps(manifest))
@@ -448,6 +453,7 @@ def selftest():
             written = (d / 'out' / '5042002.json')
             record = json.loads(written.read_text()) if written.exists() and not existing else None
             ok = (result.returncode == 0) == expect_ok and all(m in text for m in must)
+            ok &= not any(m in text for m in must_not)
             if expect_ok:
                 ok &= record is not None
             else:
@@ -520,10 +526,18 @@ def selftest():
     own_validator = checksum(own['additionalContracts'][0]['address'])
     case('adopted pair', chosen_manifest, reactor_bc(), None, True, extra=['--adopted-filler-block', '150'],
          must=['"fillerAdopted": true', '"fillerDeployBlock": 150', f'"filler": "{own_filler}"',
-               f'"validator": "{own_validator}"', '"deployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"'])
+               f'"validator": "{own_validator}"', '"reactorDeployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"'],
+         must_not=['"deployer"'])  # N-03: someone else sent the filler's CREATE2, so no field may say we did
     case('adopted pair on the recorded reactor', chosen_manifest, None, None, True,
          previous=dict(previous, deployer='0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266'),
-         extra=['--adopted-filler-block', '600'], must=['"fillerAdopted": true', '"fillerDeployBlock": 600'])
+         extra=['--adopted-filler-block', '600'], must=['"fillerAdopted": true', '"fillerDeployBlock": 600',
+                                                        '"reactorDeployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"'],
+         must_not=['"deployer"'])
+    case('adopted pair on a recorded adopted pair', chosen_manifest, None, None, True,
+         previous={k: v for k, v in dict(previous, reactorDeployer='0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266',
+                                         fillerAdopted=True).items() if k != 'deployer'},
+         extra=['--adopted-filler-block', '700'],
+         must=['"reactorDeployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"'], must_not=['"deployer"'])
     case('adopted pair before the reactor', chosen_manifest, reactor_bc(), None, False,
          extra=['--adopted-filler-block', '99'], must=['precedes reactor block'])
     case('adopted pair and a filler broadcast', chosen_manifest, reactor_bc(), filler_bc(), False,

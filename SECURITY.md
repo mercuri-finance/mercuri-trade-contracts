@@ -142,12 +142,13 @@ by the contract.
 - Reproducible bytecode: `python3 script/verify-trade-filler.py` after `forge build`, for the reactor, the filler and
   the validator, with the binding between the last two checked both ways. The reactor's runtime is pinned in each
   manifest (`reactorCodeHash`); the deployment scripts and the verifier compare against that pin, never against a hash
-  the operator supplies (C-04).
+  the operator supplies (C-04). Until a deployment record exists it runs in `--self-test` and `--preflight` mode
+  against the freshly built artifacts, the manifests and Launch's deployment records.
 - A filler pair that someone else lands first, by replaying the init code through the permissionless CREATE2 deployer,
   is adopted only when both runtimes are byte for byte the ones the script would deploy; any other code at either
-  address is refused (C-05). Such a pair is the same contract, so it is not a risk to traders. Until a deployment record exists it runs in
-  `--self-test` and `--preflight` mode against the freshly built artifacts, the manifests and Launch's deployment
-  records.
+  address is refused (C-05). Such a pair is the same contract, so it is not a risk to traders. Its deployment record
+  carries `fillerAdopted: true` and names the reactor's sender as `reactorDeployer`, with no `deployer`, because the
+  filler's CREATE2 was not the operator's transaction.
 - The filler and the validator are immutable, with no owner, pause, upgrade or rescue path; only the configured keeper
   can call `fill`.
 

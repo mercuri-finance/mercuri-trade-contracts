@@ -54,7 +54,8 @@ A new reactor is a different, larger change: every open order must be signed aga
    it is the one contract the filler created, at its predicted CREATE2 address. For an adopted pair there is no filler
    broadcast: pass `--adopted-filler-block N` instead of `--filler-broadcast`, where N is the block of the transaction
    that created the pair (from the explorer, or the first block at which `eth_getCode` of the filler is not empty). The
-   record then carries `fillerAdopted: true`.
+   record then carries `fillerAdopted: true` and, in place of `deployer`, `reactorDeployer`: the sender of the
+   reactor's CREATE. Someone else sent the filler's CREATE2, so the record names no sender for it.
 5. **Verify.** Run `verify-trade-filler.py --rpc <rpc> --block <fillerDeployBlock> --deployment
    deployments/<chainId>.json`. Every byte of the reactor, filler and validator, the binding both ways (each names the
    other; the validator is the filler's CREATE2 deployment; the filler is the standard deployer's CREATE2 of the built

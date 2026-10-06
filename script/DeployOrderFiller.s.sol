@@ -19,12 +19,24 @@ import {IOrderSwapRouter} from "../src/interfaces/IOrderSwapRouter.sol";
 ///      that will submit fills. The reactor's runtime must have the manifest's pinned `reactorCodeHash`. The filler
 ///      goes through the standard CREATE2 deployer with `FILLER_SALT` and its constructor deploys the validator with
 ///      CREATE2 from the filler, so both addresses are predicted before the broadcast and the run reverts unless the
-///      deployment lands exactly there, with the validator bound to this filler and the manifest's PoolManager.
-///
-///      The standard deployer is permissionless, so anyone can replay the filler's init code first. The pair it
-///      creates is the one this script would deploy, so the script then adopts it and broadcasts nothing, but only
-///      when both runtimes are byte for byte the ones it would deploy; any other code at either address is refused.
+///      deployment lands exactly there, with the validator bound to this filler and the manifest's PoolManager. The
+///      standard deployer is permissionless, so anyone can replay the filler's init code first. The pair it creates is
+///      the one this script would deploy, so the script then adopts it and broadcasts nothing, but only when both
+///      runtimes are byte for byte the ones it would deploy; any other code at either address is refused.
 contract DeployOrderFiller is TradeManifest {
+    /// @dev The filler's constructor arguments, in order.
+    struct FillerArgs {
+        address reactor;
+        address router;
+        address permit2;
+        address usdc;
+        address launchHook;
+        address appRecipient;
+        uint256 executionFee;
+        address feeRecipient;
+        address poolManager;
+    }
+
     /// @dev TRADE_REACTOR is operator input, so it is proven to be the reactor from the reactor step: same permit2,
     ///      same fee owner, the expected protocol fee controller (zero unless the manifest names one) and runtime code
     ///      hash equal to the manifest's reviewed `reactorCodeHash`, never a value the operator supplies.
@@ -41,19 +53,6 @@ contract DeployOrderFiller is TradeManifest {
         if (address(deployed.permit2()) != permit2) revert ReactorMismatch("permit2");
         if (deployed.owner() != feeOwner) revert ReactorMismatch("owner");
         if (address(deployed.feeController()) != feeController) revert ReactorMismatch("feeController");
-    }
-
-    /// @dev The filler's constructor arguments, in order.
-    struct FillerArgs {
-        address reactor;
-        address router;
-        address permit2;
-        address usdc;
-        address launchHook;
-        address appRecipient;
-        uint256 executionFee;
-        address feeRecipient;
-        address poolManager;
     }
 
     /// @dev The filler's creation code with its constructor arguments, as the CREATE2 deployer receives it.

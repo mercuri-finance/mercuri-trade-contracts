@@ -33,14 +33,13 @@ import {MercuriOrderValidator} from "./MercuriOrderValidator.sol";
 ///      pool's price (through a take-profit or stop-loss trigger, or just against a limit), fill there down to the
 ///      signed minimum and restore the price: a risk-free sandwich that the keeper's off-chain six-block hold cannot
 ///      stop, because it happens inside one transaction. It would also let copiers race the keeper's own fill
-///      transaction and leave the keeper paying for the reverted one.
-///
-///      Every order must name this filler's `validator`, which the constructor deploys with CREATE2 and which accepts
-///      only this filler and checks the signed take-profit or stop-loss trigger against the signed pool's price; the
-///      callback swaps only through that signed pool. So neither the keeper's nor the cosigner's key can settle an
-///      untriggered order, route one through another pool or settle it through another filler. Orders are bound to
-///      their reactor, cosigner and validator, and through the validator to this filler: a replacement filler, which
-///      rotating the keeper key requires, comes with its own validator and cannot settle orders signed for this one.
+///      transaction and leave the keeper paying for the reverted one. Every order must name this filler's `validator`,
+///      which the constructor deploys with CREATE2 and which accepts only this filler and checks the signed take-profit
+///      or stop-loss trigger against the signed pool's price; the callback swaps only through that signed pool. So
+///      neither the keeper's nor the cosigner's key can settle an untriggered order, route one through another pool or
+///      settle it through another filler. Orders are bound to their reactor, cosigner and validator, and through the
+///      validator to this filler: a replacement filler, which rotating the keeper key requires, comes with its own
+///      validator and cannot settle orders signed for this one.
 contract MercuriOrderFiller is IReactorCallback {
     using SafeERC20 for IERC20;
     using V3DutchOrderLib for V3DutchOrder;
@@ -79,7 +78,7 @@ contract MercuriOrderFiller is IReactorCallback {
     /// @notice Recipient of the execution fee: the keeper's transaction address, fixed for this filler's life.
     /// @dev Also the only address allowed to call `fill`.
     address public immutable feeRecipient;
-    /// @notice The order validator every order must name; it accepts no other filler.
+    /// @notice Order validator every order must name; it accepts no other filler.
     /// @dev Deployed by the constructor with CREATE2 from this address with `VALIDATOR_SALT`, bound to this filler and
     ///      the pool manager for life.
     IValidationCallback public immutable validator;
@@ -187,6 +186,8 @@ contract MercuriOrderFiller is IReactorCallback {
         feeRecipient = feeRecipient_;
         validator = new MercuriOrderValidator{salt: VALIDATOR_SALT}(address(this), poolManager_);
     }
+
+    // ---------------------------------------------------------------- settlement
 
     /// @notice Accepts native value from the reactor only.
     /// @dev The reactor refunds its whole native balance to the filler at the end of `executeWithCallback`. On Arc
@@ -307,17 +308,19 @@ contract MercuriOrderFiller is IReactorCallback {
         IERC20(output).forceApprove(address(reactor), minimum);
     }
 
-    /// @dev Refuses, before the reactor runs, an order the reactor would refuse when it pulls the input through Permit2:
-    ///      the deadline has passed (`OrderExpired`), the Permit2 nonce bit is set (`NonceUsed`), or the trader's input
-    ///      balance (`SwapperBalanceTooLow`) or allowance to Permit2 (`SwapperAllowanceTooLow`) is below the amount the
-    ///      reactor would take in this block. It only reads: `permit2`'s nonce bitmap (the reactor's own Permit2: the
-    ///      deployment script requires `reactor.permit2() == permit2`) and the input token's `balanceOf` and
-    ///      `allowance`, both static calls. It can only make a fill revert earlier, never let through one the reactor
-    ///      refuses. A token whose views overstate passes here and fails in Permit2 as before; one whose views
+    // ---------------------------------------------------------------- internals
+
+    /// @dev Refuses, before the reactor runs, an order the reactor would refuse when it pulls the input through
+    ///      Permit2: the deadline has passed (`OrderExpired`), the Permit2 nonce bit is set (`NonceUsed`), or the
+    ///      trader's input balance (`SwapperBalanceTooLow`) or allowance to Permit2 (`SwapperAllowanceTooLow`) is below
+    ///      the amount the reactor would take in this block. It only reads: `permit2`'s nonce bitmap (the reactor's own
+    ///      Permit2: the deployment script requires `reactor.permit2() == permit2`) and the input token's `balanceOf`
+    ///      and `allowance`, both static calls. It can only make a fill revert earlier, never let through one the
+    ///      reactor refuses. A token whose views overstate passes here and fails in Permit2 as before; one whose views
     ///      understate or revert only blocks its own orders, and `fill` already calls its `balanceOf`. The gas of
     ///      those views is bounded by the transaction the keeper chose to send for that order.
     /// @param order Decoded signed order.
-    /// @param input The order's input token.
+    /// @param input Order's input token.
     function _requireFundable(V3DutchOrder memory order, IERC20 input) private view {
         if (order.info.deadline < block.timestamp) revert OrderExpired();
         address swapper = order.info.swapper;

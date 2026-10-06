@@ -99,6 +99,20 @@ contract FillerHarness is DeployOrderFiller {
     }
 }
 
+/// @dev The filler script itself, run end to end against a manifest fixture instead of the shipped manifest, whose
+///      keeper is still a sentinel. Everything else in `run()` is the production code path.
+contract FillerRunHarness is DeployOrderFiller {
+    string internal fixture;
+
+    constructor(string memory manifest) {
+        fixture = manifest;
+    }
+
+    function _manifest() internal view override returns (string memory) {
+        return fixture;
+    }
+}
+
 /// @dev Exposes the reactor script's post-deployment check.
 contract ReactorHarness is DeployTestnetReactor {
     function requireDeployed(V3DutchOrderReactor reactor, address feeOwner, address feeController, bytes32 codeHash)
@@ -536,9 +550,10 @@ contract DeployScriptsTest is Test {
         f.reactorCodeHash("{}");
     }
 
-    /// The filler step's reactor check uses the manifest's pin. A look-alike reactor with the same getters (permit2,
-    /// owner, fee controller) but other runtime, here the same upstream source built for Arbitrum's block-number
-    /// branch, is refused even when the operator's environment names its hash.
+    /// The filler step's reactor check, given the manifest's pin, refuses a look-alike reactor with the same getters
+    /// (permit2, owner, fee controller) but other runtime, here the same upstream source built for Arbitrum's
+    /// block-number branch. This calls the check directly; `test_fillerRunUsesManifestReactorPin` proves that `run()`
+    /// passes it the manifest's pin and not the environment's hash.
     function test_fillerReactorCheckUsesManifestPin() public {
         FillerHarness f = new FillerHarness();
         bytes32 pin = f.reactorCodeHash(vm.readFile("deployments/manifest-5042002.json"));
@@ -550,9 +565,40 @@ contract DeployScriptsTest is Test {
         vm.chainId(5042002);
         assertEq(address(V3DutchOrderReactor(payable(lookAlike)).permit2()), PERMIT2);
         assertEq(V3DutchOrderReactor(payable(lookAlike)).owner(), ANVIL_1);
-        vm.setEnv("TRADE_REACTOR_CODEHASH", vm.toString(lookAlike.codehash));
         vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorMismatch.selector, "codehash"));
         f.requireReactor(lookAlike, PERMIT2, ANVIL_1, address(0), pin);
+    }
+
+    /// C-04 and N-02 (fix re-audit of 6 Oct 2026): `DeployOrderFiller.run()` itself compares TRADE_REACTOR against
+    /// the manifest's `reactorCodeHash`, never against TRADE_REACTOR_CODEHASH. The run uses the shipped testnet
+    /// manifest with only the keeper filled in. A look-alike reactor (same getters, Arbitrum block-number branch) is
+    /// refused at the reactor check even though the environment names its hash; the genuine reactor passes that check
+    /// while the environment names the look-alike's hash, and the run stops at the next check, the router, which has
+    /// no code here. Reading the hash from the environment instead fails both halves.
+    function test_fillerRunUsesManifestReactorPin() public {
+        string memory shipped = vm.readFile("deployments/manifest-5042002.json");
+        address timelock = vm.parseJsonAddress(shipped, ".reactorFeeOwner");
+        FillerRunHarness script = new FillerRunHarness(
+            vm.replace(shipped, "REQUIRED_AT_D3_OWNER_GO", "0x00000000000000000000000000000000000000dD")
+        );
+        ReactorHarness r = new ReactorHarness();
+        address genuine = address(r.newReactor(PERMIT2, timelock));
+        assertEq(genuine.codehash, vm.parseJsonBytes32(shipped, ".reactorCodeHash"), "genuine reactor is the pin");
+        vm.chainId(42161);
+        address lookAlike = address(r.newReactor(PERMIT2, timelock));
+        vm.chainId(5042002);
+        assertTrue(lookAlike.codehash != genuine.codehash, "look-alike is other code");
+
+        vm.setEnv("TRADE_LOCAL_REHEARSAL", "false");
+        vm.setEnv("TRADE_REACTOR_CODEHASH", vm.toString(lookAlike.codehash));
+        vm.setEnv("TRADE_REACTOR", vm.toString(lookAlike));
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.ReactorMismatch.selector, "codehash"));
+        script.run();
+
+        vm.setEnv("TRADE_REACTOR", vm.toString(genuine));
+        address router = vm.parseJsonAddress(shipped, ".router");
+        vm.expectRevert(abi.encodeWithSelector(TradeManifest.NoCode.selector, "router", router));
+        script.run();
     }
 
     string internal constant TESTNET_RECORD = "lib/mercuri-launch-contracts/deployments/5042002.json";

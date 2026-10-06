@@ -47,7 +47,9 @@ abstract contract TradeManifest is Script {
         if (block.chainid != TESTNET_CHAIN_ID) revert WrongChain(block.chainid);
     }
 
-    function _manifest() internal view returns (string memory) {
+    /// @dev Virtual only so a test harness can run a script's `run()` end to end against a manifest fixture with the
+    ///      owner choices filled in (`test_fillerRunUsesManifestReactorPin`); the scripts themselves never override it.
+    function _manifest() internal view virtual returns (string memory) {
         return vm.readFile(MANIFEST_PATH);
     }
 

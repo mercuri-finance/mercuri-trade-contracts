@@ -27,9 +27,13 @@ import {MercuriOrderValidator} from "./MercuriOrderValidator.sol";
 /// @dev Immutable: no owner, pause, upgrade or rescue path. The execution fee comes from the USDC side (see
 ///      `executionFee`). Tokens sent to this contract outside a fill never subsidize another order or the fee. Native
 ///      value is accepted only from the reactor (its end-of-fill refund) and is never spent. Only the configured keeper
-///      (`feeRecipient`) can call `fill`. The keeper cosigns each order exclusive to this filler, and the caller of
-///      `fill` chooses the pool, so an open `fill` would let a copier route a keeper-cosigned order through a pool of
-///      its choice (for example around Launch's hook fee) or race the keeper for its own transaction.
+///      (`feeRecipient`) can call `fill`. The pool is not the reason: the callback swaps only through the pool the
+///      trader signed, whoever calls. Only this filler can settle an order (its validator refuses any other), so an
+///      open `fill` would let anyone take a cosigned order from the mempool and, in one transaction, push the signed
+///      pool's price (through a take-profit or stop-loss trigger, or just against a limit), fill there down to the
+///      signed minimum and restore the price: a risk-free sandwich that the keeper's off-chain six-block hold cannot
+///      stop, because it happens inside one transaction. It would also let copiers race the keeper's own fill
+///      transaction and leave the keeper paying for the reverted one.
 ///
 ///      Every order must name this filler's `validator`, which the constructor deploys with CREATE2 and which accepts
 ///      only this filler and checks the signed take-profit or stop-loss trigger against the signed pool's price; the
@@ -328,9 +332,10 @@ contract MercuriOrderFiller is IReactorCallback {
 
     /// @dev Returns the input the reactor takes for `order` in this block, resolved as `V3DutchOrderReactor._resolve`
     ///      resolves it: the cosigned input when nonzero, the base-fee adjustment bounded to `maxAmount`, then the
-    ///      input curve at `block.number` (the reactor's block number on any chain but Arbitrum's, Arc included). A
-    ///      cosigned input above the signed start is left for the reactor to refuse (`InvalidCosignerInput`). The
-    ///      order is not modified.
+    ///      input curve at `block.number`. That is the reactor's block number on every chain except Arbitrum One
+    ///      (42161) and Robinhood Chain (4663), where the pinned `BlockNumberish` reads ArbSys instead; on Arc it is
+    ///      `block.number`. A cosigned input above the signed start is left for the reactor to refuse
+    ///      (`InvalidCosignerInput`). The order is not modified.
     /// @param order Decoded signed order.
     /// @return amount Input amount the reactor would transfer from the trader.
     function _inputAmount(V3DutchOrder memory order) private view returns (uint256 amount) {

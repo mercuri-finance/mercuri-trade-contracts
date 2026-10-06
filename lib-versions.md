@@ -38,7 +38,8 @@ context remappings; deployed Mercurifi imports use their existing prefixes.
 The reactor and `src/MercuriOrderFiller.sol` are not deployed: no deployment record exists, and the testnet inputs in
 `deployments/manifest-5042002.json` still hold the owner-choice sentinels. The filler builds typed single-pool R1–R4
 swaps, enforces net output and full input consumption, and sends surplus to the signed trader. It is a release
-candidate with evidence in `docs/reports/2026-10-02-order-filler-release.md`, not yet independently reviewed.
+candidate with evidence in `docs/reports/2026-10-02-order-filler-release.md`: independently reviewed on 3 October 2026
+(section 18), re-audited with its validator on 5 October 2026 and its fixes on 6 October 2026 (section 21).
 
 ## Reproducible source identity
 
@@ -47,7 +48,7 @@ candidate with evidence in `docs/reports/2026-10-02-order-filler-release.md`, no
 | `lib/mercuri-launch-contracts` | submodule commit `99d7c28a19e254e5c1cf0444819ddabae3e9c469` |
 | `lib/uniswapx` | Uniswap/UniswapX `eb7ce077036258b9510b42ad37aa920cf3aaf308`, checked by `script/check-trade-sources.py` |
 | `lib/universal-router` | Uniswap/universal-router `999d561c3ad58fb5cab91b602911f3c75591a9c7`, checked by `script/check-trade-sources.py` |
-| `src/MercuriOrderFiller.sol` | sha256 in `source-manifest.json`, checked by `script/check-local-source.py` |
+| `src/` (filler, validator, router interface) | sha256 in `source-manifest.json`, checked by `script/check-local-source.py` |
 
 Build with Solidity 0.8.26, Cancun, via-IR and the per-path optimizer profiles in `foundry.toml`. The executable used
 for the release evidence identifies itself as Foundry 1.4.3-Homebrew, build timestamp `2025-10-22T03:58:23Z`; it

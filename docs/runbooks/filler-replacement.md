@@ -96,7 +96,8 @@ signed again.
    cannot be moved: the validator is in the signed order. Until the trader signs again the order does nothing; it can
    never fill through the new pair.
 5. **Retire.** If the old key still exists (a planned rotation, not a loss), the old keeper can keep serving orders
-   signed for the old pair until they expire, as in step 7. Sweep whatever execution fees the old address can still move.
+   signed for the old pair until they expire, as in step 7. Sweep whatever execution fees the old address can still
+   move.
 
 ## Pool eligibility
 
@@ -106,14 +107,14 @@ the keeper and the web app must not offer orders on it. Funds sent to the filler
 
 ## Trigger reads and the six-block hold
 
-The validator compares the signed pool's spot price with the trigger; anyone can move that price, with no key
-(re-audit C-01). The on-chain bound is the signed minimum: the trader's loss on a manipulated fill is at most the order's
-value less that minimum. The off-chain bound is the keeper's hold: it cosigns a take-profit or stop-loss only after
-the trigger has held for six consecutive finalized blocks (`HoldBlocks = 6`), so a push for a block or two is never
-filled. A replacement filler does not change either. When operating or replacing the keeper, keep the hold at six
-blocks or more, keep the per-pool stop-capacity limits (spec D30) and tight default bands on thin pools, and treat any
-change to them as a reviewed change. A hunter that holds the price past the trigger for six blocks can still force a
-stop to fill near its signed minimum; that residual risk is part of the order terms shown to traders.
+The validator compares the signed pool's spot price with the trigger; anyone can move that price, with no key (re-audit
+C-01). The on-chain bound is the signed minimum: the trader's loss on a manipulated fill is at most the order's value
+less that minimum. The off-chain bound is the keeper's hold: it cosigns a take-profit or stop-loss only after the
+trigger has held for six consecutive finalized blocks (`HoldBlocks = 6`), so a push for a block or two is never filled.
+A replacement filler does not change either. When operating or replacing the keeper, keep the hold at six blocks or
+more, keep the per-pool stop-capacity limits (spec D30) and tight default bands on thin pools, and treat any change to
+them as a reviewed change. A hunter that holds the price past the trigger for six blocks can still force a stop to fill
+near its signed minimum; that residual risk is part of the order terms shown to traders.
 
 ## Cosigner rotation
 

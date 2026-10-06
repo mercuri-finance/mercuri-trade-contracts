@@ -15,10 +15,9 @@ moves.
 ## Scope
 
 The contracts in `src/`, `MercuriOrderFiller` and the `MercuriOrderValidator` it deploys, and the deployment scripts in
-`script/`. Nothing is deployed yet; once
-it is, the scope is the addresses in the deployment records under `deployments/`. The vendored dependencies under
-`lib/` are upstream code, and Launch's contracts are in their own public repository; report defects in them there as
-well.
+`script/`. Nothing is deployed yet; once it is, the scope is the addresses in the deployment records under
+`deployments/`. The vendored dependencies under `lib/` are upstream code, and Launch's contracts are in their own public
+repository; report defects in them there as well.
 
 Out of scope: the web app, the API and the hosting, which are not in this repository. The keeper's own code is out of
 scope; keeper or cosigner behaviour that lets a fill break the filler's guarantees is in scope. Findings that require a

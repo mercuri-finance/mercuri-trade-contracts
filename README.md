@@ -96,7 +96,8 @@ the pair lands exactly there, each naming the other.
 | [`MercuriOrderFiller.sol`](src/MercuriOrderFiller.sol) | The filler the keeper uses against the UniswapX reactor. Refuses an order that does not name its validator, or that the trader has made unfillable, before the reactor runs; swaps only through the pool the trader signed; enforces net output and full input consumption, hands all surplus to the signed trader and pays the execution fee. Deploys its validator in its constructor. No owner, pause, upgrade or rescue path. | immutable, not deployed |
 | [`MercuriOrderValidator.sol`](src/MercuriOrderValidator.sol) | The order validator the reactor calls before it moves anything. Accepts only its filler; for a take-profit or stop-loss, requires the signed pool's current price, read from the v4 PoolManager, to be at or beyond the signed trigger in the order's direction. Bound to its filler for life. No owner, pause, upgrade or storage. | immutable, not deployed |
 
-The one Universal Router entry point the filler calls is in [`interfaces/IOrderSwapRouter.sol`](src/interfaces/IOrderSwapRouter.sol).
+The one Universal Router entry point the filler calls is in
+[`interfaces/IOrderSwapRouter.sol`](src/interfaces/IOrderSwapRouter.sol).
 
 Pinned sources it builds against:
 
@@ -192,10 +193,12 @@ record.
 | Governance | The reactor's only owner is Launch's timelock, with power over a 0 to 5 bps output fee controller; the keeper and cosigner are off-chain keys. What each can do: [`SECURITY.md`](SECURITY.md). |
 
 The filler was independently reviewed on 3 October 2026 and every finding was fixed or decided (release report,
-section 18). The early guard (section 19) and the on-chain order validation (section 20) came after that review and
-await an isolated re-audit. That review was not an audit by a security firm; no third-party audit has been performed
-yet. To report a
-vulnerability, see [`SECURITY.md`](SECURITY.md).
+section 18). A re-audit of 5 October 2026 covered the early guard (section 19) and the on-chain order validation
+(section 20) and found no exploitable defect; its findings, and a focused re-audit of their fixes on 6 October 2026,
+are in section 21.
+
+These reviews were not an audit by a security firm; no third-party audit has been performed yet. Weigh that before
+relying on the contracts. To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## License
 

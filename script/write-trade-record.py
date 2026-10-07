@@ -558,14 +558,16 @@ def selftest():
          must=['"fillerAdopted": true'])
     case('rehearsal adoption without its keeper', pending_manifest, reactor_bc(tx={'arguments': [base['permit2'], anvil]}), None,
          False, extra=['--rehearsal', '--adopted-filler-block', '150'], must=['--fee-recipient'])
-    # The shipped testnet keeper is a checksummed, nonzero address; the mainnet manifest's keeper is still pending.
+    # Both shipped keepers are checksummed, nonzero addresses: the testnet keeper and the mainnet keeper (owner, 7 Oct).
     shipped = base['feeRecipient']
     mainnet = json.loads((root / 'deployments/manifest-5042.json').read_text())
     cases.append(('shipped testnet keeper is checksummed and chosen',
                   shipped == testnet_keeper and is_address(shipped) and int(shipped, 16) != 0
                   and checksum(shipped) == shipped, f'feeRecipient {shipped!r}', None))
-    cases.append(('mainnet keeper still a sentinel', mainnet['feeRecipient'] == 'REQUIRED_AT_MAINNET_OWNER_GO',
-                  f'feeRecipient {mainnet["feeRecipient"]!r}', None))
+    mainnet_keeper = '0x224d6A194CD27e1a9e84ebe2A35Ad6eC81361eF0'  # the mainnet keeper's KMS address, chosen 7 Oct
+    cases.append(('shipped mainnet keeper is checksummed and chosen',
+                  mainnet['feeRecipient'] == mainnet_keeper and checksum(mainnet_keeper) == mainnet_keeper
+                  and mainnet['executionFee'] == 50000, f'feeRecipient {mainnet["feeRecipient"]!r}', None))
     with tempfile.TemporaryDirectory() as d:
         argv = [sys.executable, __file__, '--manifest', str(root / 'deployments/manifest-5042002.json'),
                 '--reactor-broadcast', 'x', '--filler-broadcast', 'y', '--rehearsal', '--source-revision', revision,

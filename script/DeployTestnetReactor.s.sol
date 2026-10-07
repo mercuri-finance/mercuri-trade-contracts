@@ -6,14 +6,15 @@ import {V3DutchOrderReactor} from "../lib/uniswapx/src/reactors/V3DutchOrderReac
 import {IPermit2} from "../lib/uniswapx/lib/permit2/src/interfaces/IPermit2.sol";
 import {TradeManifest} from "./TradeManifest.sol";
 
-/// @notice Deploys the pinned UniswapX V3 Dutch reactor on Arc testnet. Contains no key: pass `--account` or
-///         `--ledger`.
+/// @notice Deploys the pinned UniswapX V3 Dutch reactor on Arc testnet or Arc mainnet, the network the RPC reports.
+///         Contains no key: pass `--account` or `--ledger`.
+/// @dev Named for the network it first deployed on; its broadcast files and record tooling keep the name.
 /// @dev After deployment the reactor must have the manifest's runtime code hash (`reactorCodeHash`) and report the
 ///      manifest's fee owner and protocol fee controller (zero unless the manifest names one), or the run reverts
 ///      before anything is broadcast.
 contract DeployTestnetReactor is TradeManifest {
     function run() external returns (V3DutchOrderReactor reactor) {
-        _requireTestnet();
+        _requireArc();
         string memory manifest = _manifest();
         address permit2 = _address(manifest, ".permit2");
         string memory launchRecord = _launchRecord();

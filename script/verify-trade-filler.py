@@ -712,7 +712,7 @@ def preflight_self_test():
     """Both manifests pass with only their owner choices pending; each tampered field and a pending choice fail.
 
     The shipped testnet manifest has every owner choice made, so a pending keeper is tested on a synthetic copy of it
-    with the sentinel put back. The mainnet manifest is review-only and keeps its sentinels.
+    with the sentinel put back. The mainnet manifest has every owner choice made too (owner, 7 Oct 2026).
     """
     import copy
     ok = True
@@ -720,8 +720,7 @@ def preflight_self_test():
     pending_keeper = dict(base, feeRecipient=RECIPIENT_SENTINEL)
     for label, manifest, expected in (('deployments/manifest-5042002.json', base, []),
                                       ('testnet manifest with the keeper sentinel', pending_keeper, ['feeRecipient']),
-                                      ('deployments/manifest-5042.json', load('deployments/manifest-5042.json'),
-                                       ['executionFee', 'feeRecipient'])):
+                                      ('deployments/manifest-5042.json', load('deployments/manifest-5042.json'), [])):
         problems, waiting = preflight(manifest)
         if problems or waiting != expected:
             print(f'{label}: expected a clean preflight with {expected} pending, got {problems} {waiting}')

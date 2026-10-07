@@ -203,7 +203,7 @@ contract DeployOrderFiller is TradeManifest {
     }
 
     function run() external returns (MercuriOrderFiller filler) {
-        _requireTestnet();
+        _requireArc();
         string memory manifest = _manifest();
         string memory launchRecord = _launchRecord();
         _requireLaunchRecord(manifest, launchRecord);

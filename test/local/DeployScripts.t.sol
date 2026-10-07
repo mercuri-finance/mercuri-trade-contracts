@@ -136,6 +136,9 @@ contract DeployScriptsTest is Test {
     string internal constant CHOSEN = '{"reactorFeeOwner":"0x00000000000000000000000000000000000000cc"}';
     /// @dev The testnet keeper's transaction address, the owner's D3 choice recorded in the testnet manifest.
     address internal constant TESTNET_KEEPER = 0xFFEd2F02Ec860fFF1523375Fb253f0Bb0B7b2Efd;
+    /// @dev The mainnet keeper's transaction address, the owner's choice of 7 Oct 2026 in the mainnet manifest (the
+    ///      address of the mainnet keeper's KMS key).
+    address internal constant MAINNET_KEEPER = 0x224d6A194CD27e1a9e84ebe2A35Ad6eC81361eF0;
     string internal constant RECIPIENT_SENTINEL = "REQUIRED_AT_D3_OWNER_GO";
 
     function setUp() public {
@@ -152,7 +155,8 @@ contract DeployScriptsTest is Test {
     }
 
     /// The testnet owner choices are made: the reactor fee owner is Launch's testnet timelock (read from Launch's
-    /// record) and the keeper is the testnet keeper, written checksummed. The mainnet manifest keeps its sentinels.
+    /// record) and the keeper is the testnet keeper, written checksummed. The mainnet choices are in
+    /// `test_mainnetManifestShipsOwnerChoices`.
     function test_manifestShipsOwnerChoices() public view {
         string memory manifest = vm.readFile("deployments/manifest-5042002.json");
         string memory launchRecord = vm.readFile("lib/mercuri-launch-contracts/deployments/5042002.json");
@@ -163,9 +167,6 @@ contract DeployScriptsTest is Test {
         assertEq(vm.parseJsonString(manifest, ".feeRecipient"), vm.toString(TESTNET_KEEPER), "keeper not checksummed");
         assertTrue(TESTNET_KEEPER != address(0));
         assertEq(vm.parseJsonUint(manifest, ".executionFee"), 50_000);
-        string memory mainnet = vm.readFile("deployments/manifest-5042.json");
-        assertEq(vm.parseJsonString(mainnet, ".feeRecipient"), "REQUIRED_AT_MAINNET_OWNER_GO");
-        assertEq(vm.parseJsonString(mainnet, ".executionFee"), "REQUIRED_AT_MAINNET_OWNER_GO");
     }
 
     /// A sentinel or zero keeper is refused; the shipped testnet keeper and any other address resolve to themselves.
@@ -174,8 +175,9 @@ contract DeployScriptsTest is Test {
         string memory manifest = _pendingKeeperManifest();
         vm.expectRevert(TradeManifest.FeeRecipientNotChosen.selector);
         h.resolveRecipient(manifest, false, address(0), "");
-        vm.expectRevert(TradeManifest.FeeRecipientNotChosen.selector);
-        h.resolveRecipient(vm.readFile("deployments/manifest-5042.json"), false, address(0), "");
+        assertEq(
+            h.resolveRecipient(vm.readFile("deployments/manifest-5042.json"), false, address(0), ""), MAINNET_KEEPER
+        );
         assertEq(
             h.resolveRecipient(vm.readFile("deployments/manifest-5042002.json"), false, address(0), ""), TESTNET_KEEPER
         );
@@ -473,14 +475,33 @@ contract DeployScriptsTest is Test {
         assertEq(h.resolve(SENTINEL, true, ANVIL_1, bytes('"anvil/v1.4.3"')), ANVIL_1);
     }
 
+    /// Only Arc testnet and Arc mainnet are accepted; any other chain is refused before a manifest is read.
     function test_scriptsRefuseOtherChains() public {
+        uint256[3] memory chains = [uint256(1), 5041, 31337];
+        for (uint256 i; i < chains.length; ++i) {
+            vm.chainId(chains[i]);
+            DeployTestnetReactor reactorScript = new DeployTestnetReactor();
+            vm.expectRevert(abi.encodeWithSelector(TradeManifest.WrongChain.selector, chains[i]));
+            reactorScript.run();
+            DeployOrderFiller fillerScript = new DeployOrderFiller();
+            vm.expectRevert(abi.encodeWithSelector(TradeManifest.WrongChain.selector, chains[i]));
+            fillerScript.run();
+        }
+    }
+
+    /// On chain 5042 the reactor script reads the mainnet manifest and Launch's mainnet record, and deploys the same
+    /// pinned runtime owned by Launch's mainnet timelock.
+    function test_reactorScriptDeploysOnMainnetWithMainnetTimelock() public {
+        vm.setEnv("TRADE_LOCAL_REHEARSAL", "false");
         vm.chainId(5042);
-        DeployTestnetReactor reactorScript = new DeployTestnetReactor();
-        vm.expectRevert(abi.encodeWithSelector(TradeManifest.WrongChain.selector, 5042));
-        reactorScript.run();
-        DeployOrderFiller fillerScript = new DeployOrderFiller();
-        vm.expectRevert(abi.encodeWithSelector(TradeManifest.WrongChain.selector, 5042));
-        fillerScript.run();
+        vm.etch(PERMIT2, hex"00");
+        V3DutchOrderReactor reactor = new DeployTestnetReactor().run();
+        assertEq(reactor.owner(), 0x94aFdf4cF8fD025E8421C936f5647a175515eb40, "Launch's mainnet timelock");
+        assertEq(address(reactor.feeController()), address(0));
+        assertEq(
+            address(reactor).codehash,
+            new FillerHarness().reactorCodeHash(vm.readFile("deployments/manifest-5042.json"))
+        );
     }
 
     function test_fillerRefusesWrongReactor() public {
@@ -662,15 +683,17 @@ contract DeployScriptsTest is Test {
         h.requireLaunchRecord(manifest, vm.readFile(MAINNET_RECORD));
     }
 
-    /// The mainnet manifest exists for review only: its owner choices are sentinels, its reactor fee owner is
-    /// Launch's mainnet timelock, and the scripts still refuse chain 5042 (`test_scriptsRefuseOtherChains`). Spec D27:
-    /// mainnet uses our own reactor, deployed by the reactor step and owned by that timelock; the manifest names no
-    /// existing reactor, so the Uniswap-owned mainnet reactor can never be taken for ours.
-    function test_mainnetManifestIsReviewOnly() public view {
+    /// The mainnet owner choices are made (owner, 7 Oct 2026): the execution fee is the testnet's 0.05 USDC, the keeper
+    /// is the mainnet keeper, written checksummed, and the reactor fee owner is Launch's mainnet timelock, whose
+    /// proposer is the 2-of-3 Safe. Spec D27: mainnet uses our own reactor, deployed by the reactor step and owned by
+    /// that timelock; the manifest names no existing reactor, so the Uniswap-owned mainnet reactor can never be taken
+    /// for ours.
+    function test_mainnetManifestShipsOwnerChoices() public view {
         string memory manifest = vm.readFile("deployments/manifest-5042.json");
         assertEq(vm.parseJsonUint(manifest, ".chainId"), 5042);
-        assertEq(vm.parseJsonString(manifest, ".executionFee"), "REQUIRED_AT_MAINNET_OWNER_GO");
-        assertEq(vm.parseJsonString(manifest, ".feeRecipient"), "REQUIRED_AT_MAINNET_OWNER_GO");
+        assertEq(vm.parseJsonUint(manifest, ".executionFee"), 50_000);
+        assertEq(vm.parseJsonAddress(manifest, ".feeRecipient"), MAINNET_KEEPER);
+        assertEq(vm.parseJsonString(manifest, ".feeRecipient"), vm.toString(MAINNET_KEEPER), "keeper not checksummed");
         assertEq(
             vm.parseJsonAddress(manifest, ".reactorFeeOwner"),
             vm.parseJsonAddress(vm.readFile(MAINNET_RECORD), ".timelock")

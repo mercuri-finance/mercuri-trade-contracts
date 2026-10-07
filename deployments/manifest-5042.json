@@ -10,6 +10,6 @@
   "reactorFeeOwner": "0x94aFdf4cF8fD025E8421C936f5647a175515eb40",
   "reactorFeeController": "0x0000000000000000000000000000000000000000",
   "reactorCodeHash": "0xd7a5867bd6bea358f040527c10ba7ab2e76ce071e7b7be6181b26a0c1e7e7dcb",
-  "executionFee": "REQUIRED_AT_MAINNET_OWNER_GO",
-  "feeRecipient": "REQUIRED_AT_MAINNET_OWNER_GO"
+  "executionFee": 50000,
+  "feeRecipient": "0x224d6A194CD27e1a9e84ebe2A35Ad6eC81361eF0"
 }

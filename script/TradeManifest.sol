@@ -3,7 +3,8 @@ pragma solidity ^0.8.26;
 
 import {Script, console2} from "forge-std/Script.sol";
 
-/// @notice Shared manifest reader for the Trade testnet deployment scripts. Holds no key and never broadcasts.
+/// @notice Shared manifest reader for the Trade deployment scripts on Arc testnet and Arc mainnet. Holds no key and
+///         never broadcasts.
 /// @dev Owner choices ship as sentinel strings and are refused until replaced with an address; the loopback rehearsal
 ///      override is honoured only on Anvil (see `_resolveChoice`). `reactorFeeOwner` is decided: Launch's
 ///      TimelockController on the same network, required to equal `timelock` in Launch's deployment record. The filler
@@ -11,7 +12,9 @@ import {Script, console2} from "forge-std/Script.sol";
 ///      so both addresses are predicted before broadcasting and asserted after.
 abstract contract TradeManifest is Script {
     uint256 internal constant TESTNET_CHAIN_ID = 5042002;
-    string internal constant MANIFEST_PATH = "deployments/manifest-5042002.json";
+    uint256 internal constant MAINNET_CHAIN_ID = 5042;
+    /// @dev Each network's manifest is `deployments/manifest-<chainId>.json`, chosen by the chain the script runs on.
+    string internal constant MANIFEST_PREFIX = "deployments/manifest-";
     /// @dev Launch's tracked deployment records, `<chainId>.json`, from the pinned Launch submodule.
     string internal constant LAUNCH_RECORDS = "lib/mercuri-launch-contracts/deployments/";
     /// @dev Mirrors MercuriOrderFiller.MAX_EXECUTION_FEE so a bad manifest fails before any broadcast.
@@ -42,15 +45,16 @@ abstract contract TradeManifest is Script {
     error DeploymentMismatch(string what);
     error ReactorCodeHashNotPinned();
 
-    /// @dev Refuses any chain other than Arc testnet. A local fork must keep chain id 5042002.
-    function _requireTestnet() internal view {
-        if (block.chainid != TESTNET_CHAIN_ID) revert WrongChain(block.chainid);
+    /// @dev Refuses any chain other than Arc testnet and Arc mainnet. A local fork keeps its network's chain id, so it
+    ///      reads that network's manifest and Launch record.
+    function _requireArc() internal view {
+        if (block.chainid != TESTNET_CHAIN_ID && block.chainid != MAINNET_CHAIN_ID) revert WrongChain(block.chainid);
     }
 
     /// @dev Virtual only so a test harness can run a script's `run()` end to end against a manifest fixture with the
     ///      owner choices filled in (`test_fillerRunUsesManifestReactorPin`); the scripts themselves never override it.
     function _manifest() internal view virtual returns (string memory) {
-        return vm.readFile(MANIFEST_PATH);
+        return vm.readFile(string.concat(MANIFEST_PREFIX, vm.toString(block.chainid), ".json"));
     }
 
     function _address(string memory manifest, string memory key) internal pure returns (address) {
@@ -133,8 +137,8 @@ abstract contract TradeManifest is Script {
     /// @dev `reactorFeeOwner` is an owner choice made at deployment time; until it is made the manifest carries a
     ///      sentinel string, which is refused.
     ///      TRADE_LOCAL_REHEARSAL=true swaps in REACTOR_FEE_OWNER_OVERRIDE for a loopback fork rehearsal only. Because
-    ///      the real testnet shares chain id 5042002, the override additionally needs an RPC that reports itself as
-    ///      Anvil and an owner that is one of Anvil's public default accounts.
+    ///      a fork shares its network's chain id, the override additionally needs an RPC that reports itself as Anvil
+    ///      and an owner that is one of Anvil's public default accounts.
     function _reactorFeeOwner(string memory manifest) internal returns (address) {
         bool rehearsal = vm.envOr("TRADE_LOCAL_REHEARSAL", false);
         address override_ = rehearsal ? vm.envAddress("REACTOR_FEE_OWNER_OVERRIDE") : address(0);

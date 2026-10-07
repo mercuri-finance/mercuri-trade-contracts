@@ -176,8 +176,10 @@ arguments. `--reactor-only` verifies the reactor before any filler exists. Every
 against Launch's deployment record for the chain (permit2, USDC, Launch hook, PoolManager, treasury as app fee
 recipient, timelock as reactor fee owner) and the reproduced router; `--preflight` runs that check alone, offline, and
 the gate runs it for both manifests along with the verifier's self-tests. The mainnet manifest,
-[`deployments/manifest-5042.json`](deployments/manifest-5042.json), is for review only: its owner choices are sentinels
-and the deployment scripts refuse chain 5042.
+[`deployments/manifest-5042.json`](deployments/manifest-5042.json), carries the owner's choices of 7 Oct 2026: Launch's
+mainnet timelock (proposed through its 2-of-3 Safe, 48 h delay) as reactor fee owner, the mainnet keeper as fee
+recipient and a 0.05 USDC execution fee. The scripts accept Arc testnet and Arc mainnet and read the manifest and Launch
+record of the chain the RPC reports.
 
 [`script/write-trade-record.py`](script/write-trade-record.py) writes `deployments/<chainId>.json` in the shape of
 Launch's deployment records, and only from completed forge broadcasts whose receipts, chain, commit and constructor

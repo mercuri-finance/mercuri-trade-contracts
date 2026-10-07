@@ -18,16 +18,16 @@ forge fmt --check
 forge build
 python3 script/check-natspec.py
 # Both manifests must agree with Launch's records and the reproduced router; only owner choices may be pending, and
-# without --allow-pending a pending choice must be refused. The testnet manifest has every owner choice made, so it
-# must pass without --allow-pending. The mainnet manifest (review only) and a copy of the testnet manifest with the
-# keeper sentinel put back must each be refused with a pending report.
+# without --allow-pending a pending choice must be refused. Both shipped manifests have every owner choice made, so
+# each must pass without --allow-pending; a copy of the testnet manifest with the keeper sentinel put back must be
+# refused with a pending report.
 python3 script/verify-trade-filler.py --preflight
-python3 script/verify-trade-filler.py --preflight --allow-pending --manifest deployments/manifest-5042.json
+python3 script/verify-trade-filler.py --preflight --manifest deployments/manifest-5042.json
 pending_dir=$(mktemp -d)
 trap 'rm -rf "$pending_dir"' EXIT
 python3 -c 'import json, sys; m = json.load(open(sys.argv[1])); m["feeRecipient"] = "REQUIRED_AT_D3_OWNER_GO"; json.dump(m, open(sys.argv[2], "w"))' \
   deployments/manifest-5042002.json "$pending_dir/manifest-5042002.json"
-for manifest in deployments/manifest-5042.json "$pending_dir/manifest-5042002.json"; do
+for manifest in "$pending_dir/manifest-5042002.json"; do
   if pending=$(python3 script/verify-trade-filler.py --preflight --manifest "$manifest" 2>&1); then
     echo "verify-trade-filler.py --preflight accepted $manifest with a pending owner choice" >&2
     exit 1

@@ -29,6 +29,12 @@ contract DeployTestnetReactor is TradeManifest {
         reactor = _newReactor(permit2, feeOwner);
         vm.stopBroadcast();
         _requireDeployedReactor(reactor, feeOwner, feeController, codeHash);
+        // Optional: the address the runbook expects (the deployer's next CREATE). A stray deployer transaction first
+        // would move the reactor; with EXPECTED_REACTOR set the run reverts before anything is broadcast.
+        address expected = vm.envOr("EXPECTED_REACTOR", address(0));
+        if (expected != address(0) && address(reactor) != expected) {
+            revert UnexpectedReactor(address(reactor), expected);
+        }
 
         console2.log("permit2", permit2);
         console2.log("reactorFeeOwner", feeOwner);

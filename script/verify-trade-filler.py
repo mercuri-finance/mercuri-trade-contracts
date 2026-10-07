@@ -718,8 +718,10 @@ def preflight_self_test():
     ok = True
     base = load('deployments/manifest-5042002.json')
     pending_keeper = dict(base, feeRecipient=RECIPIENT_SENTINEL)
+    pending_fee = dict(base, executionFee='REQUIRED_AT_MAINNET_OWNER_GO')
     for label, manifest, expected in (('deployments/manifest-5042002.json', base, []),
                                       ('testnet manifest with the keeper sentinel', pending_keeper, ['feeRecipient']),
+                                      ('testnet manifest with the fee sentinel', pending_fee, ['executionFee']),
                                       ('deployments/manifest-5042.json', load('deployments/manifest-5042.json'), [])):
         problems, waiting = preflight(manifest)
         if problems or waiting != expected:

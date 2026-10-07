@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {Script, console2} from "forge-std/Script.sol";
+import {VmSafe} from "forge-std/Vm.sol";
 
 /// @notice Shared manifest reader for the Trade deployment scripts on Arc testnet and Arc mainnet. Holds no key and
 ///         never broadcasts.
@@ -29,6 +30,8 @@ abstract contract TradeManifest is Script {
         0x2fa86add0aed31f33a762c9d88e807c475bd51d0f52bd0955754b2608f7e4989;
 
     error WrongChain(uint256 chainId);
+    error NotArcNode(string clientVersion);
+    error UnexpectedReactor(address deployed, address expected);
     error NoCode(string name, address account);
     error ReactorFeeOwnerNotChosen();
     error FeeRecipientNotChosen();
@@ -47,8 +50,30 @@ abstract contract TradeManifest is Script {
 
     /// @dev Refuses any chain other than Arc testnet and Arc mainnet. A local fork keeps its network's chain id, so it
     ///      reads that network's manifest and Launch record.
-    function _requireArc() internal view {
+    function _requireArc() internal {
         if (block.chainid != TESTNET_CHAIN_ID && block.chainid != MAINNET_CHAIN_ID) revert WrongChain(block.chainid);
+        if (vm.isContext(VmSafe.ForgeContext.ScriptBroadcast)) {
+            _requireArcOrAnvilNode(vm.rpc("web3_clientVersion", "[]"));
+        }
+    }
+
+    /// @dev A broadcast must reach an Arc node or a loopback Anvil fork: any other client that reports an Arc chain id
+    ///      (a hosted simulator, another dev node) would write broadcast files indistinguishable from a real deploy.
+    function _requireArcOrAnvilNode(bytes memory clientVersion) internal pure {
+        // The cheatcode returns the version bare; a JSON-quoted one is accepted too.
+        uint256 offset = clientVersion.length > 0 && clientVersion[0] == '"' ? 1 : 0;
+        if (!_startsWith(clientVersion, offset, bytes("arc/")) && !_startsWith(clientVersion, offset, bytes("anvil/")))
+        {
+            revert NotArcNode(string(clientVersion));
+        }
+    }
+
+    function _startsWith(bytes memory haystack, uint256 offset, bytes memory prefix) internal pure returns (bool) {
+        if (offset + prefix.length > haystack.length) return false;
+        for (uint256 i; i < prefix.length; ++i) {
+            if (haystack[offset + i] != prefix[i]) return false;
+        }
+        return true;
     }
 
     /// @dev Virtual only so a test harness can run a script's `run()` end to end against a manifest fixture with the

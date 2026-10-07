@@ -17,6 +17,10 @@ import {MockFeeController} from "../utils/MockFeeController.sol";
 
 /// @dev Exposes the internal decision logic so tests pass inputs directly and never touch process-wide env vars.
 contract FillerHarness is DeployOrderFiller {
+    function requireArcOrAnvilNode(bytes memory client) external pure {
+        _requireArcOrAnvilNode(client);
+    }
+
     function resolve(string memory manifest, bool rehearsal, address override_, bytes memory client)
         external
         view
@@ -487,6 +491,32 @@ contract DeployScriptsTest is Test {
             vm.expectRevert(abi.encodeWithSelector(TradeManifest.WrongChain.selector, chains[i]));
             fillerScript.run();
         }
+    }
+
+    /// A broadcast reaches only an Arc node or a loopback Anvil: another client reporting an Arc chain id is refused.
+    function test_broadcastNeedsArcOrAnvilNode() public {
+        FillerHarness h = new FillerHarness();
+        h.requireArcOrAnvilNode(bytes("arc/v1"));
+        h.requireArcOrAnvilNode(bytes("anvil/v1.4.3"));
+        h.requireArcOrAnvilNode(bytes('"arc/v1"'));
+        h.requireArcOrAnvilNode(bytes('"anvil/v1.4.3"'));
+        string[4] memory others = ["tenderly/v1", '"HardhatNetwork/2.22.0"', "Geth/v1.14.0", "x-arc/v1"];
+        for (uint256 i; i < others.length; ++i) {
+            vm.expectRevert(abi.encodeWithSelector(TradeManifest.NotArcNode.selector, others[i]));
+            h.requireArcOrAnvilNode(bytes(others[i]));
+        }
+    }
+
+    /// With EXPECTED_REACTOR set, a reactor that lands anywhere else reverts the run before it is broadcast.
+    function test_reactorScriptChecksExpectedAddress() public {
+        vm.setEnv("TRADE_LOCAL_REHEARSAL", "false");
+        vm.etch(PERMIT2, hex"00");
+        vm.setEnv("EXPECTED_REACTOR", "0x00000000000000000000000000000000000000E1");
+        DeployTestnetReactor script = new DeployTestnetReactor();
+        vm.expectPartialRevert(TradeManifest.UnexpectedReactor.selector);
+        script.run();
+        vm.setEnv("EXPECTED_REACTOR", "0x0000000000000000000000000000000000000000");
+        script.run();
     }
 
     /// On chain 5042 the reactor script reads the mainnet manifest and Launch's mainnet record, and deploys the same

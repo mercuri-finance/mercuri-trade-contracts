@@ -66,6 +66,25 @@ struct Basis {
     uint256 highWater;
 }
 
+/// @notice An agent's launch request. The account adds itself as creator and its stored referrer; the agent supplies
+///         neither.
+struct LaunchRequest {
+    /// @dev Token name, 1 to 32 bytes.
+    string name;
+    /// @dev Token symbol, 1 to 10 bytes.
+    string symbol;
+    /// @dev Permanent metadata reference, at most 256 bytes.
+    string metadataURI;
+    /// @dev CREATE2 salt, scoped by the Launch factory to the account.
+    bytes32 salt;
+    /// @dev Must equal `LaunchFactory.configHash()` at inclusion, so the terms (and fee) cannot change after quoting.
+    bytes32 expectedConfigHash;
+    /// @dev Initial buy, usdc6; zero for none. Sent as `initialBuyUsdc * 1e12` wei on top of the launch fee.
+    uint256 initialBuyUsdc;
+    /// @dev Minimum tokens of the initial buy, 18-decimal units; ignored by the factory without an initial buy.
+    uint256 minTokensOut;
+}
+
 /// @dev Scale of `Basis.highWater`: usdc6 per token unit times 1e36 (usdc6 per 1e18 tokens, times 1e18).
 uint256 constant HIGH_WATER_SCALE = 1e36;
 

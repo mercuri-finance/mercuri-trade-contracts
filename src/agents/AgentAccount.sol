@@ -6,6 +6,8 @@ import {ILaunchFactory} from "@mercuri/launch/interfaces/ILaunchFactory.sol";
 import {IFeeManager} from "@mercuri/launch/interfaces/IFeeManager.sol";
 import {IGraduationManager} from "@mercuri/launch/interfaces/IGraduationManager.sol";
 import {BondingCurve} from "@mercuri/launch/BondingCurve.sol";
+import {LaunchFactory} from "@mercuri/launch/LaunchFactory.sol";
+import {CreateParams} from "@mercuri/launch/libraries/LaunchTypes.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -14,7 +16,23 @@ import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/Reentrancy
 import {IAgentAccount} from "./interfaces/IAgentAccount.sol";
 import {IAgentPolicyRegistry} from "./interfaces/IAgentPolicyRegistry.sol";
 import {AgentPolicyLib} from "./AgentPolicyLib.sol";
-import {Policy, Basis, P_BUY, P_SELL, ACTION_BUY, ACTION_SELL, SCALE, HIGH_WATER_SCALE} from "./AgentTypes.sol";
+import {
+    LaunchRequest,
+    Policy,
+    Basis,
+    P_BUY,
+    P_SELL,
+    P_LAUNCH,
+    P_CLAIM,
+    P_SWEEP_TO_OWNER,
+    ACTION_BUY,
+    ACTION_SELL,
+    ACTION_LAUNCH,
+    ACTION_CLAIM,
+    ACTION_SWEEP,
+    SCALE,
+    HIGH_WATER_SCALE
+} from "./AgentTypes.sol";
 
 /// @notice A Mercurifi agent account: a per-user vault whose agent keys trade Launch tokens within owner-set caps and
 ///         can never withdraw. Withdrawals go only to the owner, and the owner has no trade path.
@@ -212,6 +230,54 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         emit AgentAction(msg.sender, ACTION_SELL, token, 0, usdcOut, -SafeCast.toInt256(sent), basisValue, periodId);
     }
 
+    /// @inheritdoc IAgentAccount
+    function launch(LaunchRequest calldata r) external nonReentrant returns (address token, address curve) {
+        (Policy memory p, uint64 periodId) = REGISTRY.authorize(msg.sender, P_LAUNCH, block.timestamp);
+        uint256 fee = LaunchFactory(address(LAUNCH_FACTORY)).config().launchFee;
+        uint256 feeUsdc = Math.ceilDiv(fee, SCALE);
+        // Compared as "at most what is left", so no input can overflow.
+        if (r.initialBuyUsdc > p.maxTradeUsdc || feeUsdc > p.maxTradeUsdc - r.initialBuyUsdc) {
+            revert TradeTooLarge(p.maxTradeUsdc);
+        }
+
+        uint256 balBefore = address(this).balance;
+        (token, curve) = LaunchFactory(address(LAUNCH_FACTORY)).createToken{value: fee + _toWei(r.initialBuyUsdc)}(
+            CreateParams(r.name, r.symbol, r.metadataURI, address(this), referrer, r.salt),
+            r.expectedConfigHash,
+            r.minTokensOut
+        );
+        uint256 spent = Math.ceilDiv(balBefore - address(this).balance, SCALE);
+        // The token is new, so the whole balance is the initial buy.
+        uint256 tokensOut = IERC20(token).balanceOf(address(this));
+
+        if (spent > p.maxTradeUsdc) revert TradeTooLarge(p.maxTradeUsdc);
+        REGISTRY.record(token, spent, 0, true);
+        uint256 cost;
+        if (tokensOut != 0) {
+            cost = spent > feeUsdc ? spent - feeUsdc : 0;
+            _addBasis(token, cost, tokensOut);
+        }
+        emit AgentAction(msg.sender, ACTION_LAUNCH, token, spent, 0, SafeCast.toInt256(tokensOut), cost, periodId);
+    }
+
+    /// @inheritdoc IAgentAccount
+    function claimFees() external nonReentrant returns (uint256 claimed) {
+        (, uint64 periodId) = REGISTRY.authorize(msg.sender, P_CLAIM, block.timestamp);
+        uint256 balBefore = address(this).balance;
+        FEE_MANAGER.claim(address(this));
+        claimed = (address(this).balance - balBefore) / SCALE;
+        emit AgentAction(msg.sender, ACTION_CLAIM, address(0), 0, claimed, 0, 0, periodId);
+    }
+
+    /// @inheritdoc IAgentAccount
+    function sweepToOwner(address token, uint256 amount) external nonReentrant {
+        (, uint64 periodId) = REGISTRY.authorize(msg.sender, P_SWEEP_TO_OWNER, block.timestamp);
+        if (amount == 0) revert ZeroAmount();
+        if (token != address(0)) _curve(token);
+        _send(owner(), token, amount);
+        emit AgentAction(msg.sender, ACTION_SWEEP, token, 0, 0, -SafeCast.toInt256(amount), 0, periodId);
+    }
+
     // ------------------------------------------------------------------ withdrawals
 
     /// @inheritdoc IAgentAccount
@@ -244,7 +310,7 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     // ------------------------------------------------------------------ internals
 
     /// @dev Adds a measured buy to `token`'s basis and raises its high-water average to the new average if higher.
-    ///      Used by every path that records a purchase (curve buys now; launch initial buys and pool buys later).
+    ///      Used by every path that records a purchase (curve buys, launch initial buys; pool buys later).
     /// @param token The token.
     /// @param spent USDC spent, usdc6.
     /// @param tokensIn Tokens received, 18-decimal units; non-zero.

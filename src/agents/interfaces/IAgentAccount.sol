@@ -7,6 +7,7 @@ import {ILaunchFactory} from "@mercuri/launch/interfaces/ILaunchFactory.sol";
 import {IFeeManager} from "@mercuri/launch/interfaces/IFeeManager.sol";
 import {IGraduationManager} from "@mercuri/launch/interfaces/IGraduationManager.sol";
 import {IAgentPolicyRegistry} from "./IAgentPolicyRegistry.sol";
+import {LaunchRequest} from "../AgentTypes.sol";
 
 /// @notice A Mercurifi agent account: a per-user vault whose agent keys trade Launch tokens within owner-set caps and
 ///         can never withdraw. Each account is an EIP-1167 clone of one immutable implementation. It holds the funds,
@@ -21,12 +22,15 @@ interface IAgentAccount is IERC1271 {
     ///         account.
     /// @param agent The agent key that sent the transaction.
     /// @param action `ACTION_*` id.
-    /// @param token The Launch token traded.
-    /// @param usdcSpent USDC that left the account, usdc6: the native balance delta rounded up (refunds netted).
+    /// @param token The Launch token traded, launched or swept; zero for a claim or a native sweep.
+    /// @param usdcSpent USDC that left the account, usdc6: the native balance delta rounded up (refunds netted;
+    ///        a launch includes its fee). Zero for a claim or sweep.
     /// @param usdcReceived USDC that entered the account, usdc6: the native balance delta rounded down.
-    /// @param tokenDelta Change in the account's balance of `token`, 18-decimal units (positive on a buy).
-    /// @param basisValue usdc6. A buy: the cost added to the basis (equals `usdcSpent`). A sell: the cost-basis value
-    ///        charged to `maxTradeUsdc` and `periodSellCap`.
+    /// @param tokenDelta Change in the account's balance of `token`, 18-decimal units (positive on a buy). A sweep:
+    ///        minus the amount sent, native wei when `token` is zero.
+    /// @param basisValue usdc6. A buy: the cost added to the basis (equals `usdcSpent`). A launch: the cost added to
+    ///        the basis (`usdcSpent` minus the fee, zero without an initial buy). A sell: the cost-basis value charged
+    ///        to `maxTradeUsdc` and `periodSellCap`. Zero for a claim or sweep.
     /// @param periodId `block.timestamp / periodSeconds` of the period charged.
     event AgentAction(
         address indexed agent,
@@ -167,6 +171,38 @@ interface IAgentAccount is IERC1271 {
     function sell(address token, uint256 tokensIn, uint256 minUsdcOut, uint256 deadline)
         external
         returns (uint256 usdcOut);
+
+    /// @notice Launches a new Launch token with the account as creator and, optionally, an initial buy into the
+    ///         account, within the policy's caps. Agent only (`P_LAUNCH`).
+    /// @dev Lock, then the registry's `authorize` (deadline: the current block). Calls `LaunchFactory.createToken`
+    ///      with `creator = address(this)`, `referrer` = the account's stored referrer and `value = launchFee +
+    ///      initialBuyUsdc * 1e12`, `launchFee` read from `LaunchFactory.config()`. The factory reverts
+    ///      `ConfigChanged` unless `expectedConfigHash` matches, so the fee paid is the fee quoted. The spend is the
+    ///      measured native balance delta rounded up to usdc6 (fee included); `ceil(launchFee / 1e12) +
+    ///      initialBuyUsdc` and the measured spend must be at most `maxTradeUsdc`, and the spend counts toward the
+    ///      period spend cap, the new token's per-token cap and `launchesPerPeriod` in the registry's `record`. The
+    ///      initial-buy tokens are recorded in the basis at cost `spent - ceil(launchFee / 1e12)` (never negative)
+    ///      and raise the high-water like a buy. The allowlist, token age and snipe limits do not apply.
+    /// @param r The launch request; amounts usdc6 and 18-decimal tokens.
+    /// @return token The new token.
+    /// @return curve Its bonding curve.
+    function launch(LaunchRequest calldata r) external returns (address token, address curve);
+    /// @notice Claims the account's creator and referral fees from the FeeManager into the account. Agent only
+    ///         (`P_CLAIM`).
+    /// @dev Lock, then `authorize` (counts one action). Calls `FeeManager.claim(address(this))` only, so fees can
+    ///      reach nowhere but the account; reverts `NothingToClaim` from the FeeManager when nothing is owed. No
+    ///      spend or sell cap is charged.
+    /// @return claimed Native USDC received, usdc6, the balance delta rounded down (every wei stays in the account).
+    function claimFees() external returns (uint256 claimed);
+    /// @notice Sends `amount` of native USDC or of a registered Launch token to the owner. Agent only
+    ///         (`P_SWEEP_TO_OWNER`).
+    /// @dev Lock, then `authorize` (counts one action). The recipient is always the owner read from the registry.
+    ///      A non-zero `token` must have a Launch curve (`TokenNotRegistered`), and its recorded basis is cut pro rata
+    ///      exactly as an owner `withdraw`. Emits `AccountWithdrawn` and `AgentAction` with `tokenDelta = -amount`
+    ///      (native wei when `token` is zero). No spend or sell cap is charged. Reverts `ZeroAmount` for zero.
+    /// @param token A registered Launch token, or zero for native USDC.
+    /// @param amount Native wei (18 decimals) for zero, else 18-decimal token units.
+    function sweepToOwner(address token, uint256 amount) external;
 
     /// @notice Sends `amount` of a token, or native USDC, to the owner.
     /// @dev Owner only (read from the registry); works while agents are paused, by the owner or the factory. For a

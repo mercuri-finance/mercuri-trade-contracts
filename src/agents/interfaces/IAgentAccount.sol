@@ -29,9 +29,9 @@ interface IAgentAccount is IERC1271 {
     /// @param tokenDelta Change in the account's balance of `token`, 18-decimal units (positive on a buy). A sweep:
     ///        minus the amount sent; a native sweep is encoded as `token = 0` and `tokenDelta = -wei` (native wei,
     ///        18 decimals).
-    /// @param basisValue usdc6. A buy: the cost added to the basis (equals `usdcSpent`). A launch: the cost added to
-    ///        the basis (`usdcSpent` minus the fee, zero without an initial buy). A sell: the cost-basis value charged
-    ///        to `maxTradeUsdc` and `periodSellCap`. Zero for a claim or sweep.
+    /// @param basisValue usdc6. A buy (curve or pool): the cost added to the basis (equals `usdcSpent`). A launch:
+    ///        the cost added to the basis (`usdcSpent` minus the fee, zero without an initial buy). A sell (curve or
+    ///        pool): the value charged to `maxTradeUsdc` and `periodSellCap`. Zero for a claim or sweep.
     /// @param periodId `block.timestamp / periodSeconds` of the period charged.
     event AgentAction(
         address indexed agent,
@@ -83,6 +83,13 @@ interface IAgentAccount is IERC1271 {
     error ZeroOutput();
     /// @notice An allowance the account granted for the trade survived it.
     error AllowanceNotCleared();
+    /// @notice The token's curve has not graduated, so it has no Launch pool to swap in.
+    error NotGraduated();
+    /// @notice The GraduationManager's pool key for the token does not use the LaunchHook or does not pair the token
+    ///         with USDC.
+    error UnexpectedPool();
+    /// @notice A pool swap took more than `amountIn` or paid less than `minAmountOut`, measured from balance deltas.
+    error UnexpectedSwapDelta();
 
     /// @notice Binds the referrer of a fresh clone. The registry already holds its owner, policy and agents.
     /// @dev Callable only by `FACTORY`, once, inside `createAccount`. Binds a non-zero referrer in the FeeManager.
@@ -172,6 +179,38 @@ interface IAgentAccount is IERC1271 {
     function sell(address token, uint256 tokensIn, uint256 minUsdcOut, uint256 deadline)
         external
         returns (uint256 usdcOut);
+
+    /// @notice Swaps exactly `amountIn` through the token's graduated Launch pool on the Universal Router, within the
+    ///         policy's caps. Agent only (`P_POOL_SWAP`).
+    /// @dev Lock, then `authorize`; then registration, phase `Graduated` (`NotGraduated`), `amountIn > 0`
+    ///      (`ZeroAmount`), `minAmountOut > 0` (`ZeroMinOut`) and both at most `type(uint128).max`
+    ///      (`AmountTooLarge`). The pool key is always `GraduationManager.poolKey(token)`, asserted to use `LAUNCH_HOOK`
+    ///      and to pair the token with USDC (`UnexpectedPool`); the agent cannot name a pool. The account approves
+    ///      Permit2 for exactly `amountIn` of the input and Permit2 the router for `uint160(amountIn)` expiring this
+    ///      block, then calls `execute(0x10, [actions 0x06 0x0c 0x0f], deadline)` (V4_SWAP with the allow-revert bit
+    ///      clear: SWAP_EXACT_IN_SINGLE with `minHopPriceX36 = 0` and `hookData = abi.encode(address(this))` so the
+    ///      LaunchHook attributes the fee to the account, SETTLE_ALL capped at `amountIn`, TAKE_ALL at least
+    ///      `minAmountOut`). Afterwards both allowances must be zero (`AllowanceNotCleared`), the input taken must be
+    ///      at most `amountIn` and the output at least `minAmountOut` (`UnexpectedSwapDelta`), and the move of the
+    ///      pool price from `sqrtPriceX96` before and after, `|(after / before)^2 - 1|` in basis points rounded down,
+    ///      at most `maxPriceImpactBps`. That limits the size of this swap only, not a price moved earlier.
+    ///      Buy (`buyToken`): `amountIn` is usdc6, the allowlist applies and `amountIn <= maxTradeUsdc`. The spend is
+    ///      the native balance delta rounded up to usdc6 (Arc's USDC ERC-20 view moves the native balance), charged to
+    ///      the period and per-token caps and added to the basis with the measured token delta.
+    ///      Sell: `amountIn` is 18-decimal tokens and `minAmountOut` usdc6. The value charged to `maxTradeUsdc` and
+    ///      `periodSellCap` is the cost basis exactly as for curve sells for the recorded share; tokens beyond the
+    ///      recorded amount are valued at their pro-rata share of the measured proceeds, rounded up. That share is a
+    ///      weaker bound than a quote taken before the swap: it is what a moved pool actually paid. Proceeds (native
+    ///      delta rounded down) never create headroom. Never sized from `minAmountOut`.
+    /// @param token The Launch token of the pool.
+    /// @param buyToken True to buy the token with USDC, false to sell it for USDC.
+    /// @param amountIn Exact input: usdc6 on a buy, 18-decimal tokens on a sell.
+    /// @param minAmountOut Minimum output: 18-decimal tokens on a buy, usdc6 on a sell; not zero.
+    /// @param deadline Latest Unix time (seconds), within `maxDeadlineSeconds` of now; also the router's deadline.
+    /// @return amountOut Output received: 18-decimal tokens on a buy, usdc6 (rounded down) on a sell.
+    function swapExactIn(address token, bool buyToken, uint256 amountIn, uint256 minAmountOut, uint256 deadline)
+        external
+        returns (uint256 amountOut);
 
     /// @notice Launches a new Launch token with the account as creator and, optionally, an initial buy into the
     ///         account, within the policy's caps. Agent only (`P_LAUNCH`).

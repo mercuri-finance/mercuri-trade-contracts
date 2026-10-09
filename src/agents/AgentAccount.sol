@@ -2,11 +2,18 @@
 pragma solidity ^0.8.26;
 
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
+import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import {ILaunchFactory} from "@mercuri/launch/interfaces/ILaunchFactory.sol";
 import {IFeeManager} from "@mercuri/launch/interfaces/IFeeManager.sol";
 import {IGraduationManager} from "@mercuri/launch/interfaces/IGraduationManager.sol";
 import {BondingCurve} from "@mercuri/launch/BondingCurve.sol";
 import {LaunchFactory} from "@mercuri/launch/LaunchFactory.sol";
+import {GraduationManager} from "@mercuri/launch/GraduationManager.sol";
 import {CreateParams} from "@mercuri/launch/libraries/LaunchTypes.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
@@ -23,16 +30,33 @@ import {
     P_BUY,
     P_SELL,
     P_LAUNCH,
+    P_POOL_SWAP,
     P_CLAIM,
     P_SWEEP_TO_OWNER,
     ACTION_BUY,
     ACTION_SELL,
     ACTION_LAUNCH,
+    ACTION_POOL_BUY,
+    ACTION_POOL_SELL,
     ACTION_CLAIM,
     ACTION_SWEEP,
     SCALE,
     HIGH_WATER_SCALE
 } from "./AgentTypes.sol";
+
+/// @notice The one Universal Router entry point agent accounts call.
+interface IUniversalRouterExecute {
+    /// @notice Runs `commands` with their `inputs`, reverting after `deadline`.
+    /// @param commands One byte per command.
+    /// @param inputs ABI-encoded input of each command.
+    /// @param deadline Latest Unix time (seconds).
+    function execute(bytes calldata commands, bytes[] calldata inputs, uint256 deadline) external payable;
+}
+
+/// @dev Universal Router command V4_SWAP (0x10) with the allow-revert bit (0x80) clear.
+bytes constant V4_SWAP_COMMAND = hex"10";
+/// @dev V4 actions SWAP_EXACT_IN_SINGLE (0x06), SETTLE_ALL (0x0c), TAKE_ALL (0x0f).
+bytes constant V4_ACTIONS = hex"060c0f";
 
 /// @notice A Mercurifi agent account: a per-user vault whose agent keys trade Launch tokens within owner-set caps and
 ///         can never withdraw. Withdrawals go only to the owner, and the owner has no trade path.
@@ -43,6 +67,8 @@ import {
 ///      selfdestruct. The implementation itself is locked in its constructor and has no owner.
 contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
 
     /// @inheritdoc IAgentAccount
     address public immutable FACTORY;
@@ -196,15 +222,7 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         // Cost-basis value: the recorded share at cost (rounded up), tokens beyond it at their pre-trade quote.
         Basis memory b = _basis[token];
         uint256 recorded = tokensIn < b.tokens ? tokensIn : b.tokens;
-        uint256 basisValue;
-        if (recorded != 0) {
-            // The higher of the pro-rata cost (rounded up) and the high-water value (rounded down: the stored
-            // high-water is already rounded up), so a cheap buy after a crash cannot dilute earlier holdings and a
-            // whole single-lot position is charged exactly its cost.
-            basisValue = Math.mulDiv(recorded, b.costUsdc, b.tokens, Math.Rounding.Ceil);
-            uint256 hwValue = Math.mulDiv(recorded, b.highWater, HIGH_WATER_SCALE);
-            if (hwValue > basisValue) basisValue = hwValue;
-        }
+        uint256 basisValue = _recordedValue(b, recorded);
         if (tokensIn > recorded) {
             (uint256 excessOut,) = curve.quoteSell(tokensIn - recorded);
             basisValue += Math.ceilDiv(excessOut, SCALE);
@@ -228,6 +246,66 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         REGISTRY.record(token, 0, basisValue, false);
         if (recorded != 0) _cutBasis(token, b, recorded);
         emit AgentAction(msg.sender, ACTION_SELL, token, 0, usdcOut, -SafeCast.toInt256(sent), basisValue, periodId);
+    }
+
+    /// @inheritdoc IAgentAccount
+    function swapExactIn(address token, bool buyToken, uint256 amountIn, uint256 minAmountOut, uint256 deadline)
+        external
+        nonReentrant
+        returns (uint256 amountOut)
+    {
+        (Policy memory p, uint64 periodId) = REGISTRY.authorize(msg.sender, P_POOL_SWAP, deadline);
+        if (_curve(token).phase() != BondingCurve.Phase.Graduated) revert NotGraduated();
+        if (amountIn == 0) revert ZeroAmount();
+        if (minAmountOut == 0) revert ZeroMinOut();
+        if (amountIn > type(uint128).max || minAmountOut > type(uint128).max) revert AmountTooLarge();
+        // The key is derived, never supplied: the GraduationManager's pool for the token, through the LaunchHook.
+        PoolKey memory key = GraduationManager(address(GRADUATION_MANAGER)).poolKey(token);
+        address c0 = Currency.unwrap(key.currency0);
+        address c1 = Currency.unwrap(key.currency1);
+        if (address(key.hooks) != LAUNCH_HOOK || !((c0 == USDC && c1 == token) || (c0 == token && c1 == USDC))) {
+            revert UnexpectedPool();
+        }
+
+        uint256 balBefore = address(this).balance;
+        uint256 heldBefore = IERC20(token).balanceOf(address(this));
+        if (buyToken) {
+            if (p.allowlistOnly && !REGISTRY.tokenAllowed(address(this), token)) revert TokenNotAllowed();
+            if (amountIn > p.maxTradeUsdc) revert TradeTooLarge(p.maxTradeUsdc);
+            _poolSwap(key, USDC, token, amountIn, minAmountOut, deadline, p.maxPriceImpactBps);
+            // Arc's USDC ERC-20 view moves the native balance, so the router's pull shows in the native delta.
+            uint256 spent = Math.ceilDiv(balBefore - address(this).balance, SCALE);
+            amountOut = IERC20(token).balanceOf(address(this)) - heldBefore;
+            if (spent > amountIn || amountOut < minAmountOut) revert UnexpectedSwapDelta();
+            REGISTRY.record(token, spent, 0, false);
+            _addBasis(token, spent, amountOut);
+            emit AgentAction(
+                msg.sender, ACTION_POOL_BUY, token, spent, 0, SafeCast.toInt256(amountOut), spent, periodId
+            );
+        } else {
+            Basis memory b = _basis[token];
+            uint256 recorded = amountIn < b.tokens ? amountIn : b.tokens;
+            uint256 basisValue = _recordedValue(b, recorded);
+            if (basisValue > p.maxTradeUsdc) revert TradeTooLarge(p.maxTradeUsdc);
+            _poolSwap(key, token, USDC, amountIn, minAmountOut, deadline, p.maxPriceImpactBps);
+            uint256 receivedWei = address(this).balance - balBefore;
+            amountOut = receivedWei / SCALE;
+            uint256 sent = heldBefore - IERC20(token).balanceOf(address(this));
+            if (sent > amountIn || amountOut < minAmountOut) revert UnexpectedSwapDelta();
+            if (amountIn > recorded) {
+                // Unrecorded tokens at their pro-rata share of the measured proceeds, rounded up (weaker than cost:
+                // a pool moved beforehand sets it).
+                basisValue += Math.ceilDiv(
+                    Math.mulDiv(receivedWei, amountIn - recorded, amountIn, Math.Rounding.Ceil), SCALE
+                );
+                if (basisValue > p.maxTradeUsdc) revert TradeTooLarge(p.maxTradeUsdc);
+            }
+            REGISTRY.record(token, 0, basisValue, false);
+            if (recorded != 0) _cutBasis(token, b, recorded);
+            emit AgentAction(
+                msg.sender, ACTION_POOL_SELL, token, 0, amountOut, -SafeCast.toInt256(sent), basisValue, periodId
+            );
+        }
     }
 
     /// @inheritdoc IAgentAccount
@@ -310,7 +388,7 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     // ------------------------------------------------------------------ internals
 
     /// @dev Adds a measured buy to `token`'s basis and raises its high-water average to the new average if higher.
-    ///      Used by every path that records a purchase (curve buys, launch initial buys; pool buys later).
+    ///      Used by every path that records a purchase (curve buys, launch initial buys, pool buys).
     /// @param token The token.
     /// @param spent USDC spent, usdc6.
     /// @param tokensIn Tokens received, 18-decimal units; non-zero.
@@ -322,6 +400,67 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         b.tokens = SafeCast.toUint128(tokens);
         uint256 avg = Math.mulDiv(cost, HIGH_WATER_SCALE, tokens, Math.Rounding.Ceil);
         if (avg > b.highWater) b.highWater = avg;
+    }
+
+    /// @dev The cost-basis value of `recorded` recorded tokens (at most `b.tokens`): the higher of the pro-rata cost
+    ///      (rounded up) and the high-water value (rounded down: the stored high-water is already rounded up), so a
+    ///      cheap buy after a crash cannot dilute earlier holdings and a whole single-lot position is charged exactly
+    ///      its cost. Shared by curve and pool sells.
+    /// @param b The basis as loaded.
+    /// @param recorded Recorded tokens sold, 18-decimal units.
+    /// @return value usdc6.
+    function _recordedValue(Basis memory b, uint256 recorded) private pure returns (uint256 value) {
+        if (recorded == 0) return 0;
+        value = Math.mulDiv(recorded, b.costUsdc, b.tokens, Math.Rounding.Ceil);
+        uint256 hwValue = Math.mulDiv(recorded, b.highWater, HIGH_WATER_SCALE);
+        if (hwValue > value) value = hwValue;
+    }
+
+    /// @dev Swaps exactly `amountIn` of `input` for `output` in the pool `key` through the Universal Router, then
+    ///      asserts both transient allowances are zero and the pool price moved at most `maxImpactBps`.
+    /// @param key The derived Launch pool key.
+    /// @param input Input currency (USDC or the token).
+    /// @param output Output currency.
+    /// @param amountIn Exact input, in `input`'s ERC-20 units; at most `type(uint128).max`.
+    /// @param minOut Minimum output, in `output`'s ERC-20 units; at most `type(uint128).max`.
+    /// @param deadline The router's deadline, Unix seconds.
+    /// @param maxImpactBps `maxPriceImpactBps`.
+    function _poolSwap(
+        PoolKey memory key,
+        address input,
+        address output,
+        uint256 amountIn,
+        uint256 minOut,
+        uint256 deadline,
+        uint256 maxImpactBps
+    ) private {
+        PoolId id = key.toId();
+        (uint160 sqrtBefore,,,) = POOL_MANAGER.getSlot0(id);
+        IERC20(input).forceApprove(PERMIT2, amountIn);
+        IAllowanceTransfer(PERMIT2).approve(input, UNIVERSAL_ROUTER, uint160(amountIn), uint48(block.timestamp));
+
+        bytes[] memory params = new bytes[](3);
+        params[0] = abi.encode(
+            IV4Router.ExactInputSingleParams(
+                key,
+                input == Currency.unwrap(key.currency0),
+                uint128(amountIn),
+                uint128(minOut),
+                0,
+                abi.encode(address(this))
+            )
+        );
+        params[1] = abi.encode(input, amountIn);
+        params[2] = abi.encode(output, minOut);
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = abi.encode(V4_ACTIONS, params);
+        IUniversalRouterExecute(UNIVERSAL_ROUTER).execute(V4_SWAP_COMMAND, inputs, deadline);
+
+        if (IERC20(input).allowance(address(this), PERMIT2) != 0) revert AllowanceNotCleared();
+        (uint160 left,,) = IAllowanceTransfer(PERMIT2).allowance(address(this), input, UNIVERSAL_ROUTER);
+        if (left != 0) revert AllowanceNotCleared();
+        (uint160 sqrtAfter,,,) = POOL_MANAGER.getSlot0(id);
+        _checkImpact(AgentPolicyLib.poolImpactBps(sqrtBefore, sqrtAfter), maxImpactBps);
     }
 
     /// @dev Removes `cut` recorded tokens (at most `b.tokens`) and their pro-rata cost, rounded down so the

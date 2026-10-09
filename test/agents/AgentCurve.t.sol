@@ -8,7 +8,7 @@ import {AgentFixture} from "./AgentFixture.sol";
 import {AgentAccount} from "../../src/agents/AgentAccount.sol";
 import {IAgentAccount} from "../../src/agents/interfaces/IAgentAccount.sol";
 import {IAgentPolicyRegistry} from "../../src/agents/interfaces/IAgentPolicyRegistry.sol";
-import {Policy, P_BUY, P_SELL, ACTION_BUY, ACTION_SELL} from "../../src/agents/AgentTypes.sol";
+import {Policy, InitParams, P_BUY, P_SELL, ACTION_BUY, ACTION_SELL} from "../../src/agents/AgentTypes.sol";
 
 /// @dev Task 3: capped curve buys and sells with cost basis (spec sections 4.2, 4.5 and 4.6).
 contract AgentCurveTest is AgentFixture {
@@ -49,6 +49,20 @@ contract AgentCurveTest is AgentFixture {
     function _sell(uint256 tokensIn) internal returns (uint256) {
         vm.prank(agentKey);
         return account.sell(address(token), tokensIn, 1, _dl());
+    }
+
+    /// @dev The account's valuation of `rec` recorded tokens: at the higher of the current average and the
+    ///      high-water, rounded up (spec ruling I-1).
+    function _recordedValue(uint256 rec) internal view returns (uint256) {
+        return _recordedValueOf(account, address(token), rec);
+    }
+
+    function _recordedValueOf(AgentAccount acct, address t, uint256 rec) internal view returns (uint256) {
+        (uint128 cost, uint128 tokens, uint256 hw) = acct.basis(t);
+        if (tokens == 0) return 0;
+        uint256 avg = Math.mulDiv(cost, 1e36, tokens, Math.Rounding.Ceil);
+        if (hw > avg) avg = hw;
+        return Math.mulDiv(rec, avg, 1e36, Math.Rounding.Ceil);
     }
 
     function _narrow(Policy memory p) internal {
@@ -103,7 +117,7 @@ contract AgentCurveTest is AgentFixture {
 
         assertEq(token.balanceOf(address(account)), out);
         assertEq(bal0 - address(account).balance, 50e18);
-        (uint128 cost, uint128 held) = account.basis(address(token));
+        (uint128 cost, uint128 held,) = account.basis(address(token));
         assertEq(cost, 50e6);
         assertEq(held, out);
         (uint64 pid, uint64 spent, uint64 sold, uint32 actions, uint16 launches) = registry.usage(address(account));
@@ -126,7 +140,8 @@ contract AgentCurveTest is AgentFixture {
         uint256 held = _buy(50e6);
         uint256 half = held / 3;
         (uint256 usdcOut,) = curve.quoteSell(half);
-        uint256 value = Math.mulDiv(half, 50e6, held, Math.Rounding.Ceil);
+        uint256 value = _recordedValue(half);
+        assertGe(value, Math.mulDiv(half, 50e6, held, Math.Rounding.Ceil));
         uint256 bal0 = address(account).balance;
 
         vm.expectEmit(true, false, false, false, address(curve));
@@ -140,7 +155,7 @@ contract AgentCurveTest is AgentFixture {
         assertEq(address(account).balance - bal0, usdcOut, "native USDC in");
         assertEq(token.balanceOf(address(account)), held - half);
         assertEq(token.allowance(address(account), address(curve)), 0);
-        (uint128 cost, uint128 tokens) = account.basis(address(token));
+        (uint128 cost, uint128 tokens,) = account.basis(address(token));
         assertEq(tokens, held - half);
         assertEq(cost, 50e6 - Math.mulDiv(50e6, half, held));
         assertEq(_usageSold(), value);
@@ -149,7 +164,7 @@ contract AgentCurveTest is AgentFixture {
 
         // Selling the rest clears the basis exactly.
         _sell(held - half);
-        (cost, tokens) = account.basis(address(token));
+        (cost, tokens,) = account.basis(address(token));
         assertEq(cost, 0);
         assertEq(tokens, 0);
         // Values round up and the basis reduction rounds down, so a split exit is charged its cost plus at most
@@ -318,9 +333,10 @@ contract AgentCurveTest is AgentFixture {
         Policy memory p = _defaultPolicy();
         p.maxTradeUsdc = 50e6;
         _narrow(p);
-        // The sell is valued at cost (100), not at its proceeds (about 98).
+        // The sell is valued at cost (100), not at its proceeds (about 98). Half (less a whole token, to absorb
+        // the upward rounding of the high-water valuation) fits.
         _expectSellRevert(abi.encodeWithSelector(IAgentAccount.TradeTooLarge.selector, 50e6), held);
-        _sell(held / 2);
+        _sell(held / 2 - 1e18);
     }
 
     function test_PeriodSpendExceeded() public {
@@ -348,10 +364,14 @@ contract AgentCurveTest is AgentFixture {
         Policy memory p = _defaultPolicy();
         p.periodSellCap = 50e6;
         _narrow(p);
-        _expectSellRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, 50e6), held);
-        _sell(held / 2);
-        assertEq(_usageSold(), 50e6);
-        _expectSellRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, 0), held / 4);
+        _expectSellRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, 50e6), held * 3 / 4);
+        _sell(held / 2 - 1e18);
+        uint64 sold = _usageSold();
+        assertLe(sold, 50e6);
+        assertGt(sold, 50e6 - 10, "about half the cost");
+        _expectSellRevert(
+            abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, 50e6 - sold), held / 4
+        );
     }
 
     function test_ActionLimit() public {
@@ -425,7 +445,7 @@ contract AgentCurveTest is AgentFixture {
         uint256 spent6 = Math.ceilDiv(delta, 1e12);
         assertEq(_usageSpent(), spent6);
         assertEq(registry.tokenSpent(address(account), address(token)), spent6);
-        (uint128 cost, uint128 tokens) = account.basis(address(token));
+        (uint128 cost, uint128 tokens,) = account.basis(address(token));
         assertEq(cost, spent6);
         assertEq(tokens, remaining);
     }
@@ -509,12 +529,13 @@ contract AgentCurveTest is AgentFixture {
         (uint64 hsBefore,,,) = registry.headroom(address(account));
 
         (uint256 quoteExtra,) = curve.quoteSell(extra);
-        uint256 expected = 50e6 + Math.ceilDiv(quoteExtra, 1e12);
+        uint256 expected = _recordedValue(held) + Math.ceilDiv(quoteExtra, 1e12);
+        assertLe(_recordedValue(held), 50e6 + 1, "recorded part at cost");
         uint256 total = held + extra;
         _sell(total);
 
         assertEq(_usageSold(), expected, "recorded at cost plus excess at quote");
-        (uint128 cost, uint128 tokens) = account.basis(address(token));
+        (uint128 cost, uint128 tokens,) = account.basis(address(token));
         assertEq(cost, 0);
         assertEq(tokens, 0);
         (uint64 hsAfter,,,) = registry.headroom(address(account));
@@ -534,6 +555,253 @@ contract AgentCurveTest is AgentFixture {
         assertEq(_usageSpent(), 0);
     }
 
+    // ---------------------------------------------------------------- high-water cost (fix round 1, I-1)
+
+    /// @dev An account at the beta ceilings with the given sell cap, funded with 100,000 USDC.
+    function _bigAccount(bytes32 salt, uint64 sellCap) internal returns (AgentAccount a) {
+        InitParams memory p = _defaults();
+        p.policy = _ceilings();
+        p.policy.periodSellCap = sellCap;
+        a = _account(accountOwner, salt, p);
+        vm.deal(address(a), 100_000e18);
+    }
+
+    function _buyAs(AgentAccount a, uint256 usdcIn) internal returns (uint256) {
+        uint256 dl = _dl();
+        vm.prank(agentKey);
+        return a.buy(address(token), usdcIn, 1, dl);
+    }
+
+    function _sellAs(AgentAccount a, uint256 tokensIn) internal returns (uint256) {
+        uint256 dl = _dl();
+        vm.prank(agentKey);
+        return a.sell(address(token), tokensIn, 1, dl);
+    }
+
+    function _soldOf(AgentAccount a) internal view returns (uint64 sold) {
+        (,, sold,,) = registry.usage(address(a));
+    }
+
+    /// @dev Bob sells `pct` percent of his tokens back to the curve.
+    function _bobDumps(uint256 pct) internal {
+        uint256 amt = token.balanceOf(bob) * pct / 100;
+        if (amt == 0) return;
+        (uint256 out, uint256 fee) = curve.quoteSell(amt);
+        if (out + fee == 0) return;
+        vm.startPrank(bob);
+        token.approve(address(curve), amt);
+        curve.sell(amt, 0, address(0), type(uint256).max);
+        vm.stopPrank();
+    }
+
+    /// @dev Sells every recorded token of `a` in chunks valued at most 900 USDC (under `maxTradeUsdc`), stopping at
+    ///      dust the curve would pay nothing for.
+    function _exitAll(AgentAccount a) internal {
+        for (uint256 i; i < 64; ++i) {
+            (uint128 cost, uint128 tokens, uint256 hw) = a.basis(address(token));
+            if (tokens == 0) return;
+            uint256 avg = Math.mulDiv(cost, 1e36, tokens, Math.Rounding.Ceil);
+            if (hw > avg) avg = hw;
+            uint256 chunk = Math.mulDiv(900e6, 1e36, avg);
+            if (chunk > tokens) chunk = tokens;
+            (uint256 q,) = curve.quoteSell(chunk);
+            if (q < 1e12) return;
+            _sellAs(a, chunk);
+        }
+    }
+
+    /// @dev The ruling's scenario: 1,000 USDC of holdings, a ~90% crash, a 500 USDC buy at the bottom. Without the
+    ///      high-water the average falls about 4x and the 500 sell cap would cover all the original holdings.
+    function test_CrashThenCheapBuyCannotDiluteOriginalHoldings() public {
+        AgentAccount a = _bigAccount(bytes32("crash"), 500e6);
+        vm.prank(bob);
+        curve.buy{value: 15_000e18}(0, address(0), type(uint256).max);
+        uint256 original = _buyAs(a, 1_000e6);
+        (,, uint256 hw0) = a.basis(address(token));
+        assertEq(hw0, Math.mulDiv(1_000e6, 1e36, original, Math.Rounding.Ceil));
+
+        uint256 p0 = curve.price();
+        _bobDumps(100);
+        assertLt(curve.price(), p0 * 15 / 100, "crashed by more than 85%");
+
+        uint256 cheap = _buyAs(a, 500e6);
+        assertGt(cheap, original * 4, "the bottom buy gets several times more tokens");
+        (uint128 cost, uint128 tokens, uint256 hw) = a.basis(address(token));
+        assertEq(cost, 1_500e6);
+        assertEq(hw, hw0, "high-water kept");
+        uint256 diluted = Math.mulDiv(original, cost, tokens, Math.Rounding.Ceil);
+        assertLt(diluted, 500e6, "the plain average would value all original holdings under the 500 cap");
+        assertGe(_recordedValueOf(a, address(token), original), 1_000e6, "valued at what they cost");
+
+        // Selling 60% of the original holdings is charged about 600 > 500: the cap binds.
+        uint256 dl = _dl();
+        vm.prank(agentKey);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, 500e6));
+        a.sell(address(token), original * 6 / 10, 1, dl);
+        // Half of them (less a whole token for rounding) uses the whole cap.
+        _sellAs(a, original / 2 - 1e18);
+        uint256 left = 500e6 - _soldOf(a);
+        assertLt(left, 1e6, "the whole cap is used");
+        vm.prank(agentKey);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, left));
+        a.sell(address(token), original / 10, 1, dl);
+    }
+
+    function test_DcaDownIsValuedAtTheHighWater() public {
+        AgentAccount a = _bigAccount(bytes32("dca"), 10_000e6);
+        vm.prank(bob);
+        curve.buy{value: 10_000e18}(0, address(0), type(uint256).max);
+        _buyAs(a, 300e6);
+        (,, uint256 hw1) = a.basis(address(token));
+        _bobDumps(50);
+        _buyAs(a, 300e6);
+        _bobDumps(100);
+        _buyAs(a, 300e6);
+
+        (uint128 cost, uint128 tokens, uint256 hw) = a.basis(address(token));
+        assertEq(cost, 900e6);
+        assertEq(hw, hw1, "the first, highest average stays");
+        uint256 avgNow = Math.mulDiv(cost, 1e36, tokens, Math.Rounding.Ceil);
+        assertLt(avgNow, hw, "averaging down lowered the plain average");
+        uint256 full = _recordedValueOf(a, address(token), tokens);
+        assertGt(full, cost, "a full exit is valued above what it cost");
+
+        _exitAll(a);
+        (, tokens,) = a.basis(address(token));
+        assertEq(tokens, 0);
+        assertGe(_soldOf(a), full, "charged at least the high-water value");
+        assertLe(_soldOf(a), full + 64, "plus at most one unit per chunk");
+    }
+
+    function test_HighWaterResetsAfterFullExit() public {
+        vm.prank(bob);
+        curve.buy{value: 5_000e18}(0, address(0), type(uint256).max);
+        uint256 held = _buy(100e6);
+        (,, uint256 hw1) = account.basis(address(token));
+        assertGt(hw1, 0);
+        _sell(held / 2);
+        (,, uint256 hwMid) = account.basis(address(token));
+        assertEq(hwMid, hw1, "unchanged while the position is open");
+        _sell(token.balanceOf(address(account)));
+        (uint128 cost, uint128 tokens, uint256 hw) = account.basis(address(token));
+        assertEq(cost, 0);
+        assertEq(tokens, 0);
+        assertEq(hw, 0, "closed position resets the high-water");
+
+        // A new position at a lower price starts its own high-water.
+        _bobDumps(100);
+        vm.warp(_now() + 1 days);
+        held = _buy(100e6);
+        (cost, tokens, hw) = account.basis(address(token));
+        assertEq(hw, Math.mulDiv(cost, 1e36, tokens, Math.Rounding.Ceil));
+        assertLt(hw, hw1);
+    }
+
+    /// @dev Random buy/sell sequences with the price pushed up and down in between. Every sell's charged value covers
+    ///      the cost it removed from the basis; a full exit is charged at least everything spent; the high-water never
+    ///      falls while the position is open.
+    function testFuzz_SellValuesCoverTheCostTheyRemove(uint256 seed) public {
+        AgentAccount a = _bigAccount(bytes32("fuzz"), 10_000e6);
+        vm.prank(bob);
+        curve.buy{value: 3_000e18}(0, address(0), type(uint256).max);
+        uint256 spent;
+        uint256 charged;
+        uint256 removed;
+        uint256 lastHw;
+        for (uint256 i; i < 10; ++i) {
+            uint256 r = uint256(keccak256(abi.encode(seed, i)));
+            uint256 op = r % 4;
+            r >>= 8;
+            if (op == 0) {
+                uint256 amt = 1 + r % 30e6;
+                uint256 bal0 = address(a).balance;
+                _buyAs(a, amt);
+                spent += Math.ceilDiv(bal0 - address(a).balance, 1e12);
+            } else if (op == 1) {
+                vm.prank(bob);
+                curve.buy{value: 1e18 + r % 500e18}(0, address(0), type(uint256).max);
+            } else if (op == 2) {
+                _bobDumps(r % 100);
+            } else {
+                (uint128 cost, uint128 tokens,) = a.basis(address(token));
+                if (tokens == 0) continue;
+                uint256 amt = uint256(tokens) * (1 + r % 100) / 100;
+                (uint256 q,) = curve.quoteSell(amt);
+                if (amt == 0 || q < 1e12 || _recordedValueOf(a, address(token), amt) > 900e6) continue;
+                uint64 sold0 = _soldOf(a);
+                _sellAs(a, amt);
+                (uint128 cost2,,) = a.basis(address(token));
+                charged += _soldOf(a) - sold0;
+                removed += cost - cost2;
+                assertGe(charged, removed, "each sell covers the cost it removes");
+            }
+            (, uint128 t, uint256 hw) = a.basis(address(token));
+            if (t != 0) assertGe(hw, lastHw, "high-water never falls while open");
+            lastHw = hw;
+        }
+        uint64 soldBefore = _soldOf(a);
+        (uint128 costLeft,,) = a.basis(address(token));
+        _exitAll(a);
+        (uint128 costEnd, uint128 tokensEnd,) = a.basis(address(token));
+        charged += _soldOf(a) - soldBefore;
+        removed += costLeft - costEnd;
+        assertGe(charged, removed, "sells cover the cost they removed");
+        assertEq(removed + costEnd, spent, "basis accounts for every usdc6 spent");
+        if (tokensEnd == 0) assertGe(charged, spent, "a full exit is charged at least what was spent");
+    }
+
+    // ---------------------------------------------------------------- owner withdrawal cuts the basis (M-1)
+
+    function test_OwnerWithdrawalCutsBasisAndReturnedTokensAreUnrecorded() public {
+        uint256 held = _buy(80e6);
+        (,, uint256 hw) = account.basis(address(token));
+        uint256 out = held / 4;
+        vm.prank(accountOwner);
+        account.withdraw(address(token), out);
+        (uint128 cost, uint128 tokens, uint256 hw2) = account.basis(address(token));
+        uint256 cut = Math.mulDiv(held, out, held, Math.Rounding.Ceil);
+        assertEq(tokens, held - cut, "recorded tokens cut pro rata");
+        assertEq(cost, 80e6 - Math.mulDiv(80e6, cut, held), "cost cut pro rata, rounded down");
+        assertEq(hw2, hw, "high-water unchanged while open");
+
+        // Sent back by the owner, the tokens are unrecorded and valued by quote.
+        vm.prank(accountOwner);
+        token.transfer(address(account), out);
+        (uint256 q,) = curve.quoteSell(out);
+        uint256 expected = _recordedValue(tokens) + Math.ceilDiv(q, 1e12);
+        uint64 sold0 = _usageSold();
+        _sell(held);
+        assertEq(_usageSold() - sold0, expected);
+
+        // Emptying a token through `withdrawMany` clears its basis entirely.
+        _buy(10e6);
+        address[] memory list = new address[](1);
+        list[0] = address(token);
+        vm.prank(accountOwner);
+        account.withdrawMany(list);
+        (cost, tokens, hw) = account.basis(address(token));
+        assertEq(cost, 0);
+        assertEq(tokens, 0);
+        assertEq(hw, 0);
+    }
+
+    // ---------------------------------------------------------------- graduation pending (M-2)
+
+    function test_GraduationPendingBlocksBuysAndAllowsSells() public {
+        _fillCurveLeaving(60e18 + 123_456_789);
+        vm.mockCallRevert(address(gm), abi.encodeWithSelector(gm.graduate.selector), bytes("graduation down"));
+        uint256 out = _buy(100e6);
+        assertEq(uint8(curve.phase()), uint8(BondingCurve.Phase.GraduationPending), "graduation deferred");
+        vm.clearMockedCalls();
+
+        _expectBuyRevert(abi.encodeWithSelector(IAgentAccount.NotTrading.selector), 1e6);
+        uint64 sold0 = _usageSold();
+        uint256 v = _recordedValue(out / 2);
+        _sell(out / 2);
+        assertEq(_usageSold() - sold0, v, "the pending-phase sell is charged its basis value");
+        assertEq(uint8(curve.phase()), uint8(BondingCurve.Phase.Trading), "the sell reopens trading");
+    }
+
     // ---------------------------------------------------------------- fuzz (Review Focus 1)
 
     function testFuzz_UnitsRoundTheSafeWay(uint256 preBuy, uint256 usdcIn, uint256 sellAmt) public {
@@ -551,7 +819,7 @@ contract AgentCurveTest is AgentFixture {
         assertGe(uint256(spent6) * 1e12, delta, "spent rounds up");
         assertLt(uint256(spent6) * 1e12 - delta, 1e12);
         assertLe(spent6, usdcIn);
-        (uint128 cost, uint128 tokens) = account.basis(address(token));
+        (uint128 cost, uint128 tokens,) = account.basis(address(token));
         assertEq(cost, spent6, "basis is what was spent");
         assertEq(tokens, token.balanceOf(address(account)));
 
@@ -564,7 +832,7 @@ contract AgentCurveTest is AgentFixture {
         delta = address(account).balance - bal0;
         assertLe(got6 * 1e12, delta, "received rounds down");
         assertLt(delta - got6 * 1e12, 1e12);
-        (uint128 cost2, uint128 tokens2) = account.basis(address(token));
+        (uint128 cost2, uint128 tokens2,) = account.basis(address(token));
         assertLe(cost2, cost, "basis never grows on a sell");
         assertEq(tokens2, tokens - sellAmt);
         assertGe(uint256(_usageSold()) + cost2, cost, "sold value plus remaining cost covers the cost");

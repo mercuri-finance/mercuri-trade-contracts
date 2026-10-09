@@ -60,7 +60,13 @@ struct Basis {
     uint128 costUsdc;
     /// @dev Tokens bought and still held, in the token's 18-decimal units.
     uint128 tokens;
+    /// @dev Highest average cost the position has had after any buy: usdc6 per 1e18 token units, scaled by 1e18
+    ///      (`ceil(costUsdc * 1e36 / tokens)`). Never decreases while the position is open; zero once `tokens` is 0.
+    uint256 highWater;
 }
+
+/// @dev Scale of `Basis.highWater`: usdc6 per token unit times 1e36 (usdc6 per 1e18 tokens, times 1e18).
+uint256 constant HIGH_WATER_SCALE = 1e36;
 
 /// @notice Parameters of a new account, passed to `AgentAccountFactory.createAccount`.
 struct InitParams {

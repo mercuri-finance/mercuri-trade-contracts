@@ -121,11 +121,14 @@ interface IAgentAccount is IERC1271 {
     /// @notice The referrer bound in the FeeManager at creation, fixed for life.
     /// @return The referrer, or zero for none.
     function referrer() external view returns (address);
-    /// @notice The account's recorded cost basis in `token`.
+    /// @notice The account's recorded cost basis in `token`. Only tokens the account bought are recorded; an owner
+    ///         withdrawal cuts the recording pro rata, so tokens that come back later are unrecorded.
     /// @param token The token.
     /// @return costUsdc USDC paid for the recorded tokens, usdc6.
     /// @return tokens Recorded tokens, 18-decimal units.
-    function basis(address token) external view returns (uint128 costUsdc, uint128 tokens);
+    /// @return highWater Highest average cost of the open position after any buy, usdc6 per token unit times 1e36;
+    ///         zero once the position is closed.
+    function basis(address token) external view returns (uint128 costUsdc, uint128 tokens, uint256 highWater);
 
     /// @notice Buys `token` on its Launch curve with native USDC, within the policy's caps. Agent only (`P_BUY`).
     /// @dev Lock, then the registry's `authorize` (pauses, agent, deadline, period, action count); then
@@ -145,8 +148,11 @@ interface IAgentAccount is IERC1271 {
         returns (uint256 tokensOut);
     /// @notice Sells `token` back to its Launch curve, within the policy's caps. Agent only (`P_SELL`).
     /// @dev Phase `Trading` or `GraduationPending`. The trade's value is its cost basis: the recorded share
-    ///      `ceil(min(tokensIn, basis.tokens) * cost / tokens)` plus, for tokens beyond the recorded amount, their
-    ///      pre-trade `quoteSell` proceeds rounded up to usdc6. It is checked against `maxTradeUsdc` here and
+    ///      `min(tokensIn, basis.tokens)` at the higher of the current average cost and the position's high-water
+    ///      average (rounded up), so buying cheaply after a crash cannot dilute the value of earlier holdings; plus,
+    ///      for tokens beyond the recorded amount, their pre-trade `quoteSell` proceeds rounded up to usdc6. Tokens
+    ///      the account did not buy (transfers in, or tokens back after an owner withdrawal) are valued only by that
+    ///      quote, which an attacker can move, so they are not protected by the sell cap. It is checked against `maxTradeUsdc` here and
     ///      `periodSellCap` in the registry. Proceeds (native delta rounded down to usdc6) never create headroom.
     ///      The allowance granted to the curve must be zero afterwards. The allowlist does not apply to sells.
     ///      `minUsdcOut` above `type(uint256).max / 1e12` reverts `AmountTooLarge`.
@@ -160,12 +166,15 @@ interface IAgentAccount is IERC1271 {
         returns (uint256 usdcOut);
 
     /// @notice Sends `amount` of a token, or native USDC, to the owner.
-    /// @dev Owner only (read from the registry); works while agents are paused, by the owner or the factory.
+    /// @dev Owner only (read from the registry); works while agents are paused, by the owner or the factory. For a
+    ///      token with a recorded basis, the recording is cut pro rata to `amount / balance` (tokens rounded up,
+    ///      cost rounded down; the high-water stays unless the position closes), so tokens sent back later are
+    ///      unrecorded.
     /// @param token The token, or zero for native USDC.
     /// @param amount Native wei (18 decimals) for zero, else the token's own units.
     function withdraw(address token, uint256 amount) external;
     /// @notice Sends the full balance of each listed token, or of native USDC for zero, to the owner.
-    /// @dev Owner only. Zero balances are skipped, so repeats are harmless.
+    /// @dev Owner only. Zero balances are skipped, so repeats are harmless. Emptying a token clears its basis.
     /// @param tokens Tokens to empty; zero means native USDC.
     function withdrawMany(address[] calldata tokens) external;
 }

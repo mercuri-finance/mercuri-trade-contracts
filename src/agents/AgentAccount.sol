@@ -14,7 +14,7 @@ import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/Reentrancy
 import {IAgentAccount} from "./interfaces/IAgentAccount.sol";
 import {IAgentPolicyRegistry} from "./interfaces/IAgentPolicyRegistry.sol";
 import {AgentPolicyLib} from "./AgentPolicyLib.sol";
-import {Policy, Basis, P_BUY, P_SELL, ACTION_BUY, ACTION_SELL, SCALE} from "./AgentTypes.sol";
+import {Policy, Basis, P_BUY, P_SELL, ACTION_BUY, ACTION_SELL, SCALE, HIGH_WATER_SCALE} from "./AgentTypes.sol";
 
 /// @notice A Mercurifi agent account: a per-user vault whose agent keys trade Launch tokens within owner-set caps and
 ///         can never withdraw. Withdrawals go only to the owner, and the owner has no trade path.
@@ -119,9 +119,9 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     }
 
     /// @inheritdoc IAgentAccount
-    function basis(address token) external view returns (uint128 costUsdc, uint128 tokens) {
+    function basis(address token) external view returns (uint128 costUsdc, uint128 tokens, uint256 highWater) {
         Basis memory b = _basis[token];
-        return (b.costUsdc, b.tokens);
+        return (b.costUsdc, b.tokens, b.highWater);
     }
 
     // ------------------------------------------------------------------ agent trading
@@ -158,9 +158,7 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
 
         if (spent > p.maxTradeUsdc) revert TradeTooLarge(p.maxTradeUsdc);
         REGISTRY.record(token, spent, 0, false);
-        Basis storage b = _basis[token];
-        b.costUsdc += SafeCast.toUint128(spent);
-        b.tokens += SafeCast.toUint128(tokensOut);
+        _addBasis(token, spent, tokensOut);
         emit AgentAction(msg.sender, ACTION_BUY, token, spent, 0, SafeCast.toInt256(tokensOut), spent, periodId);
     }
 
@@ -181,7 +179,12 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         Basis memory b = _basis[token];
         uint256 recorded = tokensIn < b.tokens ? tokensIn : b.tokens;
         uint256 basisValue;
-        if (recorded != 0) basisValue = Math.mulDiv(recorded, b.costUsdc, b.tokens, Math.Rounding.Ceil);
+        if (recorded != 0) {
+            // The higher of the current average and the high-water: a cheap buy after a crash cannot dilute it.
+            uint256 avg = Math.mulDiv(b.costUsdc, HIGH_WATER_SCALE, b.tokens, Math.Rounding.Ceil);
+            if (b.highWater > avg) avg = b.highWater;
+            basisValue = Math.mulDiv(recorded, avg, HIGH_WATER_SCALE, Math.Rounding.Ceil);
+        }
         if (tokensIn > recorded) {
             (uint256 excessOut,) = curve.quoteSell(tokensIn - recorded);
             basisValue += Math.ceilDiv(excessOut, SCALE);
@@ -203,12 +206,7 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         uint256 sent = heldBefore - IERC20(token).balanceOf(address(this));
 
         REGISTRY.record(token, 0, basisValue, false);
-        if (recorded != 0) {
-            // Floor keeps the remaining cost at or above its pro-rata share; selling every recorded token clears it.
-            b.costUsdc -= uint128(Math.mulDiv(b.costUsdc, recorded, b.tokens));
-            b.tokens -= uint128(recorded);
-            _basis[token] = b;
-        }
+        if (recorded != 0) _cutBasis(token, b, recorded);
         emit AgentAction(msg.sender, ACTION_SELL, token, 0, usdcOut, -SafeCast.toInt256(sent), basisValue, periodId);
     }
 
@@ -242,6 +240,36 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     }
 
     // ------------------------------------------------------------------ internals
+
+    /// @dev Adds a measured buy to `token`'s basis and raises its high-water average to the new average if higher.
+    ///      Used by every path that records a purchase (curve buys now; launch initial buys and pool buys later).
+    /// @param token The token.
+    /// @param spent USDC spent, usdc6.
+    /// @param tokensIn Tokens received, 18-decimal units; non-zero.
+    function _addBasis(address token, uint256 spent, uint256 tokensIn) private {
+        Basis storage b = _basis[token];
+        uint256 cost = b.costUsdc + spent;
+        uint256 tokens = b.tokens + tokensIn;
+        b.costUsdc = SafeCast.toUint128(cost);
+        b.tokens = SafeCast.toUint128(tokens);
+        uint256 avg = Math.mulDiv(cost, HIGH_WATER_SCALE, tokens, Math.Rounding.Ceil);
+        if (avg > b.highWater) b.highWater = avg;
+    }
+
+    /// @dev Removes `cut` recorded tokens (at most `b.tokens`) and their pro-rata cost, rounded down so the
+    ///      remaining average never falls. Closing the position clears cost and high-water.
+    /// @param token The token.
+    /// @param b The basis as loaded (memory copy).
+    /// @param cut Recorded tokens to remove, 18-decimal units.
+    function _cutBasis(address token, Basis memory b, uint256 cut) private {
+        if (cut >= b.tokens) {
+            delete _basis[token];
+            return;
+        }
+        b.costUsdc -= uint128(Math.mulDiv(b.costUsdc, cut, b.tokens));
+        b.tokens -= uint128(cut);
+        _basis[token] = b;
+    }
 
     /// @dev Reverts `NotOwner` unless the caller is the account's owner in the registry.
     /// @return The owner.
@@ -284,6 +312,13 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
             (bool ok,) = to.call{value: amount}("");
             if (!ok) revert NativeTransferFailed();
         } else {
+            Basis memory b = _basis[token];
+            if (b.tokens != 0) {
+                // Cut the recording pro rata to the share of the balance withdrawn (tokens rounded up). An amount
+                // above the balance makes the cut whole and the transfer below revert.
+                uint256 bal = IERC20(token).balanceOf(address(this));
+                _cutBasis(token, b, bal == 0 ? b.tokens : Math.mulDiv(b.tokens, amount, bal, Math.Rounding.Ceil));
+            }
             IERC20(token).safeTransfer(to, amount);
         }
         emit AccountWithdrawn(token, amount);

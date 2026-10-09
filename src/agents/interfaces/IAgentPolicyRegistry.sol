@@ -187,6 +187,9 @@ interface IAgentPolicyRegistry {
     ///         pause, factory pause, an active and unexpired agent holding `permission`, a deadline in
     ///         `[now, now + maxDeadlineSeconds]`, the period roll and the action count, which it increments.
     /// @dev Callable only by a registered account, for itself (`msg.sender`). The account runs its own lock first.
+    ///      Every agent function counts one action here, including `claimFees` and `sweepToOwner`. For `P_LAUNCH` it
+    ///      also reverts `LaunchLimit` when the period's launches are used up, after the action check and before the
+    ///      account calls the LaunchFactory; `record` counts the launch.
     /// @param agent The agent key that called the account.
     /// @param permission The `P_*` bit the function needs.
     /// @param deadline The agent's deadline, Unix seconds.

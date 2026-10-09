@@ -95,7 +95,10 @@ interface IAgentAccountFactory {
     /// @notice Shortens, lifts or extends the current pause.
     /// @dev Admin only. Any `until <= pausedUntil` is allowed at any time (zero lifts). A later `until` is allowed
     ///      only while a pause is active (`NoActivePause` otherwise, so the admin cannot start a pause) and only up to
-    ///      `now + 30 days` (`PauseTooLong`). Does not change the guardian's cooldown.
+    ///      `now + 30 days` (`PauseTooLong`). The 30-day bound is measured from each call, not from the pause's start,
+    ///      so while a pause is active the admin can extend it again and again, each time to at most `now + 30 days`:
+    ///      a rolling extension with no overall limit. Each extension is a separate timelock operation (48 h delay on
+    ///      mainnet) and the admin can never start a pause. Does not change the guardian's cooldown.
     /// @param until Unix time (seconds) the pause ends.
     function adminSetPausedUntil(uint40 until) external;
     /// @notice Replaces the guardian.

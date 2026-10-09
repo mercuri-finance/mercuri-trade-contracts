@@ -216,7 +216,8 @@ interface IAgentAccount is IERC1271 {
     /// @notice Launches a new Launch token with the account as creator and, optionally, an initial buy into the
     ///         account, within the policy's caps. Agent only (`P_LAUNCH`).
     /// @dev Lock, then the registry's `authorize` with `r.deadline`, which must lie in `[now, now +
-    ///      maxDeadlineSeconds]` like a trade's, so a held or replayed launch expires. Calls `LaunchFactory.createToken`
+    ///      maxDeadlineSeconds]` like a trade's, so a held or replayed launch expires, and which reverts `LaunchLimit`
+    ///      when the period's `launchesPerPeriod` is used up, before any external call. Calls `LaunchFactory.createToken`
     ///      with `creator = address(this)`, `referrer` = the account's stored referrer and `value = launchFee +
     ///      initialBuyUsdc * 1e12`, `launchFee` read from `LaunchFactory.config()`. The factory reverts
     ///      `ConfigChanged` unless `expectedConfigHash` matches, so the fee paid is the fee quoted. The spend is the
@@ -232,14 +233,16 @@ interface IAgentAccount is IERC1271 {
     function launch(LaunchRequest calldata r) external returns (address token, address curve);
     /// @notice Claims the account's creator and referral fees from the FeeManager into the account. Agent only
     ///         (`P_CLAIM`).
-    /// @dev Lock, then `authorize` (counts one action). Calls `FeeManager.claim(address(this))` only, so fees can
-    ///      reach nowhere but the account; reverts `NothingToClaim` from the FeeManager when nothing is owed. No
-    ///      spend or sell cap is charged.
+    /// @dev Lock, then `authorize`, which counts one action against `maxActionsPerPeriod` like a trade, so claims
+    ///      consume the period's action budget. Calls `FeeManager.claim(address(this))` only, so fees can reach
+    ///      nowhere but the account; reverts `NothingToClaim` from the FeeManager when nothing is owed. No spend or
+    ///      sell cap is charged.
     /// @return claimed Native USDC received, usdc6, the balance delta rounded down (every wei stays in the account).
     function claimFees() external returns (uint256 claimed);
     /// @notice Sends `amount` of native USDC or of a registered Launch token to the owner. Agent only
     ///         (`P_SWEEP_TO_OWNER`).
-    /// @dev Lock, then `authorize` (counts one action). The recipient is always the owner read from the registry.
+    /// @dev Lock, then `authorize`, which counts one action against `maxActionsPerPeriod` like a trade, so sweeps
+    ///      consume the period's action budget. The recipient is always the owner read from the registry.
     ///      A non-zero `token` must have a Launch curve (`TokenNotRegistered`), and its recorded basis is cut pro rata
     ///      exactly as an owner `withdraw`. Emits `AccountWithdrawn` and `AgentAction` with `tokenDelta = -amount`
     ///      (native wei when `token` is zero). No spend or sell cap is charged. Reverts `ZeroAmount` for zero.

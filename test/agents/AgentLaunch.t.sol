@@ -218,6 +218,53 @@ contract AgentLaunchTest is AgentFixture {
         assertEq(_launches(), 1, "the limit resets with the period");
     }
 
+    function test_LaunchLimitFailsBeforeTheFactoryCall() public {
+        for (uint256 i = 1; i <= 3; ++i) {
+            _launch(bytes32(i), 0);
+        }
+        (,,, uint32 actions0,) = registry.usage(address(account));
+        uint256 bal0 = address(account).balance;
+        // Refused in the registry's preamble: the LaunchFactory is never called.
+        vm.expectCall(address(factory), abi.encodeWithSelector(LaunchFactory.createToken.selector), 0);
+        _expectLaunchRevert(
+            abi.encodeWithSelector(IAgentPolicyRegistry.LaunchLimit.selector), _req(bytes32(uint256(4)), 10e6)
+        );
+        // LaunchLimit comes before the account's own maxTradeUsdc check.
+        _expectLaunchRevert(
+            abi.encodeWithSelector(IAgentPolicyRegistry.LaunchLimit.selector), _req(bytes32(uint256(4)), 100e6)
+        );
+        (,,, uint32 actions1,) = registry.usage(address(account));
+        assertEq(actions1, actions0, "a refused launch uses no action");
+        assertEq(address(account).balance, bal0, "nothing spent");
+        assertEq(_launches(), 3);
+    }
+
+    function test_LaunchActionLimitComesBeforeLaunchLimit() public {
+        for (uint256 i = 1; i <= 3; ++i) {
+            _launch(bytes32(i), 0);
+        }
+        Policy memory p = _defaultPolicy();
+        p.maxActionsPerPeriod = 3;
+        _narrow(p);
+        _expectLaunchRevert(
+            abi.encodeWithSelector(IAgentPolicyRegistry.ActionLimit.selector), _req(bytes32(uint256(4)), 0)
+        );
+    }
+
+    function test_LaunchLimitPreCheckFollowsANarrowedLimit() public {
+        _launch(bytes32(uint256(1)), 0);
+        Policy memory p = _defaultPolicy();
+        p.launchesPerPeriod = 1;
+        _narrow(p);
+        vm.expectCall(address(factory), abi.encodeWithSelector(LaunchFactory.createToken.selector), 0);
+        _expectLaunchRevert(
+            abi.encodeWithSelector(IAgentPolicyRegistry.LaunchLimit.selector), _req(bytes32(uint256(2)), 0)
+        );
+        // Other agent functions are not subject to the launch limit.
+        vm.prank(agentKey);
+        account.sweepToOwner(address(0), 1e18);
+    }
+
     function test_LaunchWrongConfigHashBubblesFactoryError() public {
         LaunchRequest memory r = _req(bytes32(uint256(1)), 10e6);
         r.expectedConfigHash = bytes32(uint256(123));
@@ -457,6 +504,54 @@ contract AgentLaunchTest is AgentFixture {
         vm.prank(agentKey);
         account.sweepToOwner(address(0), amount);
         assertEq(accountOwner.balance - owner0, amount);
+    }
+
+    // ---------------------------------------------------------------- pauses
+
+    /// @dev Launch, claim and sweep are agent functions: the owner pause and the guardian pause stop each of them,
+    ///      and the owner's own exit still works.
+    function test_PausesStopLaunchClaimAndSweep() public {
+        address launched = _launchAndTrade();
+        assertGt(feeManager.balances(address(account)), 0, "fees owed, so only the pause can refuse the claim");
+        uint256 held = LaunchToken(launched).balanceOf(address(account));
+
+        vm.prank(accountOwner);
+        registry.pauseAgents(address(account), true);
+        _expectPausedLaunchClaimSweep(launched);
+        vm.prank(accountOwner);
+        account.withdraw(address(0), 1e18);
+
+        vm.prank(accountOwner);
+        registry.pauseAgents(address(account), false);
+        vm.prank(agentGuardian);
+        agentFactory.guardianPause();
+        _expectPausedLaunchClaimSweep(launched);
+        uint256 owner0 = LaunchToken(launched).balanceOf(accountOwner);
+        vm.prank(accountOwner);
+        account.withdraw(launched, held);
+        assertEq(LaunchToken(launched).balanceOf(accountOwner) - owner0, held, "owner exit during a guardian pause");
+
+        // Once the pause ends, each works again.
+        vm.warp(agentFactory.pausedUntil());
+        vm.prank(agentKey);
+        account.claimFees();
+        vm.prank(agentKey);
+        account.sweepToOwner(address(0), 1e18);
+        _launch(bytes32(uint256(9)), 0);
+    }
+
+    function _expectPausedLaunchClaimSweep(address launched) internal {
+        LaunchRequest memory r = _req(bytes32(uint256(9)), 0);
+        _expectLaunchRevert(abi.encodeWithSelector(IAgentPolicyRegistry.Paused.selector), r);
+        vm.prank(agentKey);
+        vm.expectRevert(IAgentPolicyRegistry.Paused.selector);
+        account.claimFees();
+        vm.prank(agentKey);
+        vm.expectRevert(IAgentPolicyRegistry.Paused.selector);
+        account.sweepToOwner(address(0), 1e18);
+        vm.prank(agentKey);
+        vm.expectRevert(IAgentPolicyRegistry.Paused.selector);
+        account.sweepToOwner(launched, 1);
     }
 
     // ---------------------------------------------------------------- utils

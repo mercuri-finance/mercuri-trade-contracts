@@ -12,8 +12,9 @@ import {Policy, InitParams, GUARDIAN_PAUSE, GUARDIAN_COOLDOWN, MAX_ADMIN_PAUSE} 
 /// @notice Creates Mercurifi agent accounts as EIP-1167 clones of one implementation, records them, holds the beta
 ///         policy ceilings and the guardian pause of agent functions.
 /// @dev Immutable, holds no funds. The admin (the network's Launch timelock) can only replace the guardian, shorten or
-///      lift a pause, and extend an active pause by at most 30 days from now; it cannot start a pause or touch
-///      accounts, policies or funds. A factory deployed with guardian zero can never pause: `guardianPause`,
+///      lift a pause, and extend an active pause to at most 30 days from now; it cannot start a pause or touch
+///      accounts, policies or funds. The 30 days run from each extension, so the admin can keep an active pause
+///      going indefinitely by extending it again before it ends (a rolling extension). A factory deployed with guardian zero can never pause: `guardianPause`,
 ///      `setGuardian` and `adminSetPausedUntil` revert forever.
 contract AgentAccountFactory is IAgentAccountFactory {
     /// @notice The factory's version.

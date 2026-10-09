@@ -10,6 +10,7 @@ import {
     Usage,
     InitParams,
     P_ALL,
+    P_LAUNCH,
     MAX_AGENTS,
     MAX_AGENT_TTL,
     QUEUE_TTL,
@@ -120,6 +121,9 @@ contract AgentPolicyRegistry is IAgentPolicyRegistry {
     ///         pause, factory pause, an active and unexpired agent holding `permission`, a deadline in
     ///         `[now, now + maxDeadlineSeconds]`, the period roll and the action count, which it increments.
     /// @dev Callable only by a registered account, for itself (`msg.sender`). The account runs its own lock first.
+    ///      Every agent function counts one action here, including `claimFees` and `sweepToOwner`. For `P_LAUNCH` it
+    ///      also reverts `LaunchLimit` when the period's launches are used up, after the action check and before the
+    ///      account calls the LaunchFactory; `record` counts the launch.
     /// @param agent_ The agent key that called the account.
     /// @param permission The `P_*` bit the function needs.
     /// @param deadline The agent's deadline, Unix seconds.
@@ -141,6 +145,8 @@ contract AgentPolicyRegistry is IAgentPolicyRegistry {
         }
         Usage memory u = _currentUsage(c);
         if (u.actions >= p.maxActionsPerPeriod) revert ActionLimit();
+        // Fail a launch fast, before the account's external call; `record` still counts the launch.
+        if (permission == P_LAUNCH && u.launches >= p.launchesPerPeriod) revert LaunchLimit();
         ++u.actions;
         c.usage = u;
         return (p, u.periodId);

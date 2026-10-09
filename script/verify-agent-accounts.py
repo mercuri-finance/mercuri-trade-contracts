@@ -16,7 +16,8 @@ verify-trade-filler.py, so both contracts families are checked the same way.
                                        # read-only: eth_call constructor simulations equal the reconstruction
   python3 script/verify-agent-accounts.py --rpc URL --block N --record FILE [--account ADDR] [--manifest FILE]
                                        # FILE: deployments/agent-accounts-<chainId>.json, written only by
-                                       # write-agent-accounts-record.py from a completed broadcast
+                                       # write-agent-accounts-record.py from a completed broadcast; N must be at
+                                       # or after the record's factoryDeployBlock
 
 The preflight requires the manifest to hold exactly the input keys: the Launch addresses equal to Launch's deployment
 record for the chain, admin = the record's timelock, guardian = the record's guardian (non-zero), the Universal Router
@@ -299,7 +300,8 @@ def full_self_test():
     print('self-test ok: the implementation, factory and registry runtimes match with every immutable substituted; a '
           'flipped byte in any of their immutables is rejected by name; an extra or missing immutable is refused; '
           'both manifests pass the preflight and every tampered input is refused; a flipped clone byte is rejected; '
-          'the CREATE formula reproduces known addresses; only a writer-shaped record matching the manifest is read')
+          'the CREATE formula reproduces known addresses; only a writer-shaped record matching the manifest is read, '
+          'and never at a block before its factory')
     return True
 
 
@@ -414,6 +416,22 @@ def record_self_test():
             print(f'record {label}: {"accepted" if accepted else "refused"}')
             ok &= accepted == accept
             path.unlink()
+        # live() refuses a block before the factory existed, before any RPC call (the URL here is never reached).
+        path = Path(d) / 'agent-accounts-5042002.json'
+        path.write_text(json.dumps(dict(record, deployBlock=99, factoryDeployBlock=100)))
+        for block, accept in ((99, False), (100, True)):
+            args = argparse.Namespace(manifest='deployments/agent-accounts-manifest-5042002.json', record=str(path),
+                                      block=block, rpc='http://127.0.0.1:9/never-called', account=None)
+            try:
+                live(args)
+                message = ''
+            except SystemExit as error:
+                message = str(error)
+            except Exception as error:  # the RPC call fails: the block check passed
+                message = f'reached the RPC: {type(error).__name__}'
+            refused = 'before the factory was deployed' in message
+            print(f'record live --block {block} with factoryDeployBlock 100: {"refused" if refused else "passed"}')
+            ok &= refused != accept
     return ok
 
 
@@ -422,6 +440,10 @@ def live(args):
     if not run_preflight(manifest):
         raise SystemExit('preflight failed; nothing was read from the chain')
     deployment = load_record(args.record, manifest)
+    if args.block < deployment['factoryDeployBlock']:
+        # Before the factory existed every getCode is empty, so a comparison there proves nothing.
+        raise SystemExit(f'--block {args.block} is before the factory was deployed (record factoryDeployBlock '
+                         f'{deployment["factoryDeployBlock"]}); pass a block at or after it')
     chain = int(vtf.rpc_call(args.rpc, 'eth_chainId', []), 16)
     if chain != manifest['chainId']:
         raise SystemExit(f'chain id {chain} != manifest {manifest["chainId"]}')

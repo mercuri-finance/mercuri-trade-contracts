@@ -13,7 +13,7 @@ account; the owner has no trade path through the account.
 | Contract | Kind | Runtime size | Holds | Role |
 | --- | --- | --- | --- | --- |
 | `AgentAccount` | Immutable implementation behind EIP-1167 clones (one clone per account) | 15,387 B | Native USDC, Launch tokens, per-token cost basis, the bound referrer | Typed agent trades (`buy`, `sell`, `swapExactIn`, `launch`, `claimFees`, `sweepToOwner`) and owner withdrawals. Builds every external call itself. No generic execute, no delegatecall, no proxy upgrade, no selfdestruct; `isValidSignature` always returns `0xffffffff`; `receive()` is empty. |
-| `AgentPolicyRegistry` | Immutable singleton, one per factory, deployed by the factory's constructor | 17,798 B | Every account's owner, policy, agents, widening queue, allowlist, delay, owner pause and period usage | Owner functions (`addAgent`, `setPolicy`, `pauseAgents`, `transferOwnership`, ...), the agent preamble `authorize` and the cap accounting `record`. Only a registered account may call `authorize` or `record`, and only for itself. Emits every configuration event with `account` indexed. No admin, no owner of its own. |
+| `AgentPolicyRegistry` | Immutable singleton, one per factory, deployed by the factory's constructor | 17,838 B | Every account's owner, policy, agents, widening queue, allowlist, delay, owner pause and period usage | Owner functions (`addAgent`, `setPolicy`, `pauseAgents`, `transferOwnership`, ...), the agent preamble `authorize` and the cap accounting `record`. Only a registered account may call `authorize` or `record`, and only for itself. Emits every configuration event with `account` indexed. No admin, no owner of its own. |
 | `AgentAccountFactory` | Immutable | 3,855 B | `isAccount`, the beta ceilings (immutables), the guardian and the pause deadline | `createAccount` (CREATE2 clone with salt `keccak256(abi.encode(owner, salt))`, registry `register`, account `initialize`), `predictAccount`, `ceilings`, the guardian pause. Holds no funds. |
 
 `AgentPolicyLib` (internal library) and `AgentTypes` (structs and constants) are compiled into the contracts above.
@@ -92,6 +92,10 @@ Against a stolen key the caps are the control.
   hours before pausing again, counted from the pause's original end even if the admin lifted it early.
 - The **admin** (Launch's TimelockController) can lift or shorten any pause at any time, extend an *active* pause to at
   most 30 days from now, and replace the guardian (never with zero). It cannot start a pause.
+- The 30 days run from each extension, not from the pause's start. While a pause is active the admin can extend it
+  again before it ends, each time to at most 30 days from that moment, so a **rolling extension can keep agents
+  paused indefinitely**. Each extension is its own timelock operation (48 h delay on mainnet), publicly queued, and
+  owner exits keep working throughout.
 - A pause **blocks agent functions only**. Owner withdrawals, `withdrawMany`, revocations, policy tightening and owner
   pause always work.
 - A factory deployed with guardian zero has no pause at all, permanently: `guardianPause`, `setGuardian` and
@@ -105,7 +109,8 @@ Users migrate by:
 1. pausing agents or revoking every agent key on the old account (immediate);
 2. `withdrawMany(tokens)` on the old account, which sends native USDC (token `address(0)`) and every listed token to the
    owner. There is no on-chain token list, so a stolen key cannot make the exit run out of gas; the SDK and indexer
-   supply the list. On Arc, chunk it at **200 tokens per transaction** (section 7);
+   supply the list. On Arc, chunk it: the SDK sends **100 tokens per transaction**; 200 is the largest proven fit
+   (section 7);
 3. `createAccount` on the new factory and depositing again.
 
 The old factory keeps working; the web app marks it deprecated. There is no code rollback for any of the three
@@ -126,7 +131,8 @@ Consequences:
 - `withdrawMany` of 500 cold tokens costs 18,200,591 gas and does **not** fit in one transaction; 200 tokens cost
   7,245,580 and fit with room to spare. `test_WithdrawManyAfter500DustBuysFitsInABlock` in
   [`AgentAttacks.t.sol`](../../test/agents/AgentAttacks.t.sol) asserts a 200-entry `withdrawMany` runs under a
-  16,777,216 gas limit after 500 dust buys by a stolen key. The SDK chunks at 200.
+  16,777,216 gas limit after 500 dust buys by a stolen key. The SDK chunks at 100 tokens per transaction, half the
+  proven 200-token fit.
 - The deployment is two transactions (implementation, then factory with its registry); together they use about 7.6M
   gas, so each is well under the cap.
 
@@ -138,15 +144,15 @@ logs of the agent tests, local fixture unless stated:
 | Operation | Gas |
 | --- | --- |
 | Direct EOA curve buy (warm token), for comparison | 88,570 |
-| Agent curve buy, same size | 131,064 (42,494 overhead) |
-| Agent curve sell | 86,321 |
-| Agent pool buy through the deployed testnet Universal Router and LaunchHook (fork, first action, cold) | 420,180 |
-| Agent pool sell, same pool (fork) | 235,013 |
+| Agent curve buy, same size | 131,103 (42,533 overhead) |
+| Agent curve sell | 86,360 |
+| Agent pool buy through the deployed testnet Universal Router and LaunchHook (fork, first action, cold; measured at `c3771e7`, about 40 gas more since the launch pre-check) | 420,180 |
+| Agent pool sell, same pool (fork; measured at `c3771e7`) | 235,013 |
 | `createAccount` with referrer binding and a first agent | 353,719 |
 | Graduating agent buy, minimum call gas (cold) | 1,254,882 |
 | `revokeAgent` | 45,879 |
 | `withdrawMany` of 200 tokens / 501 tokens | 7,245,580 / 18,200,591 |
-| Deploy implementation and factory (with registry), including the script's checks | 7,606,064 |
+| Deploy implementation and factory (with registry), including the script's checks | 7,614,095 |
 
 `createAccount` is above the spec's 200 to 250k planning figure: since the 9 Oct registry split it writes the full
 policy, the first agent and the usage slots into the registry. At Arc gas prices this is a fraction of a cent.
@@ -171,12 +177,15 @@ After a broadcast, [`script/write-agent-accounts-record.py`](../../script/write-
 transaction, exactly the implementation then the factory, both CREATEs from one sender at consecutive nonces with
 status-1 receipts, the broadcast's chain and commit matching, the constructor arguments equal to the manifest (the
 implementation naming the factory and the factory's first CREATE as registry), each input the built creation code with
-those arguments, and the registry created by the factory at its predicted address from the built registry code. It
-refuses anything else, never overwrites a record, and its `--self-test` (33 cases, in the gate) covers each refusal. No
-record exists: nothing has been deployed.
+those arguments, and the registry created by the factory at its predicted address from the built registry code; the
+manifest must first pass the verifier's preflight. It refuses anything else and never overwrites a record: the record is
+written to a temporary file and hard-linked into place, which fails if the name exists, so a record written by a
+racing run is never replaced. Its `--self-test` (39 cases, in the gate) covers each refusal. No record exists: nothing
+has been deployed.
 
 Then `python3 script/verify-agent-accounts.py --rpc <Arc RPC> --block <n> --record deployments/agent-accounts-<chainId>.json`
-reads only that record (the writer's file name, key set and version, every input equal to the manifest), rebuilds the
+reads only that record (the writer's file name, key set and version, every input equal to the manifest), refuses a
+block before the record's `factoryDeployBlock` (where every runtime is empty), rebuilds the
 three runtimes from `out/` with the manifest and record values in every immutable and compares them byte for byte with
 `eth_getCode`, checks the registry is the factory's first CREATE, the router's code hash and the factory's guardian;
 `--account <addr>` also checks one clone.
@@ -196,12 +205,12 @@ optimizer runs for `src/**`, no metadata hash. Missing evidence is pending, not 
 | Substitution correctness | n/a | Constructor simulations (`eth_call`, no transaction) of the built creation code with the testnet manifest inputs equal the reconstructed runtimes | `python3 script/verify-agent-accounts.py --simulate --block 66330102` against `https://rpc.testnet.arc.io` | MATCH: account 15,387 B, factory 3,855 B, registry 17,798 B | Mainnet simulation pending (no public mainnet RPC reachable) |
 | Manifests | n/a | Inputs only (extra keys refused by the script and the preflight; the Trade manifest's chain checked); Launch addresses = Launch records, admin = timelock, guardian = record guardian, router and hash = Trade manifest, ceilings = spec 4.5 | `verify-agent-accounts.py --preflight` for both, a raised-ceiling copy refused (in gate); `DeployAgentAccounts.t.sol` | Pass | Mainnet guardian code check runs only at deploy time (script requires code on 5042) |
 | Deploy script | n/a | Predicts implementation, factory and registry from the deployer nonce; full wiring check; wrong chain and missing code refused; tampered manifests refused by field | `test/agents/DeployAgentAccounts.t.sol` (6 tests, in process against the fixture, never broadcast); the fork test runs `run()` against deployed testnet Launch | Pass | Testnet deployment needs an owner go (D9) |
-| Deployment record writer | `write-trade-record.py` for the order contracts | `write-agent-accounts-record.py`: writes `agent-accounts-<chainId>.json` only from a completed broadcast; the verifier's live mode reads only that record | `python3 script/write-agent-accounts-record.py --self-test` (in gate) and the verifier's record self-test | Pass, 33/33 cases | Run against the real broadcast at the testnet deployment; the struct-argument format is forge's raw token format, not yet observed in a real broadcast |
+| Deployment record writer | `write-trade-record.py` for the order contracts | `write-agent-accounts-record.py`: writes `agent-accounts-<chainId>.json` only from a completed broadcast and only for a manifest that passes the preflight; links the record into place so an existing or racing record is never overwritten; the verifier's live mode reads only that record and refuses a block before `factoryDeployBlock` | `python3 script/write-agent-accounts-record.py --self-test` (in gate) and the verifier's record self-test | Pass, 39/39 cases | Run against the real broadcast at the testnet deployment. The forge ceilings tuple format of the struct argument was confirmed on a local anvil fork broadcast |
 | Behaviour, attack, fuzz, invariant tests | Tasks 1 to 6 suites | 209 agent tests incl. this task's 7 | `bash script/check-contracts.sh` (seed `0x5042`); agent suites with seeds `0x907285fa`, `0x9f0dc63b`, `0x5d461ba0` | Gate exit 0 in 10 min 12 s: 387 passed, 7 skipped (fork suites without RPC). Each seed: 209 passed, 0 failed | None |
 | Stress | Order suites | Same gate with `--stress`; agent invariants moved out of the 10,000-run step into their own deep campaign (own counterexample directory) | `ARC_LOCAL_FORK_RPC=https://rpc.testnet.arc.io TRADE_FORK_CHAIN_ID=5042002 bash script/check-contracts.sh --stress` (with `AGENT_INVARIANT_STATS=true` for the ratios) | Exit 0 in 37 min 4 s: fork-suite run 409 passed, 2 skipped; 10,000-run fuzz 397 passed, 2 skipped; order invariants 1,024 x 256; agent invariants 6 passed at 1,024 x 256 (262,144 calls each, 0 reverts, fail-on-revert). Measured at depth 256 over 6,150 runs: successful-step ratio 87.7% (minimum 81.6%), successful account-call ratio 83.3% (minimum 77.3%), against the 60% floor | None |
 | Pinned fork | n/a | Agent pool buy and sell (ERC-20 and Permit2 allowances back to zero; Alchemy URLs refused) through the deployed testnet Universal Router and LaunchHook on graduated token `0x97B4…eE84` at block 65,301,435, account deployed by the production script | `test/agents/AgentPoolFork.t.sol` (skipped without `ARC_LOCAL_FORK_RPC`) | Pass (also under each random seed and in stress) | Spec 10's other fork cases (graduating buy, sell during GraduationPending, launch with initial buy, fee claim, blocklisted-owner withdraw) and a mainnet fork are pending for the testnet smoke |
 | Gas | n/a | Agent snapshot `.gas-snapshot-agents` (189 entries) | `forge snapshot --check .gas-snapshot-agents ...` (in gate) | Pass | None |
-| Size | EIP-170 24,576 B | 15,387 / 3,855 / 17,798 B | `forge build --sizes` | Pass | None |
+| Size | EIP-170 24,576 B | 15,387 / 3,855 / 17,838 B | `forge build --sizes` | Pass | None |
 | Arc per-tx gas cap | Unverified (ruling: likely 16,777,216) | Verified on testnet (section 7) | `eth_estimateGas` probe, block 66,330,102 | 16,777,216 | Mainnet probe pending |
 | Upgradeability and storage | n/a | No proxies; nothing to upgrade, no storage layout to preserve | Code review | Not applicable | Documented: no code rollback |
 | Static analysis | n/a | Slither named in spec 10 | Not installed in this environment | Pending | Run Slither |
@@ -211,7 +220,7 @@ optimizer runs for `src/**`, no metadata hash. Missing evidence is pending, not 
 
 - Independent internal multi-auditor review of the whole agent contract set, then an external audit before mainnet
   (spec 10). No mainnet deployment with an open finding.
-- Live runtime comparison after the testnet deployment (`verify-agent-accounts.py --rpc ... --block ... --deployment`).
+- Live runtime comparison after the testnet deployment (`verify-agent-accounts.py --rpc ... --block ... --record`).
 - The remaining spec 10 pinned-fork cases and a mainnet fork; the testnet smoke covers them otherwise.
 - Slither.
 - Mainnet per-tx gas cap probe and mainnet constructor simulation (no public mainnet RPC reachable read-only on

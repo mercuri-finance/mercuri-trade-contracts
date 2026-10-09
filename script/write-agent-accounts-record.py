@@ -16,16 +16,21 @@ constructor arguments must name the factory and the registry (the factory's firs
 and Uniswap addresses; the factory's must name the implementation, the manifest's admin and guardian and its ceilings.
 Each transaction's input must be the built creation code with exactly those arguments, and the one contract the
 factory's constructor creates must be the built AgentPolicyRegistry at that address. Anything else is refused and
-nothing is written. A dry run (`dry-run/`, no receipts) is refused.
+nothing is written. A dry run (`dry-run/`, no receipts) is refused. The manifest must first pass
+`verify-agent-accounts.py --preflight` (exactly the input keys, Launch's record, the Trade router pin and the spec
+4.5 ceilings).
 
   python3 script/write-agent-accounts-record.py --broadcast FILE [--manifest FILE] [--out-dir deployments]
                                                 [--source-revision SHA]
   python3 script/write-agent-accounts-record.py --self-test
 
 It never overwrites a record: archive the current one first (as `archive/agent-accounts-<chainId>-<deployBlock>.json`).
+The record is written to a temporary file and hard-linked into place, which fails if the name exists, so even a record
+written by a racing run between the check and the write is never replaced.
 Then verify the new record with `verify-agent-accounts.py --record` at its block.
 """
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -267,10 +272,44 @@ def source_revision(args):
     return head.stdout.strip()
 
 
+def manifest_problems(manifest):
+    """The verifier's preflight of `manifest` (key set, Launch record, Trade router pin, spec 4.5 ceilings)."""
+    # Loaded here, not at import: the verifier imports this module.
+    spec = importlib.util.spec_from_file_location('verify_agent_accounts', root / 'script' / 'verify-agent-accounts.py')
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    try:
+        return verifier.preflight(manifest)
+    except (OSError, ValueError) as error:
+        return [f'preflight could not read its references: {error}']
+
+
+def publish(text, target):
+    """Writes `text` to `target` only if no file of that name exists, atomically: the full text goes to a temporary
+    file in the same directory, which is then hard-linked to `target` (the link fails if `target` exists, even when
+    another run created it after any earlier check)."""
+    fd, tmp = tempfile.mkstemp(prefix=f'.{target.name}.', suffix='.tmp', dir=target.parent)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp, target)
+        except FileExistsError:
+            raise Refused(f'{target} appeared while the record was being written; it was not replaced')
+    finally:
+        os.unlink(tmp)
+
+
 def write(args):
     manifest = json.loads(Path(args.manifest).read_text())
-    if manifest.get('chainId') not in (5042, 5042002):
-        raise Refused(f'manifest chainId {manifest.get("chainId")!r} is not an Arc network')
+    if not isinstance(manifest, dict) or manifest.get('chainId') not in (5042, 5042002):
+        chain = manifest.get('chainId') if isinstance(manifest, dict) else None
+        raise Refused(f'manifest chainId {chain!r} is not an Arc network')
+    problems = manifest_problems(manifest)
+    if problems:
+        raise Refused(f'{args.manifest} fails the preflight: ' + '; '.join(problems))
     revision = source_revision(args)
     record = build(args, manifest, revision)
     out_dir = Path(args.out_dir).resolve()
@@ -279,9 +318,7 @@ def write(args):
         raise Refused(f'{target} exists; archive it as archive/agent-accounts-{record["chainId"]}-<deployBlock>.json '
                       f'first')
     out_dir.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix('.json.tmp')
-    tmp.write_text(json.dumps(record, indent=2, sort_keys=True) + '\n')
-    os.replace(tmp, target)
+    publish(json.dumps(record, indent=2, sort_keys=True) + '\n', target)
     print(f'wrote {target}')
     print(json.dumps(record, indent=2, sort_keys=True))
 
@@ -432,8 +469,36 @@ def selftest():
          must=['not the built AgentPolicyRegistry'])
     case('factory block before implementation block', bc(fac_receipt={'blockNumber': hex(99)}), False,
          must=['precedes'])
-    case('manifest of another chain', good, False, must=['chain 5042002, not 5042'], man=dict(manifest, chainId=5042))
+    mainnet = json.loads((root / 'deployments/agent-accounts-manifest-5042.json').read_text())
+    case('manifest of another chain', good, False, must=['chain 5042002, not 5042'], man=mainnet)
     case('existing record is never overwritten', good, False, must=['exists'], existing=True)
+    case('manifest with an extra key', good, False, must=['fails the preflight', 'manifest keys differ'],
+         man=dict(manifest, factory=other))
+    case('manifest missing a key', good, False, must=['fails the preflight', 'missing [\'routerCodeHash\']'],
+         man={k: v for k, v in manifest.items() if k != 'routerCodeHash'})
+    case('manifest with a raised ceiling', good, False, must=['fails the preflight', 'ceilings.maxTradeUsdc'],
+         man=dict(manifest, ceilings=dict(manifest['ceilings'], maxTradeUsdc=manifest['ceilings']['maxTradeUsdc'] + 1)))
+    case('manifest Launch address differs from the record', good, False, must=['fails the preflight', 'feeManager'],
+         man=dict(manifest, feeManager=other))
+
+    # A racing run creates the record after the existence check: the link refuses and the racing file survives.
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / 'agent-accounts-5042002.json'
+        target.write_text('{"racing": true}\n')
+        try:
+            publish('{"ours": true}\n', target)
+            raced = 'publish replaced an existing record'
+        except Refused as error:
+            raced = str(error)
+        leftovers = sorted(p.name for p in Path(d).iterdir() if p != target)
+        cases.append(('a record that appears mid-write is never overwritten',
+                      'not replaced' in raced and target.read_text() == '{"racing": true}\n' and not leftovers,
+                      f'{raced}; leftovers {leftovers}'))
+        target.unlink()
+        publish('{"ours": true}\n', target)
+        leftovers = sorted(p.name for p in Path(d).iterdir() if p != target)
+        cases.append(('publish writes the full record when the name is free',
+                      target.read_text() == '{"ours": true}\n' and not leftovers, f'leftovers {leftovers}'))
 
     failed = 0
     for name, ok, text in cases:

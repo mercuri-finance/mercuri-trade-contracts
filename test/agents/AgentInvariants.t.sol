@@ -1447,6 +1447,15 @@ contract AgentInvariantsTest is AgentFixture {
         _killPending(i);
         // Freeze the old owner's tally: it must still match, then it becomes an outsider.
         assertEq(old.balance + ownerOut[i], ownerStart[i] + ownerIn[i], "old owner native");
+        // The old owner holds exactly the tokens withdrawn or swept to it, nothing the handover moved.
+        for (uint256 k; k < toks.length; ++k) {
+            address t = address(toks[k]);
+            assertEq(IERC20(t).balanceOf(old), ownerTokIn[old][t], "old owner tokens");
+        }
+        // The heir starts with no tokens, so its tally starts at zero.
+        for (uint256 k; k < toks.length; ++k) {
+            assertEq(IERC20(address(toks[k])).balanceOf(heir), 0, "heir starts empty");
+        }
         owners[i] = heir;
         ownerStart[i] = heir.balance;
         ownerIn[i] = 0;

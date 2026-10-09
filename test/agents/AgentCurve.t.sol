@@ -51,8 +51,8 @@ contract AgentCurveTest is AgentFixture {
         return account.sell(address(token), tokensIn, 1, _dl());
     }
 
-    /// @dev The account's valuation of `rec` recorded tokens: at the higher of the current average and the
-    ///      high-water, rounded up (spec ruling I-1).
+    /// @dev The account's valuation of `rec` recorded tokens (rulings I-1 and N-1): the higher of the pro-rata cost
+    ///      rounded up and the high-water value rounded down.
     function _recordedValue(uint256 rec) internal view returns (uint256) {
         return _recordedValueOf(account, address(token), rec);
     }
@@ -60,9 +60,9 @@ contract AgentCurveTest is AgentFixture {
     function _recordedValueOf(AgentAccount acct, address t, uint256 rec) internal view returns (uint256) {
         (uint128 cost, uint128 tokens, uint256 hw) = acct.basis(t);
         if (tokens == 0) return 0;
-        uint256 avg = Math.mulDiv(cost, 1e36, tokens, Math.Rounding.Ceil);
-        if (hw > avg) avg = hw;
-        return Math.mulDiv(rec, avg, 1e36, Math.Rounding.Ceil);
+        uint256 v = Math.mulDiv(rec, cost, tokens, Math.Rounding.Ceil);
+        uint256 hwValue = Math.mulDiv(rec, hw, 1e36);
+        return hwValue > v ? hwValue : v;
     }
 
     function _narrow(Policy memory p) internal {
@@ -333,10 +333,9 @@ contract AgentCurveTest is AgentFixture {
         Policy memory p = _defaultPolicy();
         p.maxTradeUsdc = 50e6;
         _narrow(p);
-        // The sell is valued at cost (100), not at its proceeds (about 98). Half (less a whole token, to absorb
-        // the upward rounding of the high-water valuation) fits.
+        // The sell is valued at cost (100), not at its proceeds (about 98).
         _expectSellRevert(abi.encodeWithSelector(IAgentAccount.TradeTooLarge.selector, 50e6), held);
-        _sell(held / 2 - 1e18);
+        _sell(held / 2);
     }
 
     function test_PeriodSpendExceeded() public {
@@ -364,14 +363,24 @@ contract AgentCurveTest is AgentFixture {
         Policy memory p = _defaultPolicy();
         p.periodSellCap = 50e6;
         _narrow(p);
-        _expectSellRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, 50e6), held * 3 / 4);
-        _sell(held / 2 - 1e18);
-        uint64 sold = _usageSold();
-        assertLe(sold, 50e6);
-        assertGt(sold, 50e6 - 10, "about half the cost");
-        _expectSellRevert(
-            abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, 50e6 - sold), held / 4
-        );
+        _expectSellRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, 50e6), held);
+        _sell(held / 2);
+        assertEq(_usageSold(), 50e6);
+        _expectSellRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, 0), held / 4);
+    }
+
+    function test_SingleLotAtMaxTradeExitsInOneSellAtExactlyItsCost() public {
+        uint256 held = _buy(100e6);
+        (uint128 cost, uint128 tokens, uint256 hw) = account.basis(address(token));
+        assertEq(cost, 100e6);
+        assertEq(tokens, held);
+        assertEq(hw, Math.mulDiv(100e6, 1e36, held, Math.Rounding.Ceil));
+        _sell(held);
+        assertEq(_usageSold(), 100e6, "charged exactly the cost, within maxTradeUsdc");
+        (cost, tokens, hw) = account.basis(address(token));
+        assertEq(cost, 0);
+        assertEq(tokens, 0);
+        assertEq(hw, 0);
     }
 
     function test_ActionLimit() public {
@@ -669,8 +678,11 @@ contract AgentCurveTest is AgentFixture {
         _exitAll(a);
         (, tokens,) = a.basis(address(token));
         assertEq(tokens, 0);
-        assertGe(_soldOf(a), full, "charged at least the high-water value");
+        // Each chunk's high-water value rounds down, so the chunked total may be up to one usdc6 per chunk below
+        // the single-sell value; it stays far above the plain cost.
+        assertGe(_soldOf(a) + 64, full, "charged the high-water value, less at most one unit per chunk");
         assertLe(_soldOf(a), full + 64, "plus at most one unit per chunk");
+        assertGt(_soldOf(a), cost, "well above the plain cost");
     }
 
     function test_HighWaterResetsAfterFullExit() public {

@@ -180,10 +180,12 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         uint256 recorded = tokensIn < b.tokens ? tokensIn : b.tokens;
         uint256 basisValue;
         if (recorded != 0) {
-            // The higher of the current average and the high-water: a cheap buy after a crash cannot dilute it.
-            uint256 avg = Math.mulDiv(b.costUsdc, HIGH_WATER_SCALE, b.tokens, Math.Rounding.Ceil);
-            if (b.highWater > avg) avg = b.highWater;
-            basisValue = Math.mulDiv(recorded, avg, HIGH_WATER_SCALE, Math.Rounding.Ceil);
+            // The higher of the pro-rata cost (rounded up) and the high-water value (rounded down: the stored
+            // high-water is already rounded up), so a cheap buy after a crash cannot dilute earlier holdings and a
+            // whole single-lot position is charged exactly its cost.
+            basisValue = Math.mulDiv(recorded, b.costUsdc, b.tokens, Math.Rounding.Ceil);
+            uint256 hwValue = Math.mulDiv(recorded, b.highWater, HIGH_WATER_SCALE);
+            if (hwValue > basisValue) basisValue = hwValue;
         }
         if (tokensIn > recorded) {
             (uint256 excessOut,) = curve.quoteSell(tokensIn - recorded);

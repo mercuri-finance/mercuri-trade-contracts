@@ -61,7 +61,8 @@ struct Basis {
     /// @dev Tokens bought and still held, in the token's 18-decimal units.
     uint128 tokens;
     /// @dev Highest average cost the position has had after any buy: usdc6 per 1e18 token units, scaled by 1e18
-    ///      (`ceil(costUsdc * 1e36 / tokens)`). Never decreases while the position is open; zero once `tokens` is 0.
+    ///      (`ceil(costUsdc * 1e36 / tokens)`, stored rounded up and therefore applied rounded down). Never decreases
+    ///      while the position is open; zero once `tokens` is 0.
     uint256 highWater;
 }
 

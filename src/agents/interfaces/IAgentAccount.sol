@@ -148,11 +148,14 @@ interface IAgentAccount is IERC1271 {
         returns (uint256 tokensOut);
     /// @notice Sells `token` back to its Launch curve, within the policy's caps. Agent only (`P_SELL`).
     /// @dev Phase `Trading` or `GraduationPending`. The trade's value is its cost basis: the recorded share
-    ///      `min(tokensIn, basis.tokens)` at the higher of the current average cost and the position's high-water
-    ///      average (rounded up), so buying cheaply after a crash cannot dilute the value of earlier holdings; plus,
+    ///      `recorded = min(tokensIn, basis.tokens)` valued at `max(ceil(recorded * cost / tokens),
+    ///      floor(recorded * highWater / 1e36))`, so buying cheaply after a crash cannot dilute the value of earlier
+    ///      holdings and a whole single-lot position is charged exactly its cost; plus,
     ///      for tokens beyond the recorded amount, their pre-trade `quoteSell` proceeds rounded up to usdc6. Tokens
     ///      the account did not buy (transfers in, or tokens back after an owner withdrawal) are valued only by that
-    ///      quote, which an attacker can move, so they are not protected by the sell cap. It is checked against `maxTradeUsdc` here and
+    ///      quote, which an attacker can move, so they are not protected by the sell cap. A recorded dust remainder
+    ///      that quotes below 1 usdc6 cannot be sold alone and keeps the position's high-water until the owner
+    ///      withdraws it or a final sell includes the dust. It is checked against `maxTradeUsdc` here and
     ///      `periodSellCap` in the registry. Proceeds (native delta rounded down to usdc6) never create headroom.
     ///      The allowance granted to the curve must be zero afterwards. The allowlist does not apply to sells.
     ///      `minUsdcOut` above `type(uint256).max / 1e12` reverts `AmountTooLarge`.

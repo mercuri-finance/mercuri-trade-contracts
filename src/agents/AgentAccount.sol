@@ -232,7 +232,7 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
 
     /// @inheritdoc IAgentAccount
     function launch(LaunchRequest calldata r) external nonReentrant returns (address token, address curve) {
-        (Policy memory p, uint64 periodId) = REGISTRY.authorize(msg.sender, P_LAUNCH, block.timestamp);
+        (Policy memory p, uint64 periodId) = REGISTRY.authorize(msg.sender, P_LAUNCH, r.deadline);
         uint256 fee = LaunchFactory(address(LAUNCH_FACTORY)).config().launchFee;
         uint256 feeUsdc = Math.ceilDiv(fee, SCALE);
         // Compared as "at most what is left", so no input can overflow.

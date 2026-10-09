@@ -26,7 +26,9 @@ struct Policy {
     uint32 minTokenAgeBlocks;
     /// @dev An agent's deadline must lie in `[now, now + maxDeadlineSeconds]`; in `[1, 600]` seconds.
     uint32 maxDeadlineSeconds;
-    /// @dev When true, buys (curve and pool) need an owner-allowlisted token; sells stay open.
+    /// @dev When true, buys of existing tokens (curve and pool) need an owner-allowlisted token; sells stay open.
+    ///      Launches (and their initial buys) are not governed by it: an owner who wants no agent launches withholds
+    ///      `P_LAUNCH`.
     bool allowlistOnly;
 }
 
@@ -83,6 +85,8 @@ struct LaunchRequest {
     uint256 initialBuyUsdc;
     /// @dev Minimum tokens of the initial buy, 18-decimal units; ignored by the factory without an initial buy.
     uint256 minTokensOut;
+    /// @dev Latest Unix time (seconds) the launch may be included, within `maxDeadlineSeconds` of now.
+    uint256 deadline;
 }
 
 /// @dev Scale of `Basis.highWater`: usdc6 per token unit times 1e36 (usdc6 per 1e18 tokens, times 1e18).

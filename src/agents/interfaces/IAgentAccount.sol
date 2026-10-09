@@ -27,7 +27,8 @@ interface IAgentAccount is IERC1271 {
     ///        a launch includes its fee). Zero for a claim or sweep.
     /// @param usdcReceived USDC that entered the account, usdc6: the native balance delta rounded down.
     /// @param tokenDelta Change in the account's balance of `token`, 18-decimal units (positive on a buy). A sweep:
-    ///        minus the amount sent, native wei when `token` is zero.
+    ///        minus the amount sent; a native sweep is encoded as `token = 0` and `tokenDelta = -wei` (native wei,
+    ///        18 decimals).
     /// @param basisValue usdc6. A buy: the cost added to the basis (equals `usdcSpent`). A launch: the cost added to
     ///        the basis (`usdcSpent` minus the fee, zero without an initial buy). A sell: the cost-basis value charged
     ///        to `maxTradeUsdc` and `periodSellCap`. Zero for a claim or sweep.
@@ -174,7 +175,8 @@ interface IAgentAccount is IERC1271 {
 
     /// @notice Launches a new Launch token with the account as creator and, optionally, an initial buy into the
     ///         account, within the policy's caps. Agent only (`P_LAUNCH`).
-    /// @dev Lock, then the registry's `authorize` (deadline: the current block). Calls `LaunchFactory.createToken`
+    /// @dev Lock, then the registry's `authorize` with `r.deadline`, which must lie in `[now, now +
+    ///      maxDeadlineSeconds]` like a trade's, so a held or replayed launch expires. Calls `LaunchFactory.createToken`
     ///      with `creator = address(this)`, `referrer` = the account's stored referrer and `value = launchFee +
     ///      initialBuyUsdc * 1e12`, `launchFee` read from `LaunchFactory.config()`. The factory reverts
     ///      `ConfigChanged` unless `expectedConfigHash` matches, so the fee paid is the fee quoted. The spend is the
@@ -182,7 +184,8 @@ interface IAgentAccount is IERC1271 {
     ///      initialBuyUsdc` and the measured spend must be at most `maxTradeUsdc`, and the spend counts toward the
     ///      period spend cap, the new token's per-token cap and `launchesPerPeriod` in the registry's `record`. The
     ///      initial-buy tokens are recorded in the basis at cost `spent - ceil(launchFee / 1e12)` (never negative)
-    ///      and raise the high-water like a buy. The allowlist, token age and snipe limits do not apply.
+    ///      and raise the high-water like a buy. `allowlistOnly` governs buys of existing tokens and does not apply here,
+    ///      nor do the token age and snipe limits; an owner who wants no agent launches withholds `P_LAUNCH`.
     /// @param r The launch request; amounts usdc6 and 18-decimal tokens.
     /// @return token The new token.
     /// @return curve Its bonding curve.

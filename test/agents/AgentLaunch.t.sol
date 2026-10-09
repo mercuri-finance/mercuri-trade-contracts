@@ -52,6 +52,7 @@ contract AgentLaunchTest is AgentFixture {
         r.expectedConfigHash = factory.configHash();
         r.initialBuyUsdc = initialBuyUsdc;
         r.minTokensOut = initialBuyUsdc == 0 ? 0 : 1;
+        r.deadline = _now() + 60;
     }
 
     function _launch(bytes32 salt, uint256 initialBuyUsdc) internal returns (address token, address curve) {
@@ -263,6 +264,22 @@ contract AgentLaunchTest is AgentFixture {
             abi.encodeWithSelector(IAgentAccount.TradeTooLarge.selector, 100e6),
             _req(bytes32(uint256(1)), type(uint256).max)
         );
+    }
+
+    function test_LaunchDeadlineWindow() public {
+        LaunchRequest memory r = _req(bytes32(uint256(1)), 0);
+        r.deadline = _now() - 1;
+        _expectLaunchRevert(abi.encodeWithSelector(IAgentPolicyRegistry.DeadlineOutOfRange.selector), r);
+        r.deadline = _now() + 121; // maxDeadlineSeconds = 120
+        _expectLaunchRevert(abi.encodeWithSelector(IAgentPolicyRegistry.DeadlineOutOfRange.selector), r);
+        // A held launch expires: signed now, included after its deadline.
+        r.deadline = _now() + 120;
+        vm.warp(_now() + 121);
+        _expectLaunchRevert(abi.encodeWithSelector(IAgentPolicyRegistry.DeadlineOutOfRange.selector), r);
+        r.deadline = _now();
+        vm.prank(agentKey);
+        account.launch(r);
+        assertEq(_launches(), 1, "the edge of the window is valid");
     }
 
     function test_LaunchNeedsPermission() public {

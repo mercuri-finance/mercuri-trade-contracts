@@ -97,7 +97,7 @@ contract AgentOwnerTest is AgentFixture {
     }
 
     function _eta(uint256 id) internal view returns (uint40 eta) {
-        (, eta,,) = account.queued(id);
+        (, eta,,,) = account.queued(id);
     }
 
     // ---------------------------------------------------------------- views and ids
@@ -110,7 +110,7 @@ contract AgentOwnerTest is AgentFixture {
         assertFalse(account.retired(agentKey));
         assertFalse(account.ownerPaused());
         assertEq(account.epoch(), 0);
-        (uint8 kind, uint40 eta, uint64 ep, bytes memory payload) = account.queued(1);
+        (uint8 kind, uint40 eta, uint64 ep,, bytes memory payload) = account.queued(1);
         assertEq(kind, 0);
         assertEq(eta, 0);
         assertEq(ep, 0);
@@ -123,12 +123,12 @@ contract AgentOwnerTest is AgentFixture {
         assertEq(_setPolicy(p), 1);
         vm.prank(accountOwner);
         assertEq(account.addAgent(newKey, uint40(_now() + 30 days), P_BUY), 2);
-        (uint8 kind, uint40 eta, uint64 ep, bytes memory payload) = account.queued(1);
+        (uint8 kind, uint40 eta, uint64 ep,, bytes memory payload) = account.queued(1);
         assertEq(kind, Q_POLICY);
         assertEq(eta, _now() + 1 hours);
         assertEq(ep, 0);
         _eq(abi.decode(payload, (Policy)), p);
-        (kind,,,) = account.queued(2);
+        (kind,,,,) = account.queued(2);
         assertEq(kind, Q_ADD_AGENT);
     }
 
@@ -184,7 +184,7 @@ contract AgentOwnerTest is AgentFixture {
         uint256 id = account.setTokenAllowed(token, true);
         assertEq(id, 1);
         assertFalse(account.tokenAllowed(token));
-        (uint8 kind,,,) = account.queued(id);
+        (uint8 kind,,,,) = account.queued(id);
         assertEq(kind, Q_ALLOW_TOKEN);
         _warp(_eta(id));
         vm.expectEmit(address(account));
@@ -225,7 +225,7 @@ contract AgentOwnerTest is AgentFixture {
         account.executeQueued(id);
         _eq(account.policy(), p);
         // Executed items are gone.
-        (uint8 kind,,,) = account.queued(id);
+        (uint8 kind,,,,) = account.queued(id);
         assertEq(kind, 0);
         vm.expectRevert(abi.encodeWithSelector(IAgentAccount.UnknownQueued.selector, id));
         account.executeQueued(id);
@@ -259,7 +259,7 @@ contract AgentOwnerTest is AgentFixture {
         uint256 id = account.setAgent(agentKey, before.expiresAt + 1, P_BUY | P_SELL);
         assertEq(id, 1);
         assertEq(account.agent(agentKey).permissions, P_BUY);
-        (uint8 kind,,,) = account.queued(id);
+        (uint8 kind,,,,) = account.queued(id);
         assertEq(kind, Q_SET_AGENT);
         _warp(eta);
         vm.expectEmit(address(account));
@@ -343,7 +343,7 @@ contract AgentOwnerTest is AgentFixture {
         account.executeQueued(idAgent);
         _eq(account.policy(), _defaultPolicy());
         assertFalse(account.agent(newKey).active);
-        (uint8 kind,,,) = account.queued(idPolicy);
+        (uint8 kind,,,,) = account.queued(idPolicy);
         assertEq(kind, 0);
 
         // Unpausing does not revive them; new items queue in the new epoch.
@@ -388,7 +388,7 @@ contract AgentOwnerTest is AgentFixture {
         uint256 id = _setPolicy(p);
         assertEq(id, 1);
         _eq(account.policy(), now_);
-        (,,, bytes memory payload) = account.queued(id);
+        (,,,, bytes memory payload) = account.queued(id);
         _eq(abi.decode(payload, (Policy)), p);
         _warp(_eta(id));
         account.executeQueued(id);
@@ -527,7 +527,7 @@ contract AgentOwnerTest is AgentFixture {
         Policy memory p = _defaultPolicy();
         p.maxTradeUsdc = 200e6;
         uint256 idPolicy = _setPolicy(p);
-        (uint8 kind,,,) = account.queued(idOwner);
+        (uint8 kind,,,,) = account.queued(idOwner);
         assertEq(kind, Q_OWNER);
 
         vm.prank(newOwner);
@@ -548,7 +548,7 @@ contract AgentOwnerTest is AgentFixture {
         account.executeQueued(idOwner);
 
         vm.expectEmit(address(account));
-        emit IAgentAccount.OwnershipTransferred(accountOwner, newOwner);
+        emit IAgentAccount.AccountOwnerChanged(accountOwner, newOwner);
         vm.prank(newOwner);
         account.acceptOwnership(idOwner);
         assertEq(account.owner(), newOwner);
@@ -623,7 +623,7 @@ contract AgentOwnerTest is AgentFixture {
         uint256 id = account.setIncreaseDelay(30 minutes);
         assertEq(id, 1);
         assertEq(account.increaseDelay(), 2 hours);
-        (uint8 kind, uint40 eta,,) = account.queued(id);
+        (uint8 kind, uint40 eta,,,) = account.queued(id);
         assertEq(kind, Q_DELAY);
         assertEq(eta, _now() + 2 hours, "lowering waits the current delay");
         _warp(eta);
@@ -654,7 +654,7 @@ contract AgentOwnerTest is AgentFixture {
         p.maxTradeUsdc = 200e6;
         vm.prank(accountOwner);
         uint256 id = acc.setPolicy(p);
-        (, uint40 eta,,) = acc.queued(id);
+        (, uint40 eta,,,) = acc.queued(id);
         assertEq(eta, _now());
         acc.executeQueued(id);
         assertEq(acc.policy().maxTradeUsdc, 200e6);
@@ -673,14 +673,14 @@ contract AgentOwnerTest is AgentFixture {
         uint256 ownerBal = accountOwner.balance;
 
         vm.expectEmit(address(account));
-        emit IAgentAccount.Withdrawn(address(0), 2e18);
+        emit IAgentAccount.AccountWithdrawn(address(0), 2e18);
         vm.prank(accountOwner);
         account.withdraw(address(0), 2e18);
         assertEq(accountOwner.balance, ownerBal + 2e18);
         assertEq(address(account).balance, 3e18);
 
         vm.expectEmit(address(account));
-        emit IAgentAccount.Withdrawn(address(token), 400e18);
+        emit IAgentAccount.AccountWithdrawn(address(token), 400e18);
         vm.prank(accountOwner);
         account.withdraw(address(token), 400e18);
         assertEq(token.balanceOf(accountOwner), 400e18);
@@ -705,11 +705,11 @@ contract AgentOwnerTest is AgentFixture {
         tokens[2] = address(t2);
         tokens[3] = address(t1); // a repeat finds a zero balance
         vm.expectEmit(address(account));
-        emit IAgentAccount.Withdrawn(address(t1), 7e18);
+        emit IAgentAccount.AccountWithdrawn(address(t1), 7e18);
         vm.expectEmit(address(account));
-        emit IAgentAccount.Withdrawn(address(0), 3e18 + 1);
+        emit IAgentAccount.AccountWithdrawn(address(0), 3e18 + 1);
         vm.expectEmit(address(account));
-        emit IAgentAccount.Withdrawn(address(t2), 9e18);
+        emit IAgentAccount.AccountWithdrawn(address(t2), 9e18);
         vm.prank(accountOwner);
         account.withdrawMany(tokens);
         assertEq(t1.balanceOf(accountOwner), 7e18);
@@ -879,7 +879,7 @@ contract AgentOwnerTest is AgentFixture {
         _warp(t0 + 5 hours + QUEUE_TTL + 1);
         vm.expectRevert(IAgentAccount.QueuedExpired.selector);
         account.executeQueued(idLate);
-        (uint8 kind,,,) = account.queued(idLate);
+        (uint8 kind,,,,) = account.queued(idLate);
         assertEq(kind, Q_POLICY);
     }
 
@@ -909,6 +909,86 @@ contract AgentOwnerTest is AgentFixture {
         account.revokeAgent(agentKey);
         vm.stopPrank();
         assertEq(account.writeSeq(), s0 + 4);
+    }
+
+    // ---------------------------------------------------------------- indexer views and events
+
+    function test_QueuedSeqAndLastWriteGetters() public {
+        Policy memory p = _defaultPolicy();
+        p.maxTradeUsdc = 50e6;
+        _setPolicy(p);
+        uint64 sPolicy = account.writeSeq();
+        assertEq(account.policyWrite(0), sPolicy, "maxTradeUsdc written");
+        p.periodSpendCap = 600e6;
+        uint256 id = _setPolicy(p);
+        (,,, uint64 seq,) = account.queued(id);
+        assertEq(seq, sPolicy, "item seq is writeSeq at queue time");
+
+        vm.startPrank(accountOwner);
+        account.setIncreaseDelay(2 hours);
+        assertEq(account.delayWrite(), account.writeSeq());
+        account.setTokenAllowed(stranger, false);
+        assertEq(account.tokenWrite(stranger), account.writeSeq());
+        account.revokeAgent(agentKey);
+        assertEq(account.agentWrite(agentKey), account.writeSeq());
+        vm.stopPrank();
+        assertLe(account.policyWrite(1), seq, "periodSpendCap not written since");
+    }
+
+    function test_AgentQueuedCarriesIdAndQueueTimeEta() public {
+        uint40 exp = uint40(_now() + 30 days);
+        vm.expectEmit(address(account));
+        emit IAgentAccount.AgentQueued(1, newKey, exp, P_BUY, uint40(_now() + 1 hours));
+        vm.prank(accountOwner);
+        account.addAgent(newKey, exp, P_BUY);
+    }
+
+    function test_FullyStalePolicyExecutionAppliesNothing() public {
+        Policy memory p = _defaultPolicy();
+        p.maxTradeUsdc = 200e6;
+        uint256 id = _setPolicy(p);
+        // Rewrite every field after queueing.
+        Policy memory t = _defaultPolicy();
+        t.maxTradeUsdc = 90e6;
+        t.periodSpendCap = 400e6;
+        t.perTokenPeriodCap = 90e6;
+        t.periodSellCap = 400e6;
+        t.maxActionsPerPeriod = 400;
+        t.launchesPerPeriod = 2;
+        t.maxPriceImpactBps = 200;
+        t.maxDeadlineSeconds = 60;
+        t.minTokenAgeBlocks = 1;
+        t.allowlistOnly = true;
+        _setPolicy(t);
+        // maxSnipeBps is 0 and cannot go lower: widen it and execute that item so it is written too.
+        Policy memory w = t;
+        w.maxSnipeBps = 100;
+        uint256 idSnipe = _setPolicy(w);
+        _warp(_eta(idSnipe));
+        account.executeQueued(idSnipe);
+        (,,, uint64 seq,) = account.queued(id);
+        for (uint256 i; i < 11; ++i) {
+            assertGt(account.policyWrite(i), seq, "every field written since");
+        }
+        uint64 before = account.writeSeq();
+        vm.recordLogs();
+        account.executeQueued(id);
+        assertEq(vm.getRecordedLogs().length, 1, "only QueuedExecuted");
+        assertEq(account.writeSeq(), before, "nothing written");
+        _eq(account.policy(), w);
+    }
+
+    function test_RevokeAndRotateRejectZeroOwnerAndSelf() public {
+        address[3] memory bad = [address(0), accountOwner, address(account)];
+        uint40 exp = uint40(_now() + 30 days);
+        vm.startPrank(accountOwner);
+        for (uint256 i; i < 3; ++i) {
+            vm.expectRevert(IAgentAccount.InvalidAgent.selector);
+            account.revokeAgent(bad[i]);
+            vm.expectRevert(IAgentAccount.InvalidAgent.selector);
+            account.rotateAgent(bad[i], newKey, exp, P_BUY);
+        }
+        vm.stopPrank();
     }
 
     // ---------------------------------------------------------------- library fuzz

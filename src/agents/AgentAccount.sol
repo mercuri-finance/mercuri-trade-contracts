@@ -98,14 +98,14 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     uint64 public epoch;
     /// @inheritdoc IAgentAccount
     uint64 public writeSeq;
-    /// @dev Delay's last write sequence number.
-    uint64 private delayWrite;
-    /// @dev Each policy field's last write sequence number, in `Policy` struct order.
-    uint64[11] private policyWrite;
-    /// @dev Each agent address's last write sequence number (activation, term change or retirement).
-    mapping(address => uint64) private agentWrite;
-    /// @dev Each token's last allowlist write sequence number (addition or removal).
-    mapping(address => uint64) private tokenWrite;
+    /// @inheritdoc IAgentAccount
+    uint64 public delayWrite;
+    /// @inheritdoc IAgentAccount
+    uint64[11] public policyWrite;
+    /// @inheritdoc IAgentAccount
+    mapping(address => uint64) public agentWrite;
+    /// @inheritdoc IAgentAccount
+    mapping(address => uint64) public tokenWrite;
     /// @dev Last queue id handed out; ids start at 1.
     uint256 private lastQueueId;
     /// @dev Queued items by id; deleted on execution or cancellation.
@@ -193,10 +193,14 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     }
 
     /// @inheritdoc IAgentAccount
-    function queued(uint256 id) external view returns (uint8 kind, uint40 eta, uint64 itemEpoch, bytes memory payload) {
+    function queued(uint256 id)
+        external
+        view
+        returns (uint8 kind, uint40 eta, uint64 itemEpoch, uint64 seq, bytes memory payload)
+    {
         QueuedItem storage q = queue[id];
-        if (q.kind == 0) return (0, 0, 0, "");
-        return (q.kind, _eta(q.queuedAt, q.delayAtQueue), q.epoch, q.payload);
+        if (q.kind == 0) return (0, 0, 0, 0, "");
+        return (q.kind, _eta(q.queuedAt, q.delayAtQueue), q.epoch, q.seq, q.payload);
     }
 
     // ------------------------------------------------------------------ agents
@@ -247,7 +251,7 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         if (!now_.isNarrowing(target)) {
             target.checkCeilings(IAgentAccountFactory(FACTORY).ceilings());
             target.validate();
-            id = _queue(Q_POLICY, abi.encode(target, now_));
+            id = _queue(Q_POLICY, abi.encode(target));
             emit PolicyQueued(id, uint40(block.timestamp + increaseDelay), target);
         }
     }
@@ -300,7 +304,7 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         owner = msg.sender;
         ++epoch;
         emit QueuedExecuted(id);
-        emit OwnershipTransferred(previous, msg.sender);
+        emit AccountOwnerChanged(previous, msg.sender);
     }
 
     // ------------------------------------------------------------------ queue
@@ -317,7 +321,14 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         }
         _checkWindow(_eta(q.queuedAt, q.delayAtQueue));
         if (q.kind == Q_POLICY) {
-            _applyPolicy(_policy.merge(abi.decode(q.payload, (Policy)), policyWrite, q.seq));
+            // Skip the write when every field was written since queueing: the item has nothing left to apply.
+            uint64[11] memory lastWrite = policyWrite;
+            for (uint256 i; i < 11; ++i) {
+                if (lastWrite[i] <= q.seq) {
+                    _applyPolicy(_policy.merge(abi.decode(q.payload, (Policy)), lastWrite, q.seq));
+                    break;
+                }
+            }
         } else if (q.kind == Q_ALLOW_TOKEN) {
             address token = abi.decode(q.payload, (address));
             _checkFresh(tokenWrite[token], q.seq);
@@ -475,9 +486,11 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         emit AgentActivated(a, expiresAt, permissions);
     }
 
-    /// @dev Retires `a` forever, revoking it if active, and records the write.
+    /// @dev Retires `a` forever, revoking it if active, and records the write. Reverts `InvalidAgent` for zero, the
+    ///      owner or this account, which can never be agents.
     /// @param a The address.
     function _revoke(address a) private {
+        if (a == address(0) || a == owner || a == address(this)) revert InvalidAgent();
         if (retired[a]) revert AgentRetired();
         Agent memory cur = agents[a];
         retired[a] = true;
@@ -489,7 +502,7 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         emit AgentRevoked(a, cur.expiresAt, cur.permissions);
     }
 
-    /// @dev Sends `amount` of `token` (zero: native wei) to the owner and emits `Withdrawn`.
+    /// @dev Sends `amount` of `token` (zero: native wei) to the owner and emits `AccountWithdrawn`.
     /// @param token The token, or zero for native USDC.
     /// @param amount Native wei (18 decimals) for zero, else the token's own units.
     function _send(address token, uint256 amount) private {
@@ -500,7 +513,7 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         } else {
             IERC20(token).safeTransfer(to, amount);
         }
-        emit Withdrawn(token, amount);
+        emit AccountWithdrawn(token, amount);
     }
 
     /// @dev Reverts unless `a` may become an agent with these terms: not zero, the owner or this account; expiry in

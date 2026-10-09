@@ -25,7 +25,8 @@ interface IAgentAccount is IERC1271 {
     /// @param agent The agent key.
     /// @param expiresAt Requested expiry, Unix seconds.
     /// @param permissions Requested `P_*` bitmask.
-    /// @param eta Unix time (seconds) from which anyone may execute the item; it expires 7 days later.
+    /// @param eta ETA at queue time, Unix seconds: queue time plus the delay then. A later delay raise moves it, so
+    ///        read `queued(id)` for the effective ETA; the item expires 7 days after the effective ETA.
     event AgentQueued(uint256 indexed id, address indexed agent, uint40 expiresAt, uint16 permissions, uint40 eta);
     /// @notice An address was retired forever, and revoked if it was an active agent.
     /// @param agent The address.
@@ -34,7 +35,8 @@ interface IAgentAccount is IERC1271 {
     event AgentRevoked(address indexed agent, uint40 expiresAt, uint16 permissions);
     /// @notice A policy widening was queued.
     /// @param id Queue id.
-    /// @param eta Unix time (seconds) from which anyone may execute the item; it expires 7 days later.
+    /// @param eta ETA at queue time, Unix seconds: queue time plus the delay then. A later delay raise moves it, so
+    ///        read `queued(id)` for the effective ETA; the item expires 7 days after the effective ETA.
     /// @param policy The full target policy (amounts usdc6); fields changed after queueing keep their value.
     event PolicyQueued(uint256 indexed id, uint40 eta, Policy policy);
     /// @notice A queued item was cancelled by the owner, or found void on an execution attempt after the account's
@@ -51,7 +53,8 @@ interface IAgentAccount is IERC1271 {
     /// @notice Adding a token to the buy allowlist was queued.
     /// @param id Queue id.
     /// @param token The token.
-    /// @param eta Unix time (seconds) from which anyone may execute the item; it expires 7 days later.
+    /// @param eta ETA at queue time, Unix seconds: queue time plus the delay then. A later delay raise moves it, so
+    ///        read `queued(id)` for the effective ETA; the item expires 7 days after the effective ETA.
     event TokenAllowQueued(uint256 indexed id, address indexed token, uint40 eta);
     /// @notice The owner paused or unpaused this account's agents. Pausing voids every queued item.
     /// @param paused True when paused.
@@ -62,21 +65,23 @@ interface IAgentAccount is IERC1271 {
     /// @notice Lowering the widening delay was queued.
     /// @param id Queue id.
     /// @param delay Requested delay, seconds.
-    /// @param eta Unix time (seconds) from which anyone may execute the item; it expires 7 days later.
+    /// @param eta ETA at queue time, Unix seconds: queue time plus the delay then. A later delay raise moves it, so
+    ///        read `queued(id)` for the effective ETA; the item expires 7 days after the effective ETA.
     event IncreaseDelayQueued(uint256 indexed id, uint32 delay, uint40 eta);
     /// @notice An ownership transfer was queued; only `newOwner` can complete it, through `acceptOwnership`.
     /// @param id Queue id.
     /// @param newOwner The proposed owner.
-    /// @param eta Unix time (seconds) from which `newOwner` may accept; it expires 7 days later.
+    /// @param eta ETA at queue time, Unix seconds: queue time plus the delay then. A later delay raise moves it, so
+    ///        read `queued(id)` for the effective ETA from which `newOwner` may accept; it expires 7 days after it.
     event OwnershipQueued(uint256 indexed id, address indexed newOwner, uint40 eta);
     /// @notice Ownership moved. Every item queued before it is void.
     /// @param previousOwner The former owner.
     /// @param newOwner The new owner.
-    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event AccountOwnerChanged(address indexed previousOwner, address indexed newOwner);
     /// @notice Assets left the account to the owner.
     /// @param token The token, or zero for native USDC.
     /// @param amount Amount sent: native wei (18 decimals) for zero, else the token's own units.
-    event Withdrawn(address indexed token, uint256 amount);
+    event AccountWithdrawn(address indexed token, uint256 amount);
 
     /// @notice A constructor dependency, or the token passed to `setTokenAllowed`, is the zero address.
     error ZeroAddress();
@@ -90,7 +95,7 @@ interface IAgentAccount is IERC1271 {
     error DelayOutOfRange();
     /// @notice The referrer is the account itself, which the FeeManager would refuse.
     error SelfReferrer();
-    /// @notice The agent key is zero, the owner or the account itself.
+    /// @notice The agent key (to add, change, revoke or rotate) is zero, the owner or the account itself.
     error InvalidAgent();
     /// @notice The agent's expiry is not after now, or is more than 180 days away.
     error AgentExpiryOutOfRange();
@@ -216,10 +221,30 @@ interface IAgentAccount is IERC1271 {
     /// @return eta Effective ETA, Unix seconds: queue time plus the larger of the delay at queue time and the
     ///         current delay, so raising the delay also delays items already queued. Expiry is `eta + 7 days`.
     /// @return itemEpoch Epoch at queue time.
+    /// @return seq `writeSeq` at queue time: a subject whose last write (`policyWrite`, `agentWrite`, `tokenWrite`,
+    ///         `delayWrite`) is above it keeps its value (policy field) or makes the item revert `StaleQueued`.
     /// @return payload ABI-encoded arguments: `(address agent, uint40 expiresAt, uint16 permissions)` for an agent
     ///         addition or widening; `(Policy target)` for a policy; `(address token)`; `(uint32 delay)`;
     ///         `(address newOwner)`.
-    function queued(uint256 id) external view returns (uint8 kind, uint40 eta, uint64 itemEpoch, bytes memory payload);
+    function queued(uint256 id)
+        external
+        view
+        returns (uint8 kind, uint40 eta, uint64 itemEpoch, uint64 seq, bytes memory payload);
+    /// @notice Write sequence number of a policy field's last change.
+    /// @param field Field index in `Policy` struct order (0–10).
+    /// @return The `writeSeq` value of that write; zero if never written (a field left at zero at creation).
+    function policyWrite(uint256 field) external view returns (uint64);
+    /// @notice Write sequence number of an agent address's last activation, term change or retirement.
+    /// @param a The address.
+    /// @return The `writeSeq` value of that write; zero if never written.
+    function agentWrite(address a) external view returns (uint64);
+    /// @notice Write sequence number of a token's last allowlist addition or removal.
+    /// @param token The token.
+    /// @return The `writeSeq` value of that write; zero if never written.
+    function tokenWrite(address token) external view returns (uint64);
+    /// @notice Write sequence number of the widening delay's last change.
+    /// @return The `writeSeq` value of that write; zero if never changed after creation.
+    function delayWrite() external view returns (uint64);
 
     /// @notice Queues a new agent key; it becomes active once the item executes.
     /// @dev Owner only. Reverts for a retired or active key, the owner, the account, zero, an expiry outside
@@ -239,7 +264,8 @@ interface IAgentAccount is IERC1271 {
     function setAgent(address a, uint40 expiresAt, uint16 permissions) external returns (uint256 id);
     /// @notice Retires an address forever, revoking it now if it is an active agent. Queued items for it can no
     ///         longer execute (an addition fails `AgentRetired`, a widening `StaleQueued`).
-    /// @dev Owner only. Reverts `AgentRetired` if already retired.
+    /// @dev Owner only. Reverts `InvalidAgent` for zero, the owner or the account, and `AgentRetired` if already
+    ///      retired.
     /// @param a The address.
     function revokeAgent(address a) external;
     /// @notice Retires `oldA` now (revoking it if active) and queues `newA` with the given terms.
@@ -283,7 +309,8 @@ interface IAgentAccount is IERC1271 {
     /// @notice Executes a queued item. Anyone may call it.
     /// @dev From the effective ETA to 7 days after it; an expired item reverts `QueuedExpired` and stays in storage
     ///      until cancelled. An item from an older epoch is deleted with `QueuedCancelled` instead, without
-    ///      reverting. Ownership items revert `AcceptRequired`.
+    ///      reverting. Ownership items revert `AcceptRequired`. A policy item whose every field was written after
+    ///      queueing applies nothing and emits only `QueuedExecuted` (no `PolicyApplied`).
     /// @param id Queue id.
     function executeQueued(uint256 id) external;
     /// @notice Deletes a queued item.

@@ -365,30 +365,64 @@ contract AgentPoolTest is AgentFixture {
     function test_PoolImpactMaths() public pure {
         uint256 s = 79228162514264337593543950336; // 1.0 in Q64.96
         assertEq(AgentPolicyLib.poolImpactBps(s, s), 0);
-        // sqrt up exactly 1% -> price up 2.01%.
+        // sqrt up exactly 1% -> price ratio 1.0201 -> 201.
         assertEq(AgentPolicyLib.poolImpactBps(100 * s, 101 * s), 201);
-        // sqrt down exactly 1% -> price down 1.99%.
-        assertEq(AgentPolicyLib.poolImpactBps(100 * s, 99 * s), 199);
-        // Rounded against the trade: just under 2.01% is 201, and the smallest move either way is 1.
+        // sqrt down 1%: hi / lo = 100 / 99, price ratio 1.020304... -> 204 (the same move seen from the other side).
+        assertEq(AgentPolicyLib.poolImpactBps(100 * s, 99 * s), 204);
+        assertEq(AgentPolicyLib.poolImpactBps(99 * s, 100 * s), 204);
+        // Rounded up: just under 2.01% is 201, and the smallest move either way is 1.
         assertEq(AgentPolicyLib.poolImpactBps(s, s * 101 / 100), 201);
         assertEq(AgentPolicyLib.poolImpactBps(s, s + 1), 1);
         assertEq(AgentPolicyLib.poolImpactBps(s, s - 1), 1);
-        assertEq(AgentPolicyLib.poolImpactBps(100 * s, 99 * s + 1), 199);
-        // Extreme moves stay typed: a fall to zero is 10,000; a rise across the whole range saturates.
+        // Doubling or halving the sqrt price is a 4x price move either way.
+        assertEq(AgentPolicyLib.poolImpactBps(s, 2 * s), 30_000);
+        assertEq(AgentPolicyLib.poolImpactBps(2 * s, s), 30_000);
+        // Extreme moves stay typed: across the whole range, either way, saturates.
         uint256 minSqrt = 4295128739;
         uint256 maxSqrt = 1461446703485210103287273052203988822378723970342;
-        assertEq(AgentPolicyLib.poolImpactBps(maxSqrt, minSqrt), 10_000);
+        assertEq(AgentPolicyLib.poolImpactBps(maxSqrt, minSqrt), type(uint256).max);
         assertEq(AgentPolicyLib.poolImpactBps(minSqrt, maxSqrt), type(uint256).max);
         assertGt(AgentPolicyLib.poolImpactBps(s, s * 1e9), 1e21);
     }
 
-    function testFuzz_PoolImpactNeverPanics(uint160 a, uint160 b) public pure {
+    /// @dev A token price up 50.0625% is a sqrt-price rise of 1.225x when the token is currency1 and a fall to 1/1.225
+    ///      when it is currency0. Both read 5,007 bps (ruling: orientation-independent; the old signed formula read the
+    ///      fall as about 3,336).
+    function test_PoolImpactIsTheSameInBothOrderings() public pure {
+        uint256 s = 79228162514264337593543950336;
+        assertEq(AgentPolicyLib.poolImpactBps(1000 * s, 1225 * s), 5_007);
+        assertEq(AgentPolicyLib.poolImpactBps(1225 * s, 1000 * s), 5_007);
+    }
+
+    function testFuzz_PoolImpactIsSymmetricAndNeverPanics(uint160 a, uint160 b) public pure {
         a = uint160(bound(a, 4295128739, 1461446703485210103287273052203988822378723970342));
         b = uint160(bound(b, 4295128739, 1461446703485210103287273052203988822378723970342));
         uint256 bps = AgentPolicyLib.poolImpactBps(a, b);
+        assertEq(bps, AgentPolicyLib.poolImpactBps(b, a), "mirrored moves read the same");
         if (a == b) assertEq(bps, 0);
         else assertGt(bps, 0, "any move counts");
-        if (b < a) assertLe(bps, 10_000, "a fall is at most 100%");
+    }
+
+    /// @dev The same 50 USDC buy in a pool where the token sorts below USDC (sqrt price rises) and in one where it
+    ///      sorts above (sqrt price falls): the measured impacts agree.
+    function test_SameBuyReadsTheSameImpactInBothOrderings() public {
+        uint256[2] memory bps;
+        int256[2] memory dir;
+        for (uint256 i; i < 2; ++i) {
+            PoolKey memory key = gm.poolKey(address(toks[i]));
+            uint160 before = _sqrt(key);
+            uint256 snap = vm.snapshotState();
+            _swap(toks[i], true, 50e6, 1);
+            uint160 afterS = _sqrt(key);
+            vm.revertToState(snap);
+            bps[i] = AgentPolicyLib.poolImpactBps(before, afterS);
+            dir[i] = afterS > before ? int256(1) : int256(-1);
+        }
+        assertEq(dir[0], 1, "token is currency0: the sqrt price (USDC per token) rises on a buy");
+        assertEq(dir[1], -1, "token is currency1: the sqrt price (tokens per USDC) falls on a buy");
+        emit log_named_uint("impact, token below USDC", bps[0]);
+        emit log_named_uint("impact, token above USDC", bps[1]);
+        assertApproxEqAbs(bps[0], bps[1], 1, "the same trade reads the same impact");
     }
 
     function test_MinOutNotMetBubblesTheRouterRevert() public {

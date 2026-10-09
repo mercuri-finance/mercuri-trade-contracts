@@ -133,22 +133,23 @@ library AgentPolicyLib {
         return price > avg ? Math.mulDiv(price - avg, MAX_BPS, price, Math.Rounding.Ceil) : 0;
     }
 
-    /// @notice Price impact of a pool swap: how far the pool price moved, from `sqrtPriceX96` before and after.
-    /// @dev `r = after * 1e18 / before` and `ratio = r * r / 1e18` (the price ratio scaled by 1e18), both rounded
-    ///      away from 1e18 (up for a rise, down for a fall), then impact `ceil(|ratio - 1e18| * 10,000 / 1e18)`: every
-    ///      step rounds against the trade, as the curve checks do. Every step uses `Math.mulDiv`, and a rise of more
-    ///      than 2^128 / 1e18 in `r` returns `type(uint256).max`, so an extreme move ends in the caller's typed
-    ///      `PriceImpactTooHigh` instead of an overflow. Callers pass `sqrtBefore > 0` (an initialised pool).
+    /// @notice Price impact of a pool swap: how far the pool price moved, the same in either token ordering.
+    /// @dev With `hi = max(before, after)` and `lo = min(before, after)` (sqrt prices), the price ratio is
+    ///      `(hi / lo)^2 >= 1` whichever currency is the token, and the impact is `ceil(((hi / lo)^2 - 1) * 10,000)`:
+    ///      `r = ceil(hi * 1e18 / lo)`, `ratio = ceil(r * r / 1e18)`, then `ceil((ratio - 1e18) * 10,000 / 1e18)`, so
+    ///      every step rounds against the trade, as the curve checks do. A move and its mirror (the same move seen
+    ///      from the other ordering) give the same value. Every step uses `Math.mulDiv`, and `r > 2^128` returns
+    ///      `type(uint256).max`, so an extreme move ends in the caller's typed `PriceImpactTooHigh` instead of an
+    ///      overflow. Callers pass non-zero prices (an initialised pool).
     /// @param sqrtBefore Pool `sqrtPriceX96` before the swap (Q64.96).
     /// @param sqrtAfter Pool `sqrtPriceX96` after the swap (Q64.96).
     /// @return Impact, basis points.
     function poolImpactBps(uint256 sqrtBefore, uint256 sqrtAfter) internal pure returns (uint256) {
-        bool up = sqrtAfter >= sqrtBefore;
-        Math.Rounding away = up ? Math.Rounding.Ceil : Math.Rounding.Floor;
-        uint256 r = Math.mulDiv(sqrtAfter, 1e18, sqrtBefore, away);
+        (uint256 hi, uint256 lo) = sqrtAfter > sqrtBefore ? (sqrtAfter, sqrtBefore) : (sqrtBefore, sqrtAfter);
+        uint256 r = Math.mulDiv(hi, 1e18, lo, Math.Rounding.Ceil);
         if (r > type(uint128).max) return type(uint256).max;
-        uint256 ratio = Math.mulDiv(r, r, 1e18, away);
-        return Math.mulDiv(up ? ratio - 1e18 : 1e18 - ratio, MAX_BPS, 1e18, Math.Rounding.Ceil);
+        uint256 ratio = Math.mulDiv(r, r, 1e18, Math.Rounding.Ceil);
+        return Math.mulDiv(ratio - 1e18, MAX_BPS, 1e18, Math.Rounding.Ceil);
     }
 
     /// @dev Per-field narrowing rule. `minTokenAgeBlocks` is a floor, so higher is tighter; for `allowlistOnly`

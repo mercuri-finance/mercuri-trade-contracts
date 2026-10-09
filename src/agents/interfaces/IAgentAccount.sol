@@ -191,9 +191,10 @@ interface IAgentAccount is IERC1271 {
     ///      clear: SWAP_EXACT_IN_SINGLE with `minHopPriceX36 = 0` and `hookData = abi.encode(address(this))` so the
     ///      LaunchHook attributes the fee to the account, SETTLE_ALL capped at `amountIn`, TAKE_ALL at least
     ///      `minAmountOut`). Afterwards both allowances must be zero (`AllowanceNotCleared`), the input taken must be
-    ///      at most `amountIn` and the output at least `minAmountOut` (`UnexpectedSwapDelta`), and the move of the
-    ///      pool price from `sqrtPriceX96` before and after, `|(after / before)^2 - 1|` in basis points rounded against the trade,
-    ///      at most `maxPriceImpactBps`. That limits the size of this swap only, not a price moved earlier.
+    ///      at most `amountIn` and the output at least `minAmountOut` (`UnexpectedSwapDelta`), and the pool price move
+    ///      `(hi / lo)^2 - 1` in basis points, rounded up, at most `maxPriceImpactBps`, where `hi` and `lo` are the
+    ///      larger and smaller `sqrtPriceX96` of before and after, so either token ordering reads the same. That
+    ///      limits the size of this swap only, not a price moved earlier.
     ///      Buy (`buyToken`): `amountIn` is usdc6, the allowlist applies and `amountIn <= maxTradeUsdc`. The spend is
     ///      the native balance delta rounded up to usdc6 (Arc's USDC ERC-20 view moves the native balance), charged to
     ///      the period and per-token caps and added to the basis with the measured token delta.

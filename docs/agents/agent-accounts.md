@@ -25,7 +25,9 @@ factory's first CREATE), predicted before either exists; the factory's construct
 not name it and its registry.
 
 Each agent action runs: account lock, registry `authorize` (owner pause, factory pause, active unexpired agent with the
-permission, deadline in `[now, now + maxDeadlineSeconds]`, period roll, action count), the account's own checks (genuine
+permission, deadline in `[now, now + maxDeadlineSeconds]`, period roll, action count, and for `launch` only the launch
+limit: `launches < launchesPerPeriod`, else `LaunchLimit`, before `maxTradeUsdc` and before any `LaunchFactory` call;
+the launch is counted only after it succeeds), the account's own checks (genuine
 curve from `LaunchFactory.curveOf`, or the GraduationManager's pool key through the LaunchHook, allowlist, snipe and age
 limits, per-trade cap, price impact), the trade, the measured native-balance delta (spent rounded up to usdc6,
 received rounded down), then registry `record` against the period caps.
@@ -146,8 +148,8 @@ logs of the agent tests, local fixture unless stated:
 | Direct EOA curve buy (warm token), for comparison | 88,570 |
 | Agent curve buy, same size | 131,103 (42,533 overhead) |
 | Agent curve sell | 86,360 |
-| Agent pool buy through the deployed testnet Universal Router and LaunchHook (fork, first action, cold; measured at `c3771e7`, about 40 gas more since the launch pre-check) | 420,180 |
-| Agent pool sell, same pool (fork; measured at `c3771e7`) | 235,013 |
+| Agent pool buy through the deployed testnet Universal Router and LaunchHook (fork, first action, cold; measured at `6a559b3`) | 420,219 |
+| Agent pool sell, same pool (fork; measured at `6a559b3`) | 235,046 |
 | `createAccount` with referrer binding and a first agent | 353,719 |
 | Graduating agent buy, minimum call gas (cold) | 1,254,882 |
 | `revokeAgent` | 45,879 |
@@ -192,7 +194,12 @@ three runtimes from `out/` with the manifest and record values in every immutabl
 
 ## 10. Release evidence
 
-Candidate: branch `feat/agent-accounts` at `6a559b3db594fe34b2a10a4ca8ec196bba4905f1` (contracts, scripts and tests; later commits touching only this page do not change the candidate). Baseline: Launch as pinned in
+Candidate: branch `feat/agent-accounts`, code at `6a559b3db594fe34b2a10a4ca8ec196bba4905f1`; the evidence below is the
+independent final review's, run at `c8c6485` (a docs-only commit on top of `6a559b3`). Later commits do not change the
+candidate: `20cc075` adds only local tooling (`script/local/**`, a `foundry.toml` compilation restriction for it), and
+rebuilding at `6a559b3` and at `20cc075` gives byte-identical creation and runtime code for `AgentAccount`,
+`AgentAccountFactory` and `AgentPolicyRegistry`; the closing pass changes only tests, scripts and docs, and
+`git diff 20cc075 -- src` is empty. Baseline: Launch as pinned in
 `lib/mercuri-launch-contracts` at `99d7c28` and its deployment records for 5042002 and 5042; the deployed testnet
 Universal Router `0x4fcA…9Fb1` at its pinned runtime hash. Toolchain: forge 1.4.3, solc 0.8.26, Cancun, via-IR, 200
 optimizer runs for `src/**`, no metadata hash. Missing evidence is pending, not pass.
@@ -202,27 +209,45 @@ optimizer runs for `src/**`, no metadata hash. Missing evidence is pending, not 
 | Source manifest | `source-manifest.json` listed only the three order sources; at `f292c52` `check-local-source.py` failed because `src/agents/` was unlisted (pre-existing gate failure from Tasks 1 to 6) | All eight `src/agents/` sources listed with sha256 | `python3 script/check-local-source.py` (in gate) | Pass | None |
 | NatSpec | Order contracts only (54 entries) | Adds `AgentAccount`, `AgentAccountFactory`, `AgentPolicyRegistry` and their three interfaces; two gaps found and fixed (registry `authorize` `@param agent_`; `isValidSignature` declared in vendored IERC1271 treated as inherited, the account's override still checked). Comment-only: registry runtime byte-identical before and after | `python3 script/check-natspec.py` | Pass, 284 ABI entries, 0 failures | Semantic review of NatSpec is part of the independent review |
 | Runtime identity | Filler, validator and reactor only | Every immutable of the implementation (10), factory (14) and registry (1) reconstructed; a flipped byte in each is rejected by name; extra or missing immutables refused; EIP-1167 clone check | `python3 script/verify-agent-accounts.py --self-test`, ten `--self-test-flipped` pairs (in gate) | Pass | Live comparison against a real deployment is pending until a testnet deployment exists |
-| Substitution correctness | n/a | Constructor simulations (`eth_call`, no transaction) of the built creation code with the testnet manifest inputs equal the reconstructed runtimes | `python3 script/verify-agent-accounts.py --simulate --block 66330102` against `https://rpc.testnet.arc.io` | MATCH at the previous candidate `c3771e7`: account 15,387 B, factory 3,855 B, registry 17,798 B. Since then the registry gained the launch pre-check (17,838 B); account and factory runtimes are unchanged | Re-run at `6a559b3` (no network was used in the final wave); mainnet simulation pending (no public mainnet RPC reachable) |
+| Substitution correctness | n/a | Constructor simulations (`eth_call`, no transaction) of the built creation code with the testnet manifest inputs equal the reconstructed runtimes | `python3 script/verify-agent-accounts.py --simulate --block 66330102` against `https://rpc.testnet.arc.io` | MATCH at `6a559b3`: account 15,387 B, factory 3,855 B, registry 17,838 B | Mainnet simulation pending (no public mainnet RPC reachable) |
 | Manifests | n/a | Inputs only (extra keys refused by the script and the preflight; the Trade manifest's chain checked); Launch addresses = Launch records, admin = timelock, guardian = record guardian, router and hash = Trade manifest, ceilings = spec 4.5 | `verify-agent-accounts.py --preflight` for both, a raised-ceiling copy refused (in gate); `DeployAgentAccounts.t.sol` | Pass | Mainnet guardian code check runs only at deploy time (script requires code on 5042) |
-| Deploy script | n/a | Predicts implementation, factory and registry from the deployer nonce; full wiring check; wrong chain and missing code refused; tampered manifests refused by field | `test/agents/DeployAgentAccounts.t.sol` (6 tests, in process against the fixture, never broadcast); the fork test runs `run()` against deployed testnet Launch | Pass | Testnet deployment needs an owner go (D9) |
-| Deployment record writer | `write-trade-record.py` for the order contracts | `write-agent-accounts-record.py`: writes `agent-accounts-<chainId>.json` only from a completed broadcast and only for a manifest that passes the preflight; links the record into place so an existing or racing record is never overwritten; the verifier's live mode reads only that record and refuses a block before `factoryDeployBlock` | `python3 script/write-agent-accounts-record.py --self-test` (in gate) and the verifier's record self-test | Pass, 39/39 cases | Run against the real broadcast at the testnet deployment. The forge ceilings tuple format of the struct argument was confirmed on a local anvil fork broadcast |
-| Behaviour, attack, fuzz, invariant tests | Tasks 1 to 6 suites | 213 agent tests, incl. the final wave's launch pre-check and pause tests | `bash script/check-contracts.sh` (seed `0x5042`); agent suites with seeds `0xe93d4ec5`, `0x0ea0facb`, `0xb711d0ad` | Gate exit 0 in 10 min 8 s: 391 passed, 7 skipped (fork suites without RPC). Each seed: 212 passed, 1 skipped (fork), 0 failed | None |
-| Stress | Order suites | Same gate with `--stress`; agent invariants moved out of the 10,000-run step into their own deep campaign (own counterexample directory) | `ARC_LOCAL_FORK_RPC=https://rpc.testnet.arc.io TRADE_FORK_CHAIN_ID=5042002 bash script/check-contracts.sh --stress` (with `AGENT_INVARIANT_STATS=true` for the ratios) | Exit 0 in 37 min 4 s: fork-suite run 409 passed, 2 skipped; 10,000-run fuzz 397 passed, 2 skipped; order invariants 1,024 x 256; agent invariants 6 passed at 1,024 x 256 (262,144 calls each, 0 reverts, fail-on-revert). Measured at depth 256 over 6,150 runs: successful-step ratio 87.7% (minimum 81.6%), successful account-call ratio 83.3% (minimum 77.3%), against the 60% floor (all at `c3771e7`). At `6a559b3`: the agent invariant campaign alone, 1,024 x 256, seed `0x5042002`, 6 passed (262,144 calls each, 0 reverts, fail-on-revert) in 19 min 44 s; the full `--stress` was not re-run | Full `--stress` at the final candidate before testnet |
-| Pinned fork | n/a | Agent pool buy and sell (ERC-20 and Permit2 allowances back to zero; Alchemy URLs refused) through the deployed testnet Universal Router and LaunchHook on graduated token `0x97B4…eE84` at block 65,301,435, account deployed by the production script | `test/agents/AgentPoolFork.t.sol` (skipped without `ARC_LOCAL_FORK_RPC`) | Pass at `c3771e7` (also under each random seed and in stress); not re-run at `6a559b3` (no network) | Re-run at the final candidate. Spec 10's other fork cases (graduating buy, sell during GraduationPending, launch with initial buy, fee claim, blocklisted-owner withdraw) and a mainnet fork are pending for the testnet smoke |
+| Deploy script | n/a | Predicts implementation, factory and registry from the deployer nonce; full wiring check; wrong chain and missing code refused; tampered manifests refused by field | `test/agents/DeployAgentAccounts.t.sol` (6 tests, in process against the fixture, never broadcast); the fork test runs `run()` against deployed testnet Launch; `forge script script/DeployAgentAccounts.s.sol` dry run (no `--broadcast`) against the testnet RPC | Pass; dry run OK at `6a559b3` | Testnet deployment needs an owner go (D9) |
+| Deployment record writer | `write-trade-record.py` for the order contracts | `write-agent-accounts-record.py`: writes `agent-accounts-<chainId>.json` only from a completed broadcast and only for a manifest that passes the preflight; links the record into place so an existing or racing record is never overwritten; names only HEAD of a clean tree as `sourceRevision` (a different or abbreviated `--source-revision`, or a dirty tree, is refused unless `--allow-unverified-revision`); the verifier's live mode reads only that record and refuses a block before `factoryDeployBlock` | `python3 script/write-agent-accounts-record.py --self-test` (in gate) and the verifier's record self-test | Pass, 54/54 cases | Run against the real broadcast at the testnet deployment. The forge ceilings tuple format of the struct argument was confirmed on a local anvil fork broadcast |
+| Behaviour, attack, fuzz, invariant tests | Tasks 1 to 6 suites | 213 agent tests, incl. the final wave's launch pre-check and pause tests | `bash script/check-contracts.sh` (seed `0x5042`); agent suites with seeds `0xe93d4ec5`, `0x0ea0facb`, `0xb711d0ad` | Gate exit 0 at `c8c6485` (final review): 391 passed, 7 skipped (fork suites without RPC). Each seed (final wave, same code): 212 passed, 1 skipped (fork), 0 failed | None |
+| Stress | Order suites | Same gate with `--stress`; agent invariants moved out of the 10,000-run step into their own deep campaign (own counterexample directory) | `ARC_LOCAL_FORK_RPC=https://rpc.testnet.arc.io TRADE_FORK_CHAIN_ID=5042002 bash script/check-contracts.sh --stress` (with `AGENT_INVARIANT_STATS=true` for the ratios) | Exit 0 in 38 min 37 s at `c8c6485` (final review): fork-suite run 413 passed, 2 skipped; 10,000-run fuzz 401 passed, 2 skipped; order invariants 6 passed at 1,024 x 256; agent invariants 6 passed at 1,024 x 256 (262,144 calls each, 0 reverts, fail-on-revert). Agent invariant ratios at depth 256: successful-step 87.71% (minimum per run 81.64%), successful account-call 83.26% (minimum 77.35%), against the 60% floor. Closing pass (handler only, `src/` unchanged): the queue-expiry branch is now reached in every run and asserted (`queueExpiries > 0`); campaign of the agent invariants alone at 1,024 x 256, seed `0x5042002`: 6 passed (262,144 calls each, 0 reverts, fail-on-revert) in 21 min 21 s; over 6,150 runs successful-step 87.68% (minimum 80.47%), successful account-call 82.78% (minimum 77.49%), 14,038 queue expiries (at least 1 per run). Default depth (64 x 64, seed `0x5042`): 6 passed; step 73.74% (minimum 68.75%), account-call 71.75% (minimum 66.67%), 594 expiries over 390 runs | None |
+| Pinned fork | n/a | Agent pool buy and sell (ERC-20 and Permit2 allowances back to zero; Alchemy URLs refused) through the deployed testnet Universal Router and LaunchHook on graduated token `0x97B4…eE84` at block 65,301,435, account deployed by the production script | `test/agents/AgentPoolFork.t.sol` (skipped without `ARC_LOCAL_FORK_RPC`) | PASS at `6a559b3` (final review, and in stress): pool buy 420,219 gas, pool sell 235,046 gas | Spec 10's other fork cases and a mainnet fork: see "Before testnet sign-off" below |
 | Gas | n/a | Agent snapshot `.gas-snapshot-agents` (194 entries) | `forge snapshot --check .gas-snapshot-agents ...` (in gate) | Pass | None |
 | Size | EIP-170 24,576 B | 15,387 / 3,855 / 17,838 B | `forge build --sizes` | Pass | None |
 | Arc per-tx gas cap | Unverified (ruling: likely 16,777,216) | Verified on testnet (section 7) | `eth_estimateGas` probe, block 66,330,102 | 16,777,216 | Mainnet probe pending |
 | Upgradeability and storage | n/a | No proxies; nothing to upgrade, no storage layout to preserve | Code review | Not applicable | Documented: no code rollback |
-| Static analysis | n/a | Slither named in spec 10 | Not installed in this environment | Pending | Run Slither |
+| Static analysis | n/a | Slither 0.11.3, per file (`AgentAccount.sol`; `AgentAccountFactory.sol`, which compiles the registry), `lib/` filtered; whole-repo mode fails on duplicate `ERC20` names | `bash script/run-slither.sh` (offline, about 15 s; in the gate when Slither 0.11.3 is installed); triage in [`docs/reports/2026-10-09-agent-accounts-slither.md`](../reports/2026-10-09-agent-accounts-slither.md) | 87 results (50 + 37), 0 true positives; every result triaged; counts per detector pinned by the script | None |
 | Independent review and external audit | n/a | Required by spec 10 before testnet and mainnet respectively | n/a | Pending | Both |
+
+### Before testnet sign-off
+
+The pinned fork test proves the graduated pool buy and sell only. Spec 10's remaining fork cases are proven in the
+testnet smoke, against the deployed testnet Launch contracts and the new testnet factory, before the testnet is signed
+off:
+
+- a **graduating buy**: the agent curve buy that graduates the curve, charged at its measured native delta (refund
+  included) against the caps;
+- a **sell during `GraduationPending`** (and a buy refused with `NotTrading` in the same state);
+- a **launch with an initial buy**, with the creator and the referrer bound at Launch's FeeManager;
+- a **fee claim** (`claimFees`) of the account's creator fees;
+- a **blocklisted-owner withdraw**, expected to revert (spec Q9: a blocklisted owner cannot withdraw and nothing can
+  override it); the live blocklist is not ours to set, so this case runs on a testnet fork that impersonates USDC's
+  blocklister;
+- the **real USDC approve and Permit2 path**: the pool trade's ERC-20 approval and Permit2 allowance against Arc's real
+  USDC system contract, both back to zero after the trade.
+
+Each case records the transaction hash and gas in the testnet smoke report; a mainnet fork follows before mainnet.
 
 ## 11. Open gaps (pending before contract readiness)
 
 - Independent internal multi-auditor review of the whole agent contract set, then an external audit before mainnet
   (spec 10). No mainnet deployment with an open finding.
 - Live runtime comparison after the testnet deployment (`verify-agent-accounts.py --rpc ... --block ... --record`).
-- The remaining spec 10 pinned-fork cases and a mainnet fork; the testnet smoke covers them otherwise.
-- Slither.
+- The remaining spec 10 fork cases (section 10, "Before testnet sign-off") in the testnet smoke, and a mainnet fork.
 - Mainnet per-tx gas cap probe and mainnet constructor simulation (no public mainnet RPC reachable read-only on
   9 October 2026).
 - Owner decisions D1 to D8 were taken at the spec's recommendations; a different choice costs a contract change before

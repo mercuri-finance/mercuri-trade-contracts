@@ -1345,6 +1345,34 @@ contract AgentInvariantsTest is AgentFixture {
     ///      queueing stays at or below that tightening, and every other field takes the target (Review Focus 2).
     function _actExecute(uint256 seed) internal {
         uint256 i = seed % 2;
+        // The first EXECUTE of every run, and about one in sixteen after it, first lets a fresh widening lapse.
+        if (queueExpiries == 0 || _r(seed, 7) % 16 == 0) _expireFresh(i, seed);
+        _executeOldest(i, seed);
+    }
+
+    /// @dev Queues a fresh widening and warps one second past its expiry (ETA + QUEUE_TTL, about 8 days): anyone's
+    ///      execution then reverts `QueuedExpired` and changes nothing. Every older live item has lapsed too, so the
+    ///      execution that follows takes the expiry branch of `_executeOldest` for each of them.
+    function _expireFresh(uint256 i, uint256 seed) internal {
+        uint256 id = _actQueueWiden(i, seed);
+        ++okCount[QUEUE_WIDEN];
+        pendingOf[i].pop(); // the item just queued; it never applies
+        (, uint40 eta,,,) = registry.queued(_acct(i), id);
+        assertEq(eta, _now() + 1 hours, "eta is the delay after queueing");
+        vm.warp(uint256(eta) + QUEUE_TTL + 1);
+        vm.roll(vm.getBlockNumber() + 1);
+        Pre memory s = _ownerPre(i);
+        (bytes32 d0, bytes32 d1) = _snap();
+        vm.prank(stranger);
+        vm.expectRevert(IAgentPolicyRegistry.QueuedExpired.selector);
+        registry.executeQueued(_acct(i), id);
+        _unchanged(d0, d1);
+        ++refusedCalls;
+        ++queueExpiries;
+        _ownerPost(i, s);
+    }
+
+    function _executeOldest(uint256 i, uint256 seed) internal {
         if (pendingOf[i].length == 0) {
             _actQueueWiden(i, seed);
             ++okCount[QUEUE_WIDEN];
@@ -1376,7 +1404,7 @@ contract AgentInvariantsTest is AgentFixture {
             ++refusedCalls;
             ++queueExpiries;
             _ownerPost(i, s);
-            _actExecute(seed);
+            _executeOldest(i, seed);
             return;
         }
         if (_now() < eta) {
@@ -1978,6 +2006,7 @@ contract AgentInvariantsTest is AgentFixture {
         for (uint256 k; k < KINDS; ++k) {
             assertGt(okCount[k], 0, string.concat("kind never reached: ", vm.toString(k)));
         }
+        assertGt(queueExpiries, 0, "queue expiry never reached");
         if (vm.envOr("AGENT_INVARIANT_STATS", false)) {
             string memory line = string.concat(
                 vm.toString(steps),

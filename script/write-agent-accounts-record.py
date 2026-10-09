@@ -21,12 +21,15 @@ nothing is written. A dry run (`dry-run/`, no receipts) is refused. The manifest
 4.5 ceilings).
 
   python3 script/write-agent-accounts-record.py --broadcast FILE [--manifest FILE] [--out-dir deployments]
-                                                [--source-revision SHA]
+                                                [--source-revision SHA [--allow-unverified-revision]]
   python3 script/write-agent-accounts-record.py --self-test
 
 It never overwrites a record: archive the current one first (as `archive/agent-accounts-<chainId>-<deployBlock>.json`).
 The record is written to a temporary file and hard-linked into place, which fails if the name exists, so even a record
 written by a racing run between the check and the write is never replaced.
+The record names the source revision: HEAD of a tree whose src/, script/, deployments/ and foundry.toml have no
+uncommitted changes. A `--source-revision` must be that HEAD (full SHA); `--allow-unverified-revision` names a full SHA
+as given, for a record written from another checkout, and should be reviewed by hand.
 Then verify the new record with `verify-agent-accounts.py --record` at its block.
 """
 import argparse
@@ -261,15 +264,41 @@ def build(args, manifest, revision):
     return record
 
 
-def source_revision(args):
-    if args.source_revision:
-        return args.source_revision
-    head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=root, capture_output=True, text=True, check=True)
-    dirty = subprocess.run(['git', 'status', '--porcelain', '--', 'src', 'script', 'deployments', 'foundry.toml'],
-                           cwd=root, capture_output=True, text=True, check=True).stdout
+SOURCE_PATHS = ('src', 'script', 'deployments', 'foundry.toml')
+
+
+def git_state(repo):
+    """(HEAD's full SHA, porcelain status of the source paths) of `repo`; HEAD is None outside a git checkout."""
+    head = subprocess.run(['git', 'rev-parse', '--verify', 'HEAD'], cwd=repo, capture_output=True, text=True)
+    if head.returncode != 0:
+        return None, ''
+    dirty = subprocess.run(['git', 'status', '--porcelain', '--', *SOURCE_PATHS], cwd=repo, capture_output=True,
+                           text=True, check=True).stdout
+    return head.stdout.strip().lower(), dirty
+
+
+def check_revision(given, head, dirty, override):
+    """The source revision the record names. Without `override` it must be HEAD of a tree whose source paths have no
+    uncommitted changes (a given revision must equal HEAD); with `override` a given full SHA is taken as is."""
+    if given is not None:
+        given = given.strip().lower()
+        if len(given) != 40 or any(ch not in '0123456789abcdef' for ch in given):
+            raise Refused(f'--source-revision {given!r} is not a full 40-hex commit SHA')
+        if override:
+            return given
+    if head is None:
+        raise Refused('the source tree is not a git checkout; pass --source-revision with --allow-unverified-revision')
+    if given is not None and given != head:
+        raise Refused(f'--source-revision {given} is not HEAD ({head}); check out that revision, or pass '
+                      f'--allow-unverified-revision to name it anyway')
     if dirty.strip():
         raise Refused(f'the source tree has uncommitted changes; the record must name a clean revision:\n{dirty}')
-    return head.stdout.strip()
+    return head
+
+
+def source_revision(args):
+    head, dirty = git_state(root)
+    return check_revision(args.source_revision, head, dirty, args.allow_unverified_revision)
 
 
 def manifest_problems(manifest):
@@ -391,7 +420,8 @@ def selftest():
                               text=True).stdout.strip().split()[-1]
     cases.append(('CREATE address at a two-byte nonce matches cast', same(big, expected), expected))
 
-    def case(name, broadcast, expect_ok, must=(), man=manifest, dry_run=False, existing=False):
+    def case(name, broadcast, expect_ok, must=(), man=manifest, dry_run=False, existing=False, override=True,
+             rev=revision):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             (d / 'manifest.json').write_text(json.dumps(man))
@@ -403,7 +433,9 @@ def selftest():
                 out.mkdir()
                 (out / 'agent-accounts-5042002.json').write_text('{}\n')
             argv = [sys.executable, __file__, '--broadcast', str(path), '--manifest', str(d / 'manifest.json'),
-                    '--out-dir', str(out), '--source-revision', revision]
+                    '--out-dir', str(out), '--source-revision', rev]
+            if override:
+                argv.append('--allow-unverified-revision')
             result = subprocess.run(argv, capture_output=True, text=True)
             text = result.stdout + result.stderr
             written = out / 'agent-accounts-5042002.json'
@@ -481,6 +513,61 @@ def selftest():
     case('manifest Launch address differs from the record', good, False, must=['fails the preflight', 'feeManager'],
          man=dict(manifest, feeManager=other))
 
+    # --source-revision: without the override it must be HEAD of a clean tree; the override takes a full SHA as is.
+    case('source revision that is not HEAD, no override', good, False, must=['is not HEAD'], override=False)
+    case('abbreviated source revision refused even with the override', good, False,
+         must=['not a full 40-hex commit SHA'], rev='b794a9c')
+    head_sha = 'ab' * 20
+
+    def checked(given, head, dirty, override):
+        try:
+            return check_revision(given, head, dirty, override)
+        except Refused as error:
+            return f'refused: {error}'
+
+    for name, got, want in (
+        ('given HEAD of a clean tree is accepted', checked(head_sha.upper(), head_sha, '', False), head_sha),
+        ('no revision given: HEAD of a clean tree', checked(None, head_sha, '', False), head_sha),
+        ('given revision other than HEAD is refused', checked('cd' * 20, head_sha, '', False), 'is not HEAD'),
+        ('given HEAD of a dirty tree is refused', checked(head_sha, head_sha, ' M src/x.sol\n', False),
+         'uncommitted changes'),
+        ('no revision given, dirty tree is refused', checked(None, head_sha, '?? script/x.py\n', False),
+         'uncommitted changes'),
+        ('override names another revision', checked('cd' * 20, head_sha, '', True), 'cd' * 20),
+        ('override accepts a dirty tree', checked(head_sha, head_sha, ' M src/x.sol\n', True), head_sha),
+        ('outside a git checkout without the override is refused', checked(head_sha, None, '', False),
+         'not a git checkout'),
+    ):
+        cases.append((f'revision check: {name}', got == want or (got.startswith('refused') and want in got), got))
+
+    # git_state against a real throwaway repository: clean, then a change under src/ and an untracked script.
+    with tempfile.TemporaryDirectory() as d:
+        git = ['git', '-c', 'user.name=self-test', '-c', 'user.email=self-test@invalid', '-c', 'commit.gpgsign=false']
+        (Path(d) / 'src').mkdir()
+        (Path(d) / 'src' / 'A.sol').write_text('a\n')
+        (Path(d) / 'notes.txt').write_text('n\n')
+        for argv in (['init', '-q'], ['add', '-A'], ['commit', '-q', '-m', 'init']):
+            subprocess.run(git + argv, cwd=d, check=True, capture_output=True)
+        want_head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=d, capture_output=True, text=True,
+                                   check=True).stdout.strip()
+        head, dirty = git_state(d)
+        cases.append(('git state of a clean checkout', head == want_head and dirty == '', f'{head} {dirty!r}'))
+        (Path(d) / 'notes.txt').write_text('changed outside the source paths\n')
+        head, dirty = git_state(d)
+        cases.append(('git state ignores changes outside the source paths', dirty == '', repr(dirty)))
+        (Path(d) / 'src' / 'A.sol').write_text('b\n')
+        (Path(d) / 'script').mkdir()
+        (Path(d) / 'script' / 'new.py').write_text('x\n')
+        head, dirty = git_state(d)
+        cases.append(('git state sees a modified source and an untracked script',
+                      'src/A.sol' in dirty and 'script/' in dirty, repr(dirty)))
+        cases.append(('dirty throwaway checkout is refused', checked(want_head, head, dirty, False).startswith(
+            'refused') and 'uncommitted' in checked(want_head, head, dirty, False), checked(want_head, head, dirty,
+                                                                                            False)))
+    with tempfile.TemporaryDirectory() as d:
+        head, dirty = git_state(d)
+        cases.append(('git state outside a checkout', head is None, f'{head} {dirty!r}'))
+
     # A racing run creates the record after the existence check: the link refuses and the racing file survives.
     with tempfile.TemporaryDirectory() as d:
         target = Path(d) / 'agent-accounts-5042002.json'
@@ -516,7 +603,9 @@ def main():
     parser.add_argument('--broadcast', help="forge's run-latest.json (or run-*.json) of DeployAgentAccounts")
     parser.add_argument('--manifest', default=str(root / 'deployments/agent-accounts-manifest-5042002.json'))
     parser.add_argument('--out-dir', default=str(root / 'deployments'))
-    parser.add_argument('--source-revision', help='full commit SHA; default: git HEAD of a clean tree')
+    parser.add_argument('--source-revision', help='full commit SHA; must be HEAD of a clean tree (the default)')
+    parser.add_argument('--allow-unverified-revision', action='store_true',
+                        help='name --source-revision as given even when it is not HEAD or the tree is dirty')
     parser.add_argument('--self-test', action='store_true')
     args = parser.parse_args()
     if args.self_test:

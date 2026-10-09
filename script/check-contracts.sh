@@ -116,6 +116,15 @@ forge snapshot --check --match-path 'test/integration/*.t.sol' \
 # Agent account gas: deterministic agent tests, in their own snapshot so the order suite's baseline is untouched.
 forge snapshot --check .gas-snapshot-agents --match-path 'test/agents/*.t.sol' \
   --no-match-contract 'Fork|Invariant' --no-match-test '^testFuzz_' --fuzz-seed 0x5042
+# Slither over the agent contracts: offline, about 15 s, on a temporary copy of the tree. It runs when Slither 0.11.3
+# is installed (or SLITHER names it) and then every result must match the triaged baseline; otherwise a notice only,
+# since Slither is a Python tool outside the repo. The release evidence always records a full run of the script.
+slither_bin=${SLITHER:-slither}
+if command -v "$slither_bin" > /dev/null && [[ $("$slither_bin" --version 2> /dev/null) == 0.11.3 ]]; then
+  SLITHER="$slither_bin" bash script/run-slither.sh
+else
+  echo "notice: Slither 0.11.3 not installed (set SLITHER to it); skipping the agent Slither baseline check"
+fi
 
 if [[ ${1:-} == "--stress" ]]; then
   : "${ARC_LOCAL_FORK_RPC:?set ARC_LOCAL_FORK_RPC to an approved Arc RPC or local fork}"

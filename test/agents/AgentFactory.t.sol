@@ -5,6 +5,7 @@ import {AgentFixture} from "./AgentFixture.sol";
 import {AgentAccount} from "../../src/agents/AgentAccount.sol";
 import {AgentAccountFactory} from "../../src/agents/AgentAccountFactory.sol";
 import {IAgentAccount} from "../../src/agents/interfaces/IAgentAccount.sol";
+import {AgentPolicyLib} from "../../src/agents/AgentPolicyLib.sol";
 import {IAgentAccountFactory} from "../../src/agents/interfaces/IAgentAccountFactory.sol";
 import {
     Policy,
@@ -15,6 +16,7 @@ import {
     GUARDIAN_PAUSE,
     GUARDIAN_COOLDOWN,
     MAX_AGENT_TTL,
+    MAX_ADMIN_PAUSE,
     F_MIN_TOKEN_AGE_BLOCKS
 } from "../../src/agents/AgentTypes.sol";
 
@@ -206,6 +208,15 @@ contract AgentFactoryTest is AgentFixture {
         assertEq(account.referrer(), address(0));
     }
 
+    function test_ReferrerMayBeOwner() public {
+        // Deliberate: the owner may refer its own account and earn the referrer share of the account's fees.
+        InitParams memory p = _defaults();
+        p.referrer = accountOwner;
+        AgentAccount account = _account(accountOwner, bytes32(0), p);
+        assertEq(feeManager.referrerOf(address(account)), accountOwner);
+        assertEq(account.referrer(), accountOwner);
+    }
+
     function test_PolicyAtCeilingsIsAccepted() public {
         InitParams memory p = _defaults();
         p.policy = _ceilings();
@@ -242,27 +253,36 @@ contract AgentFactoryTest is AgentFixture {
     }
 
     function test_PolicyShapeIsValidated() public {
-        Policy memory c = _ceilings();
-        c.maxPriceImpactBps = type(uint16).max;
-        c.maxSnipeBps = type(uint16).max;
-        (, AgentAccountFactory f) = _deployAgents(agentGuardian, c);
+        // Ceilings are themselves in range, so through an account only a zero deadline gets past them.
         InitParams memory p = _defaults();
-        p.policy.maxPriceImpactBps = 10_001;
-        vm.prank(accountOwner);
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.InvalidPolicy.selector, uint8(6)));
-        f.createAccount(bytes32(0), p);
-
-        p = _defaults();
-        p.policy.maxSnipeBps = 10_001;
-        vm.prank(accountOwner);
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.InvalidPolicy.selector, uint8(7)));
-        f.createAccount(bytes32(0), p);
-
-        p = _defaults();
         p.policy.maxDeadlineSeconds = 0;
         vm.prank(accountOwner);
         vm.expectRevert(abi.encodeWithSelector(IAgentAccount.InvalidPolicy.selector, uint8(9)));
-        f.createAccount(bytes32(0), p);
+        agentFactory.createAccount(bytes32(0), p);
+
+        // The library bounds, checked directly.
+        Policy memory q = _defaultPolicy();
+        q.maxPriceImpactBps = 10_001;
+        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.InvalidPolicy.selector, uint8(6)));
+        this.validatePolicy(q);
+        q = _defaultPolicy();
+        q.maxSnipeBps = 10_001;
+        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.InvalidPolicy.selector, uint8(7)));
+        this.validatePolicy(q);
+        q = _defaultPolicy();
+        q.maxDeadlineSeconds = 601;
+        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.InvalidPolicy.selector, uint8(9)));
+        this.validatePolicy(q);
+        q = _defaultPolicy();
+        q.maxPriceImpactBps = 10_000;
+        q.maxSnipeBps = 10_000;
+        q.maxDeadlineSeconds = 600;
+        this.validatePolicy(q);
+    }
+
+    /// @dev External wrapper so `expectRevert` can observe the library's revert.
+    function validatePolicy(Policy memory p) external pure {
+        AgentPolicyLib.validate(p);
     }
 
     function test_PeriodSecondsOutOfRangeReverts() public {
@@ -395,7 +415,7 @@ contract AgentFactoryTest is AgentFixture {
         assertTrue(agentFactory.isPaused());
     }
 
-    function test_AdminCanLiftAndExtend() public {
+    function test_AdminCanLift() public {
         uint40 start = uint40(block.timestamp);
         vm.prank(agentGuardian);
         agentFactory.guardianPause();
@@ -407,7 +427,7 @@ contract AgentFactoryTest is AgentFixture {
         assertFalse(agentFactory.isPaused());
         assertEq(agentFactory.pausedUntil(), 0);
 
-        // Lifting early does not reset the guardian's cooldown, which runs from the end the guardian set.
+        // Lifting early does not reset the guardian's cooldown, which runs from the end its pause stored.
         vm.prank(agentGuardian);
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -415,15 +435,118 @@ contract AgentFactoryTest is AgentFixture {
             )
         );
         agentFactory.guardianPause();
+    }
 
+    function test_AdminCanShorten() public {
+        uint40 start = uint40(block.timestamp);
+        vm.prank(agentGuardian);
+        agentFactory.guardianPause();
+        vm.prank(agentAdmin);
+        agentFactory.adminSetPausedUntil(start + 1 hours);
+        assertEq(agentFactory.pausedUntil(), start + 1 hours);
+        vm.warp(start + 1 hours);
+        assertFalse(agentFactory.isPaused());
+    }
+
+    function test_AdminCanExtendActivePauseUpTo30Days() public {
+        uint40 start = uint40(block.timestamp);
+        vm.prank(agentGuardian);
+        agentFactory.guardianPause();
+        uint40 longest = start + uint40(MAX_ADMIN_PAUSE);
+        vm.prank(agentAdmin);
+        vm.expectRevert(abi.encodeWithSelector(IAgentAccountFactory.PauseTooLong.selector, longest));
+        agentFactory.adminSetPausedUntil(longest + 1);
+
+        vm.prank(agentAdmin);
+        agentFactory.adminSetPausedUntil(longest);
+        assertEq(agentFactory.pausedUntil(), longest);
+        vm.warp(longest - 1);
+        assertTrue(agentFactory.isPaused());
+        vm.warp(longest);
+        assertFalse(agentFactory.isPaused());
+    }
+
+    function test_AdminCannotStartPause() public {
+        vm.prank(agentAdmin);
+        vm.expectRevert(IAgentAccountFactory.NoActivePause.selector);
+        agentFactory.adminSetPausedUntil(uint40(block.timestamp + 1 days));
+
+        // Nor once a guardian pause has ended.
+        uint40 start = uint40(block.timestamp);
+        vm.prank(agentGuardian);
+        agentFactory.guardianPause();
+        vm.warp(start + GUARDIAN_PAUSE);
+        vm.prank(agentAdmin);
+        vm.expectRevert(IAgentAccountFactory.NoActivePause.selector);
+        agentFactory.adminSetPausedUntil(start + uint40(GUARDIAN_PAUSE) + 1 days);
+        // Setting a value at or below the stored end is still allowed (a no-op lift).
+        vm.prank(agentAdmin);
+        agentFactory.adminSetPausedUntil(0);
+        assertEq(agentFactory.pausedUntil(), 0);
+    }
+
+    function test_GuardianCannotShortenAdminExtension() public {
+        uint40 start = uint40(block.timestamp);
+        vm.prank(agentGuardian);
+        agentFactory.guardianPause();
         uint40 longer = start + 30 days;
         vm.prank(agentAdmin);
         agentFactory.adminSetPausedUntil(longer);
+
+        uint40 readyAt = start + uint40(GUARDIAN_PAUSE + GUARDIAN_COOLDOWN);
+        vm.warp(readyAt);
+        vm.expectEmit(address(agentFactory));
+        emit IAgentAccountFactory.AgentsPausedUntil(longer, agentGuardian);
+        vm.prank(agentGuardian);
+        agentFactory.guardianPause();
         assertEq(agentFactory.pausedUntil(), longer);
-        vm.warp(longer - 1);
-        assertTrue(agentFactory.isPaused());
-        vm.warp(longer);
-        assertFalse(agentFactory.isPaused());
+
+        // The cooldown now runs from the stored (30-day) end.
+        vm.warp(longer + GUARDIAN_COOLDOWN - 1);
+        vm.prank(agentGuardian);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAgentAccountFactory.PauseCooldown.selector, longer + uint40(GUARDIAN_COOLDOWN))
+        );
+        agentFactory.guardianPause();
+        vm.warp(longer + GUARDIAN_COOLDOWN);
+        vm.prank(agentGuardian);
+        agentFactory.guardianPause();
+        assertEq(agentFactory.pausedUntil(), longer + GUARDIAN_COOLDOWN + GUARDIAN_PAUSE);
+    }
+
+    function test_SetGuardianZeroReverts() public {
+        vm.prank(agentAdmin);
+        vm.expectRevert(IAgentAccountFactory.ZeroAddress.selector);
+        agentFactory.setGuardian(address(0));
+        assertEq(agentFactory.guardian(), agentGuardian);
+    }
+
+    function test_BadCeilingsRevertDeploy() public {
+        Policy[4] memory bad;
+        uint8[4] memory fields = [uint8(6), 7, 9, 9];
+        for (uint256 i; i < 4; ++i) {
+            bad[i] = _ceilings();
+        }
+        bad[0].maxPriceImpactBps = 10_001;
+        bad[1].maxSnipeBps = 10_001;
+        bad[2].maxDeadlineSeconds = 0;
+        bad[3].maxDeadlineSeconds = 601;
+        for (uint256 i; i < 4; ++i) {
+            address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
+            AgentAccount impl = new AgentAccount(
+                predicted,
+                address(factory),
+                address(feeManager),
+                address(gm),
+                address(hook),
+                address(poolManager),
+                address(router),
+                address(permit2),
+                USDC
+            );
+            vm.expectRevert(abi.encodeWithSelector(IAgentAccountFactory.InvalidCeiling.selector, fields[i]));
+            new AgentAccountFactory(address(impl), agentAdmin, agentGuardian, bad[i]);
+        }
     }
 
     function test_PauseRolesAreEnforced() public {

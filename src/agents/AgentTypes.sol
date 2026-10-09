@@ -122,5 +122,7 @@ uint256 constant MAX_DEADLINE = 600;
 uint256 constant MAX_BPS = 10_000;
 uint256 constant GUARDIAN_PAUSE = 72 hours;
 uint256 constant GUARDIAN_COOLDOWN = 72 hours;
+/// @dev Furthest the admin may extend an active pause, counted from the time of the extension.
+uint256 constant MAX_ADMIN_PAUSE = 30 days;
 /// @dev Native USDC wei (18 decimals) per usdc6 unit.
 uint256 constant SCALE = 1e12;

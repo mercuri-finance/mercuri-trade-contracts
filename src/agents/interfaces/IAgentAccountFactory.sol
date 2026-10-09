@@ -20,10 +20,18 @@ interface IAgentAccountFactory {
     /// @param guardian The new guardian.
     event GuardianSet(address guardian);
 
-    /// @notice The implementation or the admin is the zero address.
+    /// @notice The implementation, the admin or a new guardian is the zero address.
     error ZeroAddress();
     /// @notice The implementation is bound to another factory.
     error ImplementationMismatch();
+    /// @notice A beta ceiling is outside its valid range: a bps field above 10,000 or a deadline outside 1–600 s.
+    /// @param field Index of the field in `Policy` struct order (6 impact, 7 snipe, 9 deadline).
+    error InvalidCeiling(uint8 field);
+    /// @notice The admin tried to extend a pause while none is active; the admin cannot start a pause.
+    error NoActivePause();
+    /// @notice The admin tried to extend a pause beyond 30 days from now.
+    /// @param maxUntil Latest end the admin may set now, Unix seconds.
+    error PauseTooLong(uint40 maxUntil);
     /// @notice The caller already created an account with this salt.
     /// @param account The existing account.
     error AccountExists(address account);
@@ -75,15 +83,20 @@ interface IAgentAccountFactory {
     /// @notice The factory's version.
     /// @return The version string.
     function VERSION() external view returns (string memory);
-    /// @notice Pauses agent functions of every account for 72 hours.
-    /// @dev Guardian only. Allowed once 72 hours have passed since the end of the guardian's previous pause.
+    /// @notice Pauses agent functions of every account for at least 72 hours.
+    /// @dev Guardian only. Sets `pausedUntil` to `max(pausedUntil, now + 72 hours)`, so it never shortens a pause the
+    ///      admin extended. Allowed on the first call, and afterwards once 72 hours have passed since the
+    ///      `pausedUntil` the guardian's previous call stored; admin changes to `pausedUntil` do not move that time.
     function guardianPause() external;
-    /// @notice Sets the end of the pause: extends it, lifts it (zero) or sets a new one.
-    /// @dev Admin only. Does not change the guardian's cooldown.
+    /// @notice Shortens, lifts or extends the current pause.
+    /// @dev Admin only. Any `until <= pausedUntil` is allowed at any time (zero lifts). A later `until` is allowed
+    ///      only while a pause is active (`NoActivePause` otherwise, so the admin cannot start a pause) and only up to
+    ///      `now + 30 days` (`PauseTooLong`). Does not change the guardian's cooldown.
     /// @param until Unix time (seconds) the pause ends.
     function adminSetPausedUntil(uint40 until) external;
     /// @notice Replaces the guardian.
-    /// @dev Admin only. Reverts forever on a factory deployed without a guardian.
+    /// @dev Admin only. Reverts `ZeroAddress` for zero, and `GuardianDisabled` forever on a factory deployed without
+    ///      a guardian.
     /// @param g The new guardian.
     function setGuardian(address g) external;
 }

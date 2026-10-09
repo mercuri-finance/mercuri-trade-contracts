@@ -44,10 +44,18 @@ library AgentPolicyLib {
     ///      `[1, 600]`.
     /// @param p Policy to check.
     function validate(Policy memory p) internal pure {
-        if (p.maxPriceImpactBps > MAX_BPS) revert IAgentAccount.InvalidPolicy(F_MAX_PRICE_IMPACT_BPS);
-        if (p.maxSnipeBps > MAX_BPS) revert IAgentAccount.InvalidPolicy(F_MAX_SNIPE_BPS);
-        if (p.maxDeadlineSeconds == 0 || p.maxDeadlineSeconds > MAX_DEADLINE) {
-            revert IAgentAccount.InvalidPolicy(F_MAX_DEADLINE_SECONDS);
-        }
+        (bool ok, uint8 field) = checkShape(p);
+        if (!ok) revert IAgentAccount.InvalidPolicy(field);
+    }
+
+    /// @notice Whether `p` is well formed: the bounds `validate` enforces, also applied to the factory's ceilings.
+    /// @param p Policy (or ceilings) to check.
+    /// @return ok True when every bounded field is in range.
+    /// @return field Index of the first out-of-range field in `Policy` struct order; zero when `ok`.
+    function checkShape(Policy memory p) internal pure returns (bool ok, uint8 field) {
+        if (p.maxPriceImpactBps > MAX_BPS) return (false, F_MAX_PRICE_IMPACT_BPS);
+        if (p.maxSnipeBps > MAX_BPS) return (false, F_MAX_SNIPE_BPS);
+        if (p.maxDeadlineSeconds == 0 || p.maxDeadlineSeconds > MAX_DEADLINE) return (false, F_MAX_DEADLINE_SECONDS);
+        return (true, 0);
     }
 }

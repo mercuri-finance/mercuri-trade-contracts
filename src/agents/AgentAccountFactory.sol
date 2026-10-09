@@ -4,13 +4,15 @@ pragma solidity ^0.8.26;
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IAgentAccount} from "./interfaces/IAgentAccount.sol";
 import {IAgentAccountFactory} from "./interfaces/IAgentAccountFactory.sol";
-import {Policy, InitParams, GUARDIAN_PAUSE, GUARDIAN_COOLDOWN} from "./AgentTypes.sol";
+import {AgentPolicyLib} from "./AgentPolicyLib.sol";
+import {Policy, InitParams, GUARDIAN_PAUSE, GUARDIAN_COOLDOWN, MAX_ADMIN_PAUSE} from "./AgentTypes.sol";
 
 /// @notice Creates Mercurifi agent accounts as EIP-1167 clones of one implementation, records them, holds the beta
 ///         policy ceilings and the guardian pause of agent functions.
-/// @dev Immutable, holds no funds. The admin (the network's Launch timelock) can only replace the guardian and set
-///      the pause end; it cannot touch accounts, policies or funds. A factory deployed with guardian zero can never
-///      pause: `guardianPause`, `setGuardian` and `adminSetPausedUntil` revert forever.
+/// @dev Immutable, holds no funds. The admin (the network's Launch timelock) can only replace the guardian, shorten or
+///      lift a pause, and extend an active pause by at most 30 days from now; it cannot start a pause or touch
+///      accounts, policies or funds. A factory deployed with guardian zero can never pause: `guardianPause`,
+///      `setGuardian` and `adminSetPausedUntil` revert forever.
 contract AgentAccountFactory is IAgentAccountFactory {
     /// @notice The factory's version.
     string public constant VERSION = "1.0.0-beta.1";
@@ -37,7 +39,8 @@ contract AgentAccountFactory is IAgentAccountFactory {
     address public guardian;
     /// @notice End of the current pause, Unix seconds; zero or a past time means not paused.
     uint40 public pausedUntil;
-    /// @dev End the guardian set for its latest pause, Unix seconds; the cooldown runs from it.
+    /// @dev `pausedUntil` as stored by the guardian's latest pause, Unix seconds; the guardian's cooldown runs from it.
+    ///      Later admin changes to `pausedUntil` do not move it.
     uint40 private lastGuardianPauseEnd;
 
     /// @notice Whether an address is an account created by this factory.
@@ -45,7 +48,9 @@ contract AgentAccountFactory is IAgentAccountFactory {
 
     /// @notice Binds the factory to its implementation, admin, guardian and beta ceilings for life.
     /// @dev Reverts `ZeroAddress` for a zero implementation or admin, and `ImplementationMismatch` unless the
-    ///      implementation was deployed for this factory's address. A zero guardian disables the pause forever.
+    ///      implementation was deployed for this factory's address, and `InvalidCeiling(field)` for a ceiling outside
+    ///      the bounds every policy must meet (bps at most 10,000, deadline in `[1, 600]`). A zero guardian disables
+    ///      the pause forever.
     /// @param implementation_ AgentAccount implementation whose `FACTORY` is this factory's address.
     /// @param admin_ The network's Launch timelock.
     /// @param guardian_ The Guardian Safe, or zero for no pause at all.
@@ -53,6 +58,8 @@ contract AgentAccountFactory is IAgentAccountFactory {
     constructor(address implementation_, address admin_, address guardian_, Policy memory ceilings_) {
         if (implementation_ == address(0) || admin_ == address(0)) revert ZeroAddress();
         if (IAgentAccount(implementation_).FACTORY() != address(this)) revert ImplementationMismatch();
+        (bool ok, uint8 field) = AgentPolicyLib.checkShape(ceilings_);
+        if (!ok) revert InvalidCeiling(field);
         implementation = implementation_;
         admin = admin_;
         guardianDisabled = guardian_ == address(0);
@@ -120,7 +127,10 @@ contract AgentAccountFactory is IAgentAccountFactory {
         if (last != 0 && block.timestamp < last + GUARDIAN_COOLDOWN) {
             revert PauseCooldown(uint40(last + GUARDIAN_COOLDOWN));
         }
+        // Never shortens a longer pause the admin set.
         uint40 until = uint40(block.timestamp + GUARDIAN_PAUSE);
+        uint40 current = pausedUntil;
+        if (current > until) until = current;
         lastGuardianPauseEnd = until;
         pausedUntil = until;
         emit AgentsPausedUntil(until, msg.sender);
@@ -130,6 +140,13 @@ contract AgentAccountFactory is IAgentAccountFactory {
     function adminSetPausedUntil(uint40 until) external {
         if (msg.sender != admin) revert NotAdmin();
         if (guardianDisabled) revert GuardianDisabled();
+        uint40 current = pausedUntil;
+        if (until > current) {
+            // Extending: only an active pause, and to at most 30 days from now.
+            if (block.timestamp >= current) revert NoActivePause();
+            uint256 maxUntil = block.timestamp + MAX_ADMIN_PAUSE;
+            if (until > maxUntil) revert PauseTooLong(uint40(maxUntil));
+        }
         pausedUntil = until;
         emit AgentsPausedUntil(until, msg.sender);
     }
@@ -138,6 +155,7 @@ contract AgentAccountFactory is IAgentAccountFactory {
     function setGuardian(address g) external {
         if (msg.sender != admin) revert NotAdmin();
         if (guardianDisabled) revert GuardianDisabled();
+        if (g == address(0)) revert ZeroAddress();
         guardian = g;
         emit GuardianSet(g);
     }

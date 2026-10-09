@@ -5,6 +5,9 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {ILaunchFactory} from "@mercuri/launch/interfaces/ILaunchFactory.sol";
 import {IFeeManager} from "@mercuri/launch/interfaces/IFeeManager.sol";
 import {IGraduationManager} from "@mercuri/launch/interfaces/IGraduationManager.sol";
+import {BondingCurve} from "@mercuri/launch/BondingCurve.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
@@ -14,8 +17,15 @@ import {AgentPolicyLib} from "./AgentPolicyLib.sol";
 import {
     Policy,
     Agent,
+    Usage,
+    Basis,
     InitParams,
     P_ALL,
+    P_BUY,
+    P_SELL,
+    ACTION_BUY,
+    ACTION_SELL,
+    SCALE,
     MAX_AGENTS,
     MAX_AGENT_TTL,
     QUEUE_TTL,
@@ -110,6 +120,12 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     uint256 private lastQueueId;
     /// @dev Queued items by id; deleted on execution or cancellation.
     mapping(uint256 => QueuedItem) private queue;
+    /// @dev Usage of period `_usage.periodId`; a later period starts from zero. Read through `usage()`.
+    Usage private _usage;
+    /// @dev USDC spent per period id and token, usdc6.
+    mapping(uint64 => mapping(address => uint64)) private _tokenSpent;
+    /// @dev Recorded cost basis per token; read through `basis()`.
+    mapping(address => Basis) private _basis;
 
     /// @dev Reverts `NotOwner` unless the caller is the owner.
     modifier onlyOwner() {
@@ -385,6 +401,131 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         }
     }
 
+    // ------------------------------------------------------------------ agent trading
+
+    /// @inheritdoc IAgentAccount
+    function buy(address token, uint256 usdcIn, uint256 minTokensOut, uint256 deadline)
+        external
+        nonReentrant
+        returns (uint256 tokensOut)
+    {
+        (Policy memory p, Usage memory u) = _preamble(P_BUY, deadline);
+        BondingCurve curve = _curve(token);
+        if (curve.phase() != BondingCurve.Phase.Trading) revert NotTrading();
+        if (p.allowlistOnly && !tokenAllowed[token]) revert TokenNotAllowed();
+        if (block.number - curve.launchBlock() < p.minTokenAgeBlocks) revert TokenTooNew();
+        uint256 snipe = curve.currentSnipeBps();
+        if (snipe > p.maxSnipeBps) revert SnipeTaxTooHigh(snipe);
+        if (usdcIn == 0) revert ZeroAmount();
+        if (usdcIn > p.maxTradeUsdc) revert TradeTooLarge(p.maxTradeUsdc);
+        if (minTokensOut == 0) revert ZeroMinOut();
+        uint256 value = usdcIn * SCALE;
+        {
+            (uint256 out, uint256 used, uint256 fee, uint256 tax) = curve.quoteBuy(value);
+            if (out == 0) revert ZeroOutput();
+            _checkImpact(AgentPolicyLib.buyImpactBps(used - fee - tax, out, curve.price()), p.maxPriceImpactBps);
+        }
+
+        uint256 balBefore = address(this).balance;
+        uint256 heldBefore = IERC20(token).balanceOf(address(this));
+        curve.buy{value: value}(minTokensOut, referrer, deadline);
+        // Refunds (the final buy of a curve) are netted; round the spend up to usdc6.
+        uint256 spent = Math.ceilDiv(balBefore - address(this).balance, SCALE);
+        tokensOut = IERC20(token).balanceOf(address(this)) - heldBefore;
+
+        if (spent > p.maxTradeUsdc) revert TradeTooLarge(p.maxTradeUsdc);
+        _chargeSpend(p, u, token, spent);
+        Basis storage b = _basis[token];
+        b.costUsdc += SafeCast.toUint128(spent);
+        b.tokens += SafeCast.toUint128(tokensOut);
+        _usage = u;
+        emit AgentAction(msg.sender, ACTION_BUY, token, spent, 0, SafeCast.toInt256(tokensOut), spent, u.periodId);
+    }
+
+    /// @inheritdoc IAgentAccount
+    function sell(address token, uint256 tokensIn, uint256 minUsdcOut, uint256 deadline)
+        external
+        nonReentrant
+        returns (uint256 usdcOut)
+    {
+        (Policy memory p, Usage memory u) = _preamble(P_SELL, deadline);
+        BondingCurve curve = _curve(token);
+        if (curve.phase() == BondingCurve.Phase.Graduated) revert NotTrading();
+        if (tokensIn == 0) revert ZeroAmount();
+        if (minUsdcOut == 0) revert ZeroMinOut();
+
+        // Cost-basis value: the recorded share at cost (rounded up), tokens beyond it at their pre-trade quote.
+        Basis memory b = _basis[token];
+        uint256 recorded = tokensIn < b.tokens ? tokensIn : b.tokens;
+        uint256 basisValue;
+        if (recorded != 0) basisValue = Math.mulDiv(recorded, b.costUsdc, b.tokens, Math.Rounding.Ceil);
+        if (tokensIn > recorded) {
+            (uint256 excessOut,) = curve.quoteSell(tokensIn - recorded);
+            basisValue += Math.ceilDiv(excessOut, SCALE);
+        }
+        if (basisValue > p.maxTradeUsdc) revert TradeTooLarge(p.maxTradeUsdc);
+        if (u.sold + basisValue > p.periodSellCap) revert PeriodSellExceeded(_left(p.periodSellCap, u.sold));
+        // forge-lint: disable-next-line(unsafe-typecast)
+        u.sold += uint64(basisValue); // at most maxTradeUsdc, a uint64
+        {
+            (uint256 out, uint256 fee) = curve.quoteSell(tokensIn);
+            if (out == 0) revert ZeroOutput();
+            _checkImpact(AgentPolicyLib.sellImpactBps(out + fee, tokensIn, curve.price()), p.maxPriceImpactBps);
+        }
+
+        uint256 balBefore = address(this).balance;
+        uint256 heldBefore = IERC20(token).balanceOf(address(this));
+        IERC20(token).forceApprove(address(curve), tokensIn);
+        curve.sell(tokensIn, minUsdcOut * SCALE, referrer, deadline);
+        if (IERC20(token).allowance(address(this), address(curve)) != 0) revert AllowanceNotCleared();
+        // Proceeds round down to usdc6 and never create headroom.
+        usdcOut = (address(this).balance - balBefore) / SCALE;
+        uint256 sent = heldBefore - IERC20(token).balanceOf(address(this));
+
+        if (recorded != 0) {
+            // Floor keeps the remaining cost at or above its pro-rata share; selling every recorded token clears it.
+            b.costUsdc -= uint128(Math.mulDiv(b.costUsdc, recorded, b.tokens));
+            b.tokens -= uint128(recorded);
+            _basis[token] = b;
+        }
+        _usage = u;
+        emit AgentAction(msg.sender, ACTION_SELL, token, 0, usdcOut, -SafeCast.toInt256(sent), basisValue, u.periodId);
+    }
+
+    /// @inheritdoc IAgentAccount
+    function usage()
+        external
+        view
+        returns (uint64 periodId, uint64 spent, uint64 sold, uint32 actions, uint16 launches)
+    {
+        Usage memory u = _currentUsage();
+        return (u.periodId, u.spent, u.sold, u.actions, u.launches);
+    }
+
+    /// @inheritdoc IAgentAccount
+    function tokenSpent(address token) external view returns (uint64) {
+        return _tokenSpent[uint64(block.timestamp / periodSeconds)][token];
+    }
+
+    /// @inheritdoc IAgentAccount
+    function basis(address token) external view returns (uint128 costUsdc, uint128 tokens) {
+        Basis memory b = _basis[token];
+        return (b.costUsdc, b.tokens);
+    }
+
+    /// @inheritdoc IAgentAccount
+    function headroom() external view returns (uint64, uint64, uint32, uint16) {
+        Usage memory u = _currentUsage();
+        Policy memory p = _policy;
+        // Each value is at most its cap, which has the same width.
+        return (
+            uint64(_left(p.periodSpendCap, u.spent)),
+            uint64(_left(p.periodSellCap, u.sold)),
+            uint32(_left(p.maxActionsPerPeriod, u.actions)),
+            uint16(_left(p.launchesPerPeriod, u.launches))
+        );
+    }
+
     /// @notice Never accepts a signature: agent accounts sign nothing in this version.
     /// @dev Always `0xffffffff`. Arc's USDC accepts contract signatures in the `bytes` forms of `permit` and
     ///      `transferWithAuthorization`, so returning the magic value would open a withdrawal path.
@@ -411,6 +552,75 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         }
         _policy = next;
         emit PolicyApplied(next);
+    }
+
+    /// @dev The preamble of every agent function (spec section 4.6, steps 2 to 7; step 1, the lock, is the
+    ///      function's `nonReentrant`): owner pause, factory pause, an active and unexpired agent holding
+    ///      `permission`, a deadline in `[now, now + maxDeadlineSeconds]`, the period roll and the action count.
+    ///      Writes nothing: the caller stores the returned usage once its own checks pass.
+    /// @param permission The `P_*` bit the function needs.
+    /// @param deadline The agent's deadline, Unix seconds.
+    /// @return p The policy in force (amounts usdc6).
+    /// @return u The current period's usage with this action counted.
+    function _preamble(uint16 permission, uint256 deadline) private view returns (Policy memory p, Usage memory u) {
+        if (ownerPaused || IAgentAccountFactory(FACTORY).isPaused()) revert Paused();
+        Agent memory a = agents[msg.sender];
+        if (!a.active) revert NotAgent();
+        if (block.timestamp >= a.expiresAt) revert AgentExpired();
+        if (a.permissions & permission == 0) revert MissingPermission();
+        p = _policy;
+        if (deadline < block.timestamp || deadline > block.timestamp + p.maxDeadlineSeconds) {
+            revert DeadlineOutOfRange();
+        }
+        u = _currentUsage();
+        if (u.actions >= p.maxActionsPerPeriod) revert ActionLimit();
+        ++u.actions;
+    }
+
+    /// @dev Stored usage, or a zero usage of the current period once the period has changed.
+    /// @return u Usage of the current period (amounts usdc6).
+    function _currentUsage() private view returns (Usage memory u) {
+        u = _usage;
+        uint64 periodId = uint64(block.timestamp / periodSeconds);
+        if (u.periodId != periodId) u = Usage({periodId: periodId, spent: 0, sold: 0, actions: 0, launches: 0});
+    }
+
+    /// @dev Charges a measured spend to the period and per-token caps; the caller has checked `maxTradeUsdc`, so
+    ///      `spent` fits 64 bits. Records the token's spend now and the period's in `u`.
+    /// @param p The policy in force (amounts usdc6).
+    /// @param u The current usage, updated in memory.
+    /// @param token The token the spend is keyed by.
+    /// @param spent The measured spend, usdc6.
+    function _chargeSpend(Policy memory p, Usage memory u, address token, uint256 spent) private {
+        if (u.spent + spent > p.periodSpendCap) revert PeriodSpendExceeded(_left(p.periodSpendCap, u.spent));
+        uint64 tokenUsed = _tokenSpent[u.periodId][token];
+        if (tokenUsed + spent > p.perTokenPeriodCap) revert TokenCapExceeded(_left(p.perTokenPeriodCap, tokenUsed));
+        u.spent += uint64(spent);
+        _tokenSpent[u.periodId][token] = tokenUsed + uint64(spent);
+    }
+
+    /// @dev The registered curve of `token`; reverts `TokenNotRegistered` when the Launch factory has none.
+    /// @param token The token.
+    /// @return The curve.
+    function _curve(address token) private view returns (BondingCurve) {
+        address c = LAUNCH_FACTORY.curveOf(token);
+        if (c == address(0)) revert TokenNotRegistered();
+        return BondingCurve(c);
+    }
+
+    /// @dev Reverts `PriceImpactTooHigh(bps)` when `bps > max`.
+    /// @param bps The trade's impact, basis points.
+    /// @param max `maxPriceImpactBps`.
+    function _checkImpact(uint256 bps, uint256 max) private pure {
+        if (bps > max) revert PriceImpactTooHigh(bps);
+    }
+
+    /// @dev `cap - used`, or zero when the cap was lowered below the usage.
+    /// @param cap The limit.
+    /// @param used The usage.
+    /// @return What is left.
+    function _left(uint256 cap, uint256 used) private pure returns (uint256) {
+        return cap > used ? cap - used : 0;
     }
 
     /// @dev Reverts `NotOwner` unless the caller is the owner.

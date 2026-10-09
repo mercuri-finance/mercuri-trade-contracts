@@ -82,6 +82,27 @@ interface IAgentAccount is IERC1271 {
     /// @param token The token, or zero for native USDC.
     /// @param amount Amount sent: native wei (18 decimals) for zero, else the token's own units.
     event AccountWithdrawn(address indexed token, uint256 amount);
+    /// @notice An agent acted through the account. The authoritative attribution record: the log's address is the
+    ///         account.
+    /// @param agent The agent key that sent the transaction.
+    /// @param action `ACTION_*` id.
+    /// @param token The Launch token traded.
+    /// @param usdcSpent USDC that left the account, usdc6: the native balance delta rounded up (refunds netted).
+    /// @param usdcReceived USDC that entered the account, usdc6: the native balance delta rounded down.
+    /// @param tokenDelta Change in the account's balance of `token`, 18-decimal units (positive on a buy).
+    /// @param basisValue usdc6. A buy: the cost added to the basis (equals `usdcSpent`). A sell: the cost-basis value
+    ///        charged to `maxTradeUsdc` and `periodSellCap`.
+    /// @param periodId `block.timestamp / periodSeconds` of the period charged.
+    event AgentAction(
+        address indexed agent,
+        uint8 action,
+        address indexed token,
+        uint256 usdcSpent,
+        uint256 usdcReceived,
+        int256 tokenDelta,
+        uint256 basisValue,
+        uint64 periodId
+    );
 
     /// @notice A constructor dependency, or the token passed to `setTokenAllowed`, is the zero address.
     error ZeroAddress();
@@ -136,6 +157,52 @@ interface IAgentAccount is IERC1271 {
     error InvalidOwner();
     /// @notice Sending native USDC to the owner failed.
     error NativeTransferFailed();
+    /// @notice The caller is not an active agent of this account (the owner is never one).
+    error NotAgent();
+    /// @notice The agent's expiry has passed.
+    error AgentExpired();
+    /// @notice The agent lacks the permission bit this function needs.
+    error MissingPermission();
+    /// @notice Agents are paused, by the owner or by the factory's guardian.
+    error Paused();
+    /// @notice The deadline is in the past or more than `maxDeadlineSeconds` ahead.
+    error DeadlineOutOfRange();
+    /// @notice The token has no curve in the Launch factory's registry.
+    error TokenNotRegistered();
+    /// @notice `allowlistOnly` is set and the token is not allowlisted (buys only).
+    error TokenNotAllowed();
+    /// @notice The curve is younger than `minTokenAgeBlocks`.
+    error TokenTooNew();
+    /// @notice The curve's snipe tax is above `maxSnipeBps`.
+    /// @param current The current snipe tax, basis points.
+    error SnipeTaxTooHigh(uint256 current);
+    /// @notice The trade's own price impact is above `maxPriceImpactBps`.
+    /// @param bps The quoted impact, basis points, rounded up.
+    error PriceImpactTooHigh(uint256 bps);
+    /// @notice The agent's minimum output is zero.
+    error ZeroMinOut();
+    /// @notice The trade's input amount is zero.
+    error ZeroAmount();
+    /// @notice The trade's value is above `maxTradeUsdc`.
+    /// @param max `maxTradeUsdc`, usdc6.
+    error TradeTooLarge(uint256 max);
+    /// @notice The period's measured spend would exceed `periodSpendCap`.
+    /// @param remaining Spend left this period before the trade, usdc6.
+    error PeriodSpendExceeded(uint256 remaining);
+    /// @notice The period's sells at cost-basis value would exceed `periodSellCap`.
+    /// @param remaining Sell value left this period before the trade, usdc6.
+    error PeriodSellExceeded(uint256 remaining);
+    /// @notice The period's measured spend on this token would exceed `perTokenPeriodCap`.
+    /// @param remaining Spend left on this token this period before the trade, usdc6.
+    error TokenCapExceeded(uint256 remaining);
+    /// @notice The period's `maxActionsPerPeriod` is used up.
+    error ActionLimit();
+    /// @notice The curve is not in a phase that allows this trade (graduated, or pending for a buy).
+    error NotTrading();
+    /// @notice The quote gives zero output.
+    error ZeroOutput();
+    /// @notice An allowance the account granted for the trade survived it.
+    error AllowanceNotCleared();
 
     /// @notice Sets the owner, referrer, policy, period, delay and optional first agent of a fresh clone.
     /// @dev Callable only by `FACTORY`, once, inside `createAccount`. Binds a non-zero referrer in the FeeManager.
@@ -330,4 +397,56 @@ interface IAgentAccount is IERC1271 {
     /// @dev Owner only. Zero balances are skipped, so repeats are harmless.
     /// @param tokens Tokens to empty; zero means native USDC.
     function withdrawMany(address[] calldata tokens) external;
+
+    /// @notice Buys `token` on its Launch curve with native USDC, within the policy's caps. Agent only (`P_BUY`).
+    /// @dev Checks, in order: lock, pauses, agent, deadline, period roll, action count; then registration, phase
+    ///      `Trading`, allowlist, token age, snipe tax, `0 < usdcIn <= maxTradeUsdc`, `minTokensOut > 0` and the price
+    ///      impact of the quote. Sends `usdcIn * 1e12` wei with the account's referrer. The spend is the measured
+    ///      native balance delta rounded up to usdc6 (a refund from the final buy is netted), checked after the call
+    ///      against `maxTradeUsdc`, `periodSpendCap` and `perTokenPeriodCap`, so any breach reverts the whole call.
+    ///      A buy that sells the curve out graduates it inline and needs about 2.5M gas.
+    /// @param token The Launch token.
+    /// @param usdcIn USDC to offer, usdc6.
+    /// @param minTokensOut Minimum tokens, 18-decimal units; not zero.
+    /// @param deadline Latest Unix time (seconds), within `maxDeadlineSeconds` of now.
+    /// @return tokensOut Tokens received, 18-decimal units, measured as the balance delta.
+    function buy(address token, uint256 usdcIn, uint256 minTokensOut, uint256 deadline)
+        external
+        returns (uint256 tokensOut);
+    /// @notice Sells `token` back to its Launch curve, within the policy's caps. Agent only (`P_SELL`).
+    /// @dev Phase `Trading` or `GraduationPending`. The trade's value is its cost basis: the recorded share
+    ///      `ceil(min(tokensIn, basis.tokens) * cost / tokens)` plus, for tokens beyond the recorded amount, their
+    ///      pre-trade `quoteSell` proceeds rounded up to usdc6. It is checked against `maxTradeUsdc` and
+    ///      `periodSellCap`. Proceeds (native delta rounded down to usdc6) never create headroom. The allowance
+    ///      granted to the curve must be zero afterwards. The allowlist does not apply to sells.
+    /// @param token The Launch token.
+    /// @param tokensIn Tokens to sell, 18-decimal units.
+    /// @param minUsdcOut Minimum proceeds, usdc6; not zero.
+    /// @param deadline Latest Unix time (seconds), within `maxDeadlineSeconds` of now.
+    /// @return usdcOut Proceeds, usdc6, rounded down.
+    function sell(address token, uint256 tokensIn, uint256 minUsdcOut, uint256 deadline)
+        external
+        returns (uint256 usdcOut);
+    /// @notice Usage of the current period; all zero (with the current id) once a new period has begun.
+    /// @return periodId `block.timestamp / periodSeconds`.
+    /// @return spent USDC spent, usdc6.
+    /// @return sold Sells at cost-basis value, usdc6.
+    /// @return actions Agent actions.
+    /// @return launches Launches.
+    function usage() external view returns (uint64 periodId, uint64 spent, uint64 sold, uint32 actions, uint16 launches);
+    /// @notice USDC spent on `token` in the current period.
+    /// @param token The token.
+    /// @return usdc6.
+    function tokenSpent(address token) external view returns (uint64);
+    /// @notice The account's recorded cost basis in `token`.
+    /// @param token The token.
+    /// @return costUsdc USDC paid for the recorded tokens, usdc6.
+    /// @return tokens Recorded tokens, 18-decimal units.
+    function basis(address token) external view returns (uint128 costUsdc, uint128 tokens);
+    /// @notice What is left of each period limit right now (zero when a cap was lowered below its usage).
+    /// @return spend `periodSpendCap` left, usdc6.
+    /// @return sell `periodSellCap` left, usdc6.
+    /// @return actions Actions left.
+    /// @return launches Launches left.
+    function headroom() external view returns (uint64 spend, uint64 sell, uint32 actions, uint16 launches);
 }

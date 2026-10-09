@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IAgentAccount} from "./interfaces/IAgentAccount.sol";
 import {
     Policy,
@@ -106,6 +107,30 @@ library AgentPolicyLib {
             if (lastWrite[i] <= seq) c[i] = t[i];
         }
         return _fromWords(c);
+    }
+
+    /// @notice Price impact of a curve buy: how far its average price lies above the marginal price before it.
+    /// @dev `avg = ceil(net * 1e18 / tokensOut)`, impact `ceil((avg - price) * 10,000 / price)`, zero when `avg` is not
+    ///      above `price`. Both roundings are against the trade. Callers pass `tokensOut > 0` and `price > 0`.
+    /// @param net Native USDC wei priced on the curve (the quote's used amount minus fee and tax).
+    /// @param tokensOut Quoted tokens, 18-decimal units.
+    /// @param price Marginal price before the trade, native wei per whole token.
+    /// @return Impact, basis points.
+    function buyImpactBps(uint256 net, uint256 tokensOut, uint256 price) internal pure returns (uint256) {
+        uint256 avg = Math.mulDiv(net, 1e18, tokensOut, Math.Rounding.Ceil);
+        return avg > price ? Math.mulDiv(avg - price, MAX_BPS, price, Math.Rounding.Ceil) : 0;
+    }
+
+    /// @notice Price impact of a curve sell: how far its average price lies below the marginal price before it.
+    /// @dev `avg = floor(gross * 1e18 / tokensIn)`, impact `ceil((price - avg) * 10,000 / price)`, zero when `avg` is
+    ///      not below `price`. Both roundings are against the trade. Callers pass `tokensIn > 0` and `price > 0`.
+    /// @param gross Quoted proceeds plus fee, native USDC wei.
+    /// @param tokensIn Tokens sold, 18-decimal units.
+    /// @param price Marginal price before the trade, native wei per whole token.
+    /// @return Impact, basis points.
+    function sellImpactBps(uint256 gross, uint256 tokensIn, uint256 price) internal pure returns (uint256) {
+        uint256 avg = Math.mulDiv(gross, 1e18, tokensIn);
+        return price > avg ? Math.mulDiv(price - avg, MAX_BPS, price, Math.Rounding.Ceil) : 0;
     }
 
     /// @dev Per-field narrowing rule. `minTokenAgeBlocks` is a floor, so higher is tighter; for `allowlistOnly`

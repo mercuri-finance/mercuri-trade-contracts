@@ -183,7 +183,7 @@ three runtimes from `out/` with the manifest and record values in every immutabl
 
 ## 10. Release evidence
 
-Candidate: branch `feat/agent-accounts`, Task 7 commit on top of `f292c52`. Baseline: Launch as pinned in
+Candidate: branch `feat/agent-accounts` at `c3771e7a73ff2d967cc7965bdd246acc8e68b28f` (contracts, scripts and tests; later commits touching only this page do not change the candidate). Baseline: Launch as pinned in
 `lib/mercuri-launch-contracts` at `99d7c28` and its deployment records for 5042002 and 5042; the deployed testnet
 Universal Router `0x4fcA…9Fb1` at its pinned runtime hash. Toolchain: forge 1.4.3, solc 0.8.26, Cancun, via-IR, 200
 optimizer runs for `src/**`, no metadata hash. Missing evidence is pending, not pass.

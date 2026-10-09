@@ -111,6 +111,14 @@ uint8 constant F_MIN_TOKEN_AGE_BLOCKS = 8;
 uint8 constant F_MAX_DEADLINE_SECONDS = 9;
 uint8 constant F_ALLOWLIST_ONLY = 10;
 
+// Queued item kinds, as returned by `IAgentAccount.queued`. Zero means no item.
+uint8 constant Q_ADD_AGENT = 1;
+uint8 constant Q_SET_AGENT = 2;
+uint8 constant Q_POLICY = 3;
+uint8 constant Q_ALLOW_TOKEN = 4;
+uint8 constant Q_DELAY = 5;
+uint8 constant Q_OWNER = 6;
+
 // Shared limits.
 uint8 constant MAX_AGENTS = 8;
 uint256 constant MAX_AGENT_TTL = 180 days;

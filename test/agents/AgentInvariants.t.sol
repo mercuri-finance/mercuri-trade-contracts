@@ -73,18 +73,25 @@ contract AgentInvariantsTest is AgentFixture {
     uint256 internal constant EXECUTE = 12;
     uint256 internal constant ROTATE = 13;
     uint256 internal constant MARKET = 14;
+    uint256 internal constant TRANSFER_OWNER = 15;
     /// @dev Kinds below this are positive (must succeed); the rest are expected reverts.
-    uint256 internal constant POSITIVE = 15;
-    uint256 internal constant N_STRANGER = 15;
-    uint256 internal constant N_OWNER_TRADE = 16;
-    uint256 internal constant N_REVOKED = 17;
-    uint256 internal constant N_EXPIRED = 18;
-    uint256 internal constant N_OWNER_PAUSED = 19;
-    uint256 internal constant N_FACTORY_PAUSED = 20;
-    uint256 internal constant N_EARLY = 21;
-    uint256 internal constant N_CROSS = 22;
-    uint256 internal constant N_OVER_CAP = 23;
-    uint256 internal constant KINDS = 24;
+    uint256 internal constant POSITIVE = 16;
+    uint256 internal constant N_STRANGER = 16;
+    uint256 internal constant N_OWNER_TRADE = 17;
+    uint256 internal constant N_REVOKED = 18;
+    uint256 internal constant N_EXPIRED = 19;
+    uint256 internal constant N_OWNER_PAUSED = 20;
+    uint256 internal constant N_FACTORY_PAUSED = 21;
+    uint256 internal constant N_EARLY = 22;
+    uint256 internal constant N_CROSS = 23;
+    uint256 internal constant N_OVER_CAP = 24;
+    uint256 internal constant N_SPEND_CAP = 25;
+    uint256 internal constant N_TOKEN_CAP = 26;
+    uint256 internal constant N_SELL_CAP = 27;
+    uint256 internal constant N_ACTION_LIMIT = 28;
+    uint256 internal constant N_LAUNCH_LIMIT = 29;
+    uint256 internal constant N_CEILING = 30;
+    uint256 internal constant KINDS = 31;
 
     uint256 internal constant PERIOD = 1 hours;
     bytes4 internal constant ERC1271_MAGIC = 0x1626ba7e;
@@ -101,7 +108,24 @@ contract AgentInvariantsTest is AgentFixture {
     address[] internal watchList;
     LaunchToken[] internal toks;
     mapping(address => uint256) internal launcherOf;
-    mapping(uint256 => uint256[]) internal pendingOf;
+
+    /// @dev A queued widening as the test saw it: queue time and the test-side write sequence at queue time, and
+    ///      whether a pause or an ownership change has since killed it. No registry stamp or epoch is read.
+    struct Pending {
+        uint256 id;
+        uint256 seq;
+        uint256 queuedAt;
+        bool killed;
+        Policy target;
+    }
+
+    mapping(uint256 => Pending[]) internal pendingOf;
+    /// @dev Test-side policy write ghosts: a sequence bumped by every write, each field's last write, and each field's
+    ///      last tightening (sequence and value).
+    uint256[2] internal ghostSeq;
+    mapping(uint256 => uint256[11]) internal fieldSeq;
+    mapping(uint256 => uint256[11]) internal tightSeq;
+    mapping(uint256 => uint256[11]) internal tightVal;
     uint256[2] internal lastQueueId;
     uint256 internal nonce;
     uint256 internal guardianReadyAt;
@@ -109,7 +133,8 @@ contract AgentInvariantsTest is AgentFixture {
     uint256[2] internal ownerStart;
     uint256[2] public ownerIn;
     uint256[2] public ownerOut;
-    mapping(uint256 => mapping(address => uint256)) internal ownerTokIn;
+    /// @dev Tokens received by each owner address (owners can change through TRANSFER_OWNER).
+    mapping(address => mapping(address => uint256)) internal ownerTokIn;
 
     struct Ghost {
         uint64 period;
@@ -133,6 +158,13 @@ contract AgentInvariantsTest is AgentFixture {
     uint256 public queueExpiries;
     uint256 public ownerExitsDuringPause;
     uint256 public notYetActiveRefusals;
+    uint256 public ownershipTransfers;
+    uint256 internal pausedFnCursor;
+    uint256[6] public pausedFnsTried;
+    uint256 public oddWeiSpendRefusals;
+    /// @dev Account and registry calls that succeeded, and those refused as expected.
+    uint256 public okCalls;
+    uint256 public refusedCalls;
 
     // ------------------------------------------------------------------ setup
 
@@ -264,18 +296,19 @@ contract AgentInvariantsTest is AgentFixture {
     }
 
     function _pick(uint256 seed) internal view returns (uint256) {
-        if (steps % 2 == 1) {
+        if (steps % 3 != 0) {
             for (uint256 k; k < KINDS; ++k) {
                 if (okCount[k] == 0) return k;
             }
         }
         uint256 r = _r(seed, 99) % 100;
-        uint8[15] memory w = [16, 3, 11, 5, 5, 10, 9, 3, 5, 5, 5, 3, 3, 2, 6]; // sums to 91
-        for (uint256 k; k < 15; ++k) {
+        uint8[16] memory w = [16, 3, 11, 5, 5, 10, 9, 3, 5, 5, 5, 3, 3, 2, 6, 1]; // sums to 92
+        for (uint256 k; k < 16; ++k) {
             if (r < w[k]) return k;
             r -= w[k];
         }
-        return POSITIVE + r; // the remaining 9, one per negative kind
+        // The remaining 8%: a negative kind (coverage already reaches each one every run).
+        return POSITIVE + _r(seed, 98) % (KINDS - POSITIVE);
     }
 
     function _positive(uint256 kind, uint256 seed) internal {
@@ -293,7 +326,8 @@ contract AgentInvariantsTest is AgentFixture {
         else if (kind == QUEUE_WIDEN) _actQueueWiden(seed % 2, seed);
         else if (kind == EXECUTE) _actExecute(seed);
         else if (kind == ROTATE) _actRotate(seed % 2, seed);
-        else _actMarket(seed);
+        else if (kind == MARKET) _actMarket(seed);
+        else _actTransferOwner(seed);
     }
 
     function _negative(uint256 kind, uint256 seed) internal {
@@ -305,7 +339,13 @@ contract AgentInvariantsTest is AgentFixture {
         else if (kind == N_FACTORY_PAUSED) _negFactoryPaused(seed);
         else if (kind == N_EARLY) _negEarly(seed);
         else if (kind == N_CROSS) _negCross(seed);
-        else _negOverCap(seed);
+        else if (kind == N_OVER_CAP) _negOverCap(seed);
+        else if (kind == N_SPEND_CAP) _negSpendCap(seed, false);
+        else if (kind == N_TOKEN_CAP) _negSpendCap(seed, true);
+        else if (kind == N_SELL_CAP) _negSellCap(seed);
+        else if (kind == N_ACTION_LIMIT) _negActionLimit(seed);
+        else if (kind == N_LAUNCH_LIMIT) _negLaunchLimit(seed);
+        else _negCeiling(seed);
     }
 
     // ------------------------------------------------------------------ small helpers
@@ -496,6 +536,8 @@ contract AgentInvariantsTest is AgentFixture {
             assertEq(_watch(t), s.watchTok, "tokens reached an outside address");
         }
         assertEq(_digest(1 - i), s.other, "a call through one account changed the other");
+        assertEq(IERC20(USDC).balanceOf(_acct(i)), _acct(i).balance / 1e12, "USDC view is the native balance");
+        assertEq(IERC20(USDC).balanceOf(_acct(1 - i)), _acct(1 - i).balance / 1e12);
     }
 
     function _sysNative(address extra) internal view returns (uint256 sum) {
@@ -647,6 +689,7 @@ contract AgentInvariantsTest is AgentFixture {
         vm.prank(agent);
         out = accts[i].buy(t, amt, 1, dl);
         _post(i, t, s, address(0));
+        ++okCalls;
         uint256 paid = s.acctNative - _acct(i).balance;
         assertLe(paid, amt * 1e12, "a buy took more than its input");
         assertEq(IERC20(t).balanceOf(_acct(i)) - s.acctTok, out, "tokens received");
@@ -666,6 +709,7 @@ contract AgentInvariantsTest is AgentFixture {
         vm.prank(agent);
         uint256 usdcOut = accts[i].sell(t, tokensIn, 1, dl);
         _post(i, t, s, address(0));
+        ++okCalls;
         _afterSell(i, t, s, tokensIn, usdcOut, value, cost0, tok0, hw0);
     }
 
@@ -706,6 +750,7 @@ contract AgentInvariantsTest is AgentFixture {
         vm.prank(agent);
         uint256 out = accts[i].swapExactIn(t, true, amt, 1, dl);
         _post(i, t, s, address(0));
+        ++okCalls;
         assertEq(s.acctNative - _acct(i).balance, amt * 1e12, "a pool buy takes exactly its input");
         assertEq(IERC20(t).balanceOf(_acct(i)) - s.acctTok, out, "tokens received");
         assertEq(owners[i].balance, s.ownerNative, "owner untouched");
@@ -723,6 +768,7 @@ contract AgentInvariantsTest is AgentFixture {
         vm.prank(agent);
         uint256 out = accts[i].swapExactIn(t, false, amountIn, 1, dl);
         _post(i, t, s, address(0));
+        ++okCalls;
         uint256 receivedWei = _acct(i).balance - s.acctNative;
         uint256 value = recordedValue;
         if (amountIn > tok0) {
@@ -933,6 +979,7 @@ contract AgentInvariantsTest is AgentFixture {
         vm.prank(agent);
         (address t, address c) = accts[i].launch(r);
         _post(i, address(0), s, c);
+        ++okCalls;
         uint256 paid = s.acctNative - _acct(i).balance;
         assertLe(paid, cfg.launchFee + r.initialBuyUsdc * 1e12, "a launch took more than fee plus buy");
         assertEq(feeManagerCreator(t), _acct(i), "the account is the creator");
@@ -1056,6 +1103,7 @@ contract AgentInvariantsTest is AgentFixture {
         vm.prank(agent);
         uint256 claimed = accts[i].claimFees();
         _post(i, address(0), s, address(0));
+        ++okCalls;
         assertEq(_acct(i).balance - s.acctNative, owed, "the whole balance is claimed to the account");
         assertEq(claimed, owed / 1e12, "claimed rounds down");
         assertEq(feeManager.balances(_acct(i)), 0);
@@ -1086,6 +1134,7 @@ contract AgentInvariantsTest is AgentFixture {
         vm.prank(agent);
         accts[i].sweepToOwner(t, amt);
         _post(i, t, s, address(0));
+        ++okCalls;
         if (t == address(0)) {
             assertEq(s.acctNative - _acct(i).balance, amt, "swept native");
             assertEq(owners[i].balance - s.ownerNative, amt, "native swept to the owner");
@@ -1094,7 +1143,7 @@ contract AgentInvariantsTest is AgentFixture {
             assertEq(s.acctTok - IERC20(t).balanceOf(_acct(i)), amt, "swept tokens");
             assertEq(IERC20(t).balanceOf(owners[i]) - s.ownerTok, amt, "tokens swept to the owner");
             assertEq(owners[i].balance, s.ownerNative);
-            ownerTokIn[i][t] += amt;
+            ownerTokIn[owners[i]][t] += amt;
             _checkCut(i, t, cost0, tok0, hw0, amt, bal0);
         }
         _charge(i, t, 0, 0);
@@ -1166,12 +1215,13 @@ contract AgentInvariantsTest is AgentFixture {
             uint256 own0 = owners[i].balance;
             vm.prank(owners[i]);
             accts[i].withdrawMany(list);
+            ++okCalls;
             assertEq(_acct(i).balance, 0, "drained");
             assertEq(owners[i].balance - own0, bals[0]);
             ownerIn[i] += bals[0];
             for (uint256 k = 1; k < list.length; ++k) {
                 assertEq(IERC20(list[k]).balanceOf(_acct(i)), 0);
-                ownerTokIn[i][list[k]] += bals[k];
+                ownerTokIn[owners[i]][list[k]] += bals[k];
                 (, uint128 tokens,) = accts[i].basis(list[k]);
                 assertEq(tokens, 0, "withdrawMany clears the basis");
             }
@@ -1192,7 +1242,8 @@ contract AgentInvariantsTest is AgentFixture {
             (uint128 cost0, uint128 tok0, uint256 hw0) = accts[i].basis(t);
             vm.prank(owners[i]);
             accts[i].withdraw(t, amt);
-            ownerTokIn[i][t] += amt;
+            ++okCalls;
+            ownerTokIn[owners[i]][t] += amt;
             _checkCut(i, t, cost0, tok0, hw0, amt, bal);
             _ownerPost(i, s);
         }
@@ -1204,6 +1255,7 @@ contract AgentInvariantsTest is AgentFixture {
         uint256 acct0 = _acct(i).balance;
         vm.prank(owners[i]);
         accts[i].withdraw(address(0), amt);
+        ++okCalls;
         assertEq(owners[i].balance - own0, amt, "withdrawn to the owner");
         assertEq(acct0 - _acct(i).balance, amt);
         ownerIn[i] += amt;
@@ -1219,7 +1271,7 @@ contract AgentInvariantsTest is AgentFixture {
     function _actTighten(uint256 i, uint256 seed) internal {
         Policy memory cur = _policy(i);
         Policy memory base = _base();
-        Policy memory next = cur;
+        Policy memory next = _policy(i); // a separate copy: `cur` must keep the old values
         uint256 f = _r(seed, 1) % 4;
         uint256[4] memory curV =
             [uint256(cur.maxTradeUsdc), cur.periodSpendCap, cur.perTokenPeriodCap, cur.periodSellCap];
@@ -1234,9 +1286,39 @@ contract AgentInvariantsTest is AgentFixture {
         Pre memory s = _ownerPre(i);
         vm.prank(owners[i]);
         assertEq(registry.setPolicy(_acct(i), next), 0, "a tightening is immediate");
+        ++okCalls;
         assertEq(abi.encode(_policy(i)), abi.encode(next), "tightening applied");
+        _ghostWrite(i, cur, next, true);
         _ownerPost(i, s);
         _sync(i);
+    }
+
+    /// @dev Records a policy write in the test-side ghost: one sequence number per write, stamped on every field whose
+    ///      value changed (and, for a tightening, the value it was tightened to).
+    function _ghostWrite(uint256 i, Policy memory from, Policy memory to, bool tightening) internal {
+        uint256[11] memory a = AgentPolicyLib.words(from);
+        uint256[11] memory b = AgentPolicyLib.words(to);
+        bool any;
+        for (uint256 f; f < 11; ++f) {
+            if (a[f] != b[f]) any = true;
+        }
+        if (!any) return;
+        uint256 sq = ++ghostSeq[i];
+        for (uint256 f; f < 11; ++f) {
+            if (a[f] == b[f]) continue;
+            fieldSeq[i][f] = sq;
+            if (tightening) {
+                tightSeq[i][f] = sq;
+                tightVal[i][f] = b[f];
+            }
+        }
+    }
+
+    function _killPending(uint256 i) internal {
+        Pending[] storage list = pendingOf[i];
+        for (uint256 k; k < list.length; ++k) {
+            list[k].killed = true;
+        }
     }
 
     /// @dev Queues a widening back to the base policy (tightening first when the policy is already the base).
@@ -1250,42 +1332,48 @@ contract AgentInvariantsTest is AgentFixture {
         vm.prank(owners[i]);
         id = registry.setPolicy(_acct(i), _base());
         assertGt(id, 0, "a widening is queued");
+        ++okCalls;
         assertEq(abi.encode(_policy(i)), abi.encode(cur), "nothing loosens at queue time");
         lastQueueId[i] = id;
-        pendingOf[i].push(id);
+        pendingOf[i].push(Pending(id, ghostSeq[i], _now(), false, _base()));
         _ownerPost(i, s);
     }
 
-    /// @dev Executes the oldest pending widening at (or after) its ETA and checks the field-wise merge: a field
-    ///      written after the item was queued keeps its value (Review Focus 2); a pause since then cancels it.
+    /// @dev Executes the oldest pending widening at (or after) its ETA and checks the merge against TEST-SIDE ghosts
+    ///      only (no registry write stamp or epoch is read): a killed item (pause or ownership change since queueing)
+    ///      applies nothing; otherwise each field written since queueing keeps its value, every field tightened since
+    ///      queueing stays at or below that tightening, and every other field takes the target (Review Focus 2).
     function _actExecute(uint256 seed) internal {
         uint256 i = seed % 2;
         if (pendingOf[i].length == 0) {
             _actQueueWiden(i, seed);
             ++okCount[QUEUE_WIDEN];
         }
-        uint256 id = pendingOf[i][0];
+        Pending memory q = pendingOf[i][0];
         _dropPending(i, 0);
         address a = _acct(i);
-        (uint8 kind, uint40 eta, uint64 itemEpoch, uint64 seq, bytes memory payload) = registry.queued(a, id);
-        if (kind == 0) {
-            _actExecute(seed); // already gone: take the next one
-            return;
-        }
         Policy memory cur = _policy(i);
         Pre memory s = _ownerPre(i);
-        if (itemEpoch != registry.epoch(a)) {
+        uint256 eta = q.queuedAt + 1 hours; // the delay never changes in this suite
+        if (q.killed) {
+            if (_now() < eta) {
+                vm.warp(eta);
+                vm.roll(vm.getBlockNumber() + 1);
+                s = _ownerPre(i);
+            }
             vm.prank(stranger);
-            registry.executeQueued(a, id);
-            assertEq(abi.encode(_policy(i)), abi.encode(cur), "a cancelled item applies nothing");
+            registry.executeQueued(a, q.id);
+            ++okCalls;
+            assertEq(abi.encode(_policy(i)), abi.encode(cur), "a killed item applies nothing");
             ++cancelledExecutions;
             _ownerPost(i, s);
             return;
         }
-        if (_now() > uint256(eta) + QUEUE_TTL) {
+        if (_now() > eta + QUEUE_TTL) {
             vm.prank(stranger);
             vm.expectRevert(IAgentPolicyRegistry.QueuedExpired.selector);
-            registry.executeQueued(a, id);
+            registry.executeQueued(a, q.id);
+            ++refusedCalls;
             ++queueExpiries;
             _ownerPost(i, s);
             _actExecute(seed);
@@ -1297,25 +1385,81 @@ contract AgentInvariantsTest is AgentFixture {
         }
         cur = _policy(i);
         uint256[11] memory c = AgentPolicyLib.words(cur);
-        uint256[11] memory t = AgentPolicyLib.words(abi.decode(payload, (Policy)));
+        uint256[11] memory t = AgentPolicyLib.words(q.target);
         for (uint256 f; f < 11; ++f) {
-            if (registry.policyWrite(a, f) <= seq) c[f] = t[f];
+            if (fieldSeq[i][f] <= q.seq) c[f] = t[f];
         }
         s = _ownerPre(i);
         vm.prank(stranger);
-        registry.executeQueued(a, id);
-        assertEq(abi.encode(AgentPolicyLib.words(_policy(i))), abi.encode(c), "merge keeps later writes");
+        registry.executeQueued(a, q.id);
+        ++okCalls;
+        Policy memory after_ = _policy(i);
+        uint256[11] memory n = AgentPolicyLib.words(after_);
+        assertEq(abi.encode(n), abi.encode(c), "merge keeps every write made since queueing");
+        for (uint256 f; f < 11; ++f) {
+            if (tightSeq[i][f] > q.seq) {
+                if (f == 8 || f == 10) assertGe(n[f], tightVal[i][f], "a later tightening survives");
+                else assertLe(n[f], tightVal[i][f], "a later tightening survives");
+            }
+        }
         assertGe(_now(), eta, "never before the ETA");
+        _ghostWrite(i, cur, after_, false);
         _ownerPost(i, s);
         _sync(i);
     }
 
     function _dropPending(uint256 i, uint256 k) internal {
-        uint256[] storage list = pendingOf[i];
+        Pending[] storage list = pendingOf[i];
         for (uint256 m = k; m + 1 < list.length; ++m) {
             list[m] = list[m + 1];
         }
         list.pop();
+    }
+
+    /// @dev The owner hands the account to a fresh address after the delay. The handover kills every queued item of
+    ///      the previous owner; the owner ghosts move to the new owner and the old one joins the watched outsiders.
+    function _actTransferOwner(uint256 seed) internal {
+        uint256 i = seed % 2;
+        address old = owners[i];
+        address heir = makeAddr(string.concat("heir ", vm.toString(++nonce)));
+        vm.deal(heir, 10_000_000e18);
+        Pre memory s = _ownerPre(i);
+        vm.prank(old);
+        uint256 id = registry.transferOwnership(_acct(i), heir);
+        ++okCalls;
+        lastQueueId[i] = id;
+        _ownerPost(i, s);
+        // Not before the delay (checked on half the transfers).
+        if (_r(seed, 1) % 2 == 0) {
+            vm.prank(heir);
+            vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.TooEarly.selector, uint40(_now() + 1 hours)));
+            registry.acceptOwnership(_acct(i), id);
+            ++refusedCalls;
+        }
+        vm.warp(_now() + 1 hours);
+        vm.roll(vm.getBlockNumber() + 1);
+        s = _ownerPre(i);
+        vm.prank(heir);
+        registry.acceptOwnership(_acct(i), id);
+        ++okCalls;
+        _ownerPost(i, s);
+        assertEq(registry.owner(_acct(i)), heir);
+        _killPending(i);
+        // Freeze the old owner's tally: it must still match, then it becomes an outsider.
+        assertEq(old.balance + ownerOut[i], ownerStart[i] + ownerIn[i], "old owner native");
+        owners[i] = heir;
+        ownerStart[i] = heir.balance;
+        ownerIn[i] = 0;
+        ownerOut[i] = 0;
+        watchList.push(old);
+        // The old owner can no longer withdraw (checked on the transfers that skipped the early accept).
+        if (_r(seed, 1) % 2 == 1) {
+            vm.prank(old);
+            vm.expectRevert(IAgentAccount.NotOwner.selector);
+            accts[i].withdraw(address(0), 1);
+            ++refusedCalls;
+        }
+        ++ownershipTransfers;
     }
 
     /// @dev Revokes a key (immediately) and queues its replacement, which activates only once executed after the
@@ -1337,6 +1481,7 @@ contract AgentInvariantsTest is AgentFixture {
         Pre memory s = _ownerPre(i);
         vm.prank(owners[i]);
         uint256 id = registry.rotateAgent(_acct(i), old, fresh, uint40(_now() + 170 days), perms);
+        ++okCalls;
         lastQueueId[i] = id;
         assertFalse(registry.agent(_acct(i), old).active, "revocation is immediate");
         assertTrue(registry.retired(_acct(i), old));
@@ -1349,15 +1494,23 @@ contract AgentInvariantsTest is AgentFixture {
         watchList.push(fresh);
 
         // Spec 5.5: a queued key can do nothing before its addition executes, even once the ETA has passed.
-        _try(fresh, i, _r(seed, 7) % 6, abi.encodeWithSelector(IAgentPolicyRegistry.NotAgent.selector));
+        // Before the ETA or after it (but before execution), by seed: either way it is not an agent yet.
+        bool afterEta = _r(seed, 7) % 2 == 0;
         (, uint40 eta,,,) = registry.queued(_acct(i), id);
-        vm.warp(eta);
-        vm.roll(vm.getBlockNumber() + 1);
+        if (afterEta) {
+            vm.warp(eta);
+            vm.roll(vm.getBlockNumber() + 1);
+        }
         _try(fresh, i, _r(seed, 8) % 6, abi.encodeWithSelector(IAgentPolicyRegistry.NotAgent.selector));
-        notYetActiveRefusals += 2;
+        ++notYetActiveRefusals;
+        if (!afterEta) {
+            vm.warp(eta);
+            vm.roll(vm.getBlockNumber() + 1);
+        }
         s = _ownerPre(i);
         vm.prank(stranger);
         registry.executeQueued(_acct(i), id);
+        ++okCalls;
         assertTrue(registry.agent(_acct(i), fresh).active);
         agentsOf[i].push(fresh);
         isCurrentAgent[i][fresh] = true;
@@ -1431,6 +1584,7 @@ contract AgentInvariantsTest is AgentFixture {
         else if (fn == 4) accts[i].claimFees();
         else accts[i].sweepToOwner(address(0), 1);
         _unchanged(d0, d1);
+        ++refusedCalls;
     }
 
     function _negStranger(uint256 seed) internal {
@@ -1445,11 +1599,13 @@ contract AgentInvariantsTest is AgentFixture {
             vm.prank(stranger);
             vm.expectRevert(IAgentAccount.NotOwner.selector);
             accts[i].withdraw(address(0), 1);
+            ++refusedCalls;
         } else {
             Policy memory p = _base();
             vm.prank(stranger);
             vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
             registry.setPolicy(_acct(i), p);
+            ++refusedCalls;
         }
         _unchanged(d0, d1);
     }
@@ -1483,12 +1639,20 @@ contract AgentInvariantsTest is AgentFixture {
         uint256 i = seed % 2;
         vm.prank(owners[i]);
         registry.pauseAgents(_acct(i), true);
-        _try(
-            _agentWith(i, P_BUY, seed), i, _r(seed, 1) % 2, abi.encodeWithSelector(IAgentPolicyRegistry.Paused.selector)
-        );
+        ++okCalls;
+        _killPending(i);
+        // The pause check comes first, so every agent action of every key is refused. Three of the six actions per
+        // pause, rotating, so two pauses cover all six (and `pausedFnsTried` shows each was tried).
+        address agent = _agentWith(i, P_BUY, seed);
+        for (uint256 k; k < 3; ++k) {
+            uint256 fn = pausedFnCursor++ % 6;
+            _try(agent, i, fn, abi.encodeWithSelector(IAgentPolicyRegistry.Paused.selector));
+            ++pausedFnsTried[fn];
+        }
         _ownerExit(i, seed);
         vm.prank(owners[i]);
         registry.pauseAgents(_acct(i), false);
+        ++okCalls;
     }
 
     /// @dev Owner exits and narrowing still work while agents are paused.
@@ -1499,6 +1663,7 @@ contract AgentInvariantsTest is AgentFixture {
         Policy memory p = _policy(i);
         vm.prank(owners[i]);
         assertEq(registry.setPolicy(_acct(i), p), 0, "narrowing works while paused");
+        ++okCalls;
         ++ownerExitsDuringPause;
     }
 
@@ -1527,12 +1692,13 @@ contract AgentInvariantsTest is AgentFixture {
     function _negEarly(uint256 seed) internal {
         uint256 i = seed % 2;
         uint256 id = _actQueueWiden(i, seed);
-        (, uint40 eta,,,) = registry.queued(_acct(i), id);
+        uint40 eta = uint40(_now() + 1 hours);
         (bytes32 d0, bytes32 d1) = _snap();
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.TooEarly.selector, eta));
         registry.executeQueued(_acct(i), id);
         _unchanged(d0, d1);
+        ++refusedCalls;
     }
 
     function _negCross(uint256 seed) internal {
@@ -1553,6 +1719,162 @@ contract AgentInvariantsTest is AgentFixture {
         vm.expectRevert(abi.encodeWithSelector(IAgentAccount.TradeTooLarge.selector, maxT));
         accts[i].buy(address(t), maxT + 1, 1, dl);
         _unchanged(d0, d1);
+        ++refusedCalls;
+    }
+
+    // ------------------------------------------------------------------ over-cap refusals (spec 5.2)
+    //
+    // Each runs inside a snapshot: the owner narrows one cap so the headroom is exactly h, the agent asks for h + 1
+    // (or a native cost of h * 1e12 + r wei), the call must revert with that cap's error carrying h, nothing may
+    // change, and the snapshot then restores the run.
+
+    function _narrowTo(uint256 i, Policy memory p) internal {
+        vm.prank(owners[i]);
+        assertEq(registry.setPolicy(_acct(i), p), 0, "narrowing is immediate");
+    }
+
+    function _negSpendCap(uint256 seed, bool perToken) internal {
+        uint256 i = seed % 2;
+        _ensureRoom(i, 5e6, 0, false);
+        uint256 snap = vm.snapshotState();
+        (LaunchToken lt, BondingCurve c) = _tradingToken(_r(seed, 1), 200e18);
+        Policy memory p = _policy(i);
+        if (_tokenLeft(i, address(lt)) < 5e6) {
+            (lt, c) = _newToken(seed);
+            _passSnipe(c);
+        }
+        address t = address(lt);
+        uint256 room = _min(_min(p.maxTradeUsdc, _spendLeft(i)), _tokenLeft(i, t));
+        uint256 h;
+        uint256 usdcIn;
+        bool odd = _r(seed, 2) % 2 == 0;
+        if (odd) {
+            // A graduating buy whose native cost is h * 1e12 + r wei, r in (0, 1e12).
+            uint256 leave = _b(_r(seed, 3), 1e18, (room - 1) * 1e12 * 8 / 10) + _r(seed, 4) % 1e12 + 1;
+            (, uint256 full,,) = c.quoteBuy(1e30);
+            if (full > leave) {
+                vm.deal(bob, 1_000_000e18);
+                vm.prank(bob);
+                c.buy{value: full - leave}(0, address(0), type(uint256).max);
+            }
+            (uint256 q, uint256 used,,) = c.quoteBuy(room * 1e12);
+            assertEq(q, c.curveSupply() - c.sold(), "final buy");
+            odd = used % 1e12 != 0;
+            h = used / 1e12;
+            usdcIn = room;
+        }
+        if (!odd) {
+            h = _b(_r(seed, 5), 1, room - 1);
+            usdcIn = h + 1;
+        }
+        bytes memory err;
+        if (perToken) {
+            p.perTokenPeriodCap = uint64(registry.tokenSpent(_acct(i), t) + h);
+            err = abi.encodeWithSelector(IAgentPolicyRegistry.TokenCapExceeded.selector, h);
+        } else {
+            (, uint64 spent,,,) = registry.usage(_acct(i));
+            p.periodSpendCap = uint64(spent + h);
+            err = abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSpendExceeded.selector, h);
+        }
+        _narrowTo(i, p);
+        address agent = _agentWith(i, P_BUY, seed);
+        uint256 dl = _dl();
+        (bytes32 d0, bytes32 d1) = _snap();
+        uint256 bal = _acct(i).balance;
+        vm.prank(agent);
+        vm.expectRevert(err);
+        accts[i].buy(t, usdcIn, 1, dl);
+        _unchanged(d0, d1);
+        assertEq(_acct(i).balance, bal);
+        vm.revertToState(snap);
+        ++refusedCalls;
+        if (odd) ++oddWeiSpendRefusals;
+    }
+
+    function _negSellCap(uint256 seed) internal {
+        uint256 i = seed % 2;
+        _ensureRoom(i, 25e6, 25e6, false);
+        uint256 snap = vm.snapshotState();
+        (LaunchToken lt, BondingCurve c) = _newToken(seed);
+        _passSnipe(c);
+        address t = address(lt);
+        _agentBuy(i, _agentWith(i, P_BUY, seed), t, 20e6);
+        (, uint128 held,) = accts[i].basis(t);
+        uint256 tokensIn = _b(_r(seed, 1), held / 4, held / 2);
+        uint256 value = _recV(_acct(i), t, tokensIn);
+        Policy memory p = _policy(i);
+        (,, uint64 sold,,) = registry.usage(_acct(i));
+        p.periodSellCap = uint64(sold + value - 1);
+        _narrowTo(i, p);
+        address agent = _agentWith(i, P_SELL, seed);
+        uint256 dl = _dl();
+        (bytes32 d0, bytes32 d1) = _snap();
+        vm.prank(agent);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, value - 1));
+        accts[i].sell(t, tokensIn, 1, dl);
+        _unchanged(d0, d1);
+        vm.revertToState(snap);
+        ++refusedCalls;
+    }
+
+    function _negActionLimit(uint256 seed) internal {
+        uint256 i = seed % 2;
+        _ensureRoom(i, 2e6, 0, false);
+        uint256 snap = vm.snapshotState();
+        (LaunchToken t,) = _tradingToken(_r(seed, 1), 200e18);
+        Policy memory p = _policy(i);
+        (,,, uint32 actions,) = registry.usage(_acct(i));
+        p.maxActionsPerPeriod = actions;
+        _narrowTo(i, p);
+        address agent = _agentWith(i, P_BUY, seed);
+        uint256 dl = _dl();
+        (bytes32 d0, bytes32 d1) = _snap();
+        vm.prank(agent);
+        vm.expectRevert(IAgentPolicyRegistry.ActionLimit.selector);
+        accts[i].buy(address(t), 1e6, 1, dl);
+        _unchanged(d0, d1);
+        vm.revertToState(snap);
+        ++refusedCalls;
+    }
+
+    function _negLaunchLimit(uint256 seed) internal {
+        uint256 i = seed % 2;
+        _ensureRoom(i, 2e6, 0, false);
+        uint256 snap = vm.snapshotState();
+        Policy memory p = _policy(i);
+        (,,,, uint16 launches) = registry.usage(_acct(i));
+        p.launchesPerPeriod = launches;
+        _narrowTo(i, p);
+        LaunchRequest memory r;
+        r.name = "Over";
+        r.symbol = "OVR";
+        r.salt = bytes32(++nonce);
+        r.expectedConfigHash = factory.configHash();
+        r.deadline = _dl();
+        address agent = _agentWith(i, P_LAUNCH, seed);
+        (bytes32 d0, bytes32 d1) = _snap();
+        vm.prank(agent);
+        vm.expectRevert(IAgentPolicyRegistry.LaunchLimit.selector);
+        accts[i].launch(r);
+        _unchanged(d0, d1);
+        vm.revertToState(snap);
+        ++refusedCalls;
+    }
+
+    /// @dev Spec 5.6: a write above a beta ceiling, in any limited field, is refused.
+    function _negCeiling(uint256 seed) internal {
+        uint256 i = seed % 2;
+        uint8[9] memory fields = [0, 1, 2, 3, 4, 5, 6, 7, 9];
+        uint8 f = fields[_r(seed, 1) % 9];
+        uint256[11] memory w = AgentPolicyLib.words(_policy(i));
+        w[f] = AgentPolicyLib.words(agentFactory.ceilings())[f] + 1;
+        Policy memory p = abi.decode(abi.encode(w), (Policy));
+        (bytes32 d0, bytes32 d1) = _snap();
+        vm.prank(owners[i]);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.BetaCeiling.selector, f));
+        registry.setPolicy(_acct(i), p);
+        _unchanged(d0, d1);
+        ++refusedCalls;
     }
 
     // ------------------------------------------------------------------ invariants
@@ -1563,7 +1885,7 @@ contract AgentInvariantsTest is AgentFixture {
             assertEq(owners[i].balance + ownerOut[i], ownerStart[i] + ownerIn[i], "owner native");
             for (uint256 k; k < toks.length; ++k) {
                 address t = address(toks[k]);
-                assertEq(IERC20(t).balanceOf(owners[i]), ownerTokIn[i][t], "owner tokens");
+                assertEq(IERC20(t).balanceOf(owners[i]), ownerTokIn[owners[i]][t], "owner tokens");
             }
         }
     }
@@ -1642,7 +1964,8 @@ contract AgentInvariantsTest is AgentFixture {
     ///      per-run counts to test-export/agent-invariant-stats.csv.
     function afterInvariant() public {
         assertGt(steps, 0, "steps");
-        assertGt(stepSuccesses * 100, steps * 60, "successful-call ratio above 60%");
+        assertGt(stepSuccesses * 100, steps * 60, "successful-step ratio above 60%");
+        assertGt(okCalls * 100, (okCalls + refusedCalls) * 60, "successful account-call ratio above 60%");
         for (uint256 k; k < KINDS; ++k) {
             assertGt(okCount[k], 0, string.concat("kind never reached: ", vm.toString(k)));
         }
@@ -1664,7 +1987,15 @@ contract AgentInvariantsTest is AgentFixture {
                 ",",
                 vm.toString(ownerExitsDuringPause),
                 ",",
-                vm.toString(notYetActiveRefusals)
+                vm.toString(notYetActiveRefusals),
+                ",",
+                vm.toString(okCalls),
+                ",",
+                vm.toString(refusedCalls),
+                ",",
+                vm.toString(ownershipTransfers),
+                ",",
+                vm.toString(oddWeiSpendRefusals)
             );
             for (uint256 k; k < KINDS; ++k) {
                 line = string.concat(line, ",", vm.toString(okCount[k]));

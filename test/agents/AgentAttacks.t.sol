@@ -21,7 +21,7 @@ contract ReentrantToken is ERC20 {
     AgentAccount public target;
     uint256 public attempts;
     uint256 public blocked;
-    bytes4 public lastError;
+    bytes4[3] public errors;
 
     constructor() ERC20("Evil", "EVIL") {
         _mint(msg.sender, 1e24);
@@ -44,7 +44,7 @@ contract ReentrantToken is ERC20 {
             (bool ok, bytes memory err) = address(target).call(calls[k]);
             if (!ok) {
                 ++blocked;
-                lastError = bytes4(err);
+                errors[k] = bytes4(err);
             }
         }
     }
@@ -396,7 +396,13 @@ contract AgentAttacksTest is AgentFixture {
         assertEq(evil.balanceOf(accountOwner), 1e21);
         assertEq(evil.attempts(), 3);
         assertEq(evil.blocked(), 3, "every re-entry was refused");
-        assertEq(evil.lastError(), ReentrancyGuardTransient.ReentrancyGuardReentrantCall.selector);
+        for (uint256 k; k < 3; ++k) {
+            assertEq(
+                evil.errors(k),
+                ReentrancyGuardTransient.ReentrancyGuardReentrantCall.selector,
+                "withdraw, sweep and buy are each locked"
+            );
+        }
         assertEq(address(account).balance, bal, "nothing else moved");
     }
 
@@ -547,6 +553,21 @@ contract AgentAttacksTest is AgentFixture {
         vm.cool(address(account));
         vm.cool(address(agentImpl));
         vm.cool(address(registry));
+        // A 200-entry chunk (native plus 199 tokens, all cold) fits the 16,777,216 per-transaction gas cap
+        // (EIP-7825), so an SDK can always split the exit into such chunks.
+        uint256 snap = vm.snapshotState();
+        address[] memory chunk = new address[](200);
+        for (uint256 k = 1; k < 200; ++k) {
+            chunk[k] = bait[k - 1];
+        }
+        vm.prank(accountOwner);
+        g0 = gasleft();
+        account.withdrawMany{gas: 16_777_216}(chunk);
+        uint256 chunkGas = g0 - gasleft();
+        emit log_named_uint("withdrawMany(200) gas", chunkGas);
+        assertLt(chunkGas, 16_777_216);
+        vm.revertToState(snap);
+
         uint256 native = address(account).balance;
         uint256 ownerBal = accountOwner.balance;
         vm.prank(accountOwner);

@@ -88,6 +88,32 @@ contract DeployAgentAccounts is TradeManifest {
         if (got != want) revert AgentManifestMismatch(string.concat("ceilings.", key));
     }
 
+    /// @dev The manifest holds exactly the input keys, and its ceilings exactly the eleven policy fields: an extra key
+    ///      (a deployed address, a misspelt field) is refused rather than ignored.
+    function _requireKeys(string memory manifest) internal view {
+        string[13] memory keys = [
+            "admin",
+            "ceilings",
+            "chainId",
+            "feeManager",
+            "graduationManager",
+            "guardian",
+            "launchFactory",
+            "launchHook",
+            "permit2",
+            "poolManager",
+            "routerCodeHash",
+            "universalRouter",
+            "usdc"
+        ];
+        string[] memory found = vm.parseJsonKeys(manifest, "$");
+        if (found.length != keys.length) revert AgentManifestMismatch("keys");
+        for (uint256 i; i < keys.length; ++i) {
+            if (!vm.keyExistsJson(manifest, string.concat(".", keys[i]))) revert AgentManifestMismatch("keys");
+        }
+        if (vm.parseJsonKeys(manifest, ".ceilings").length != 11) revert AgentManifestMismatch("ceilings keys");
+    }
+
     function _requireRecord(
         string memory manifest,
         string memory key,
@@ -107,6 +133,10 @@ contract DeployAgentAccounts is TradeManifest {
     {
         if (vm.parseJsonUint(manifest, ".chainId") != block.chainid) revert AgentManifestMismatch("chainId");
         if (vm.parseJsonUint(launchRecord, ".chainId") != block.chainid) revert LaunchRecordMismatch("record chainId");
+        if (vm.parseJsonUint(tradeManifest, ".chainId") != block.chainid) {
+            revert AgentManifestMismatch("trade manifest chainId");
+        }
+        _requireKeys(manifest);
         a.launchFactory = _requireRecord(manifest, ".launchFactory", launchRecord, ".factory");
         a.feeManager = _requireRecord(manifest, ".feeManager", launchRecord, ".feeManager");
         a.graduationManager = _requireRecord(manifest, ".graduationManager", launchRecord, ".graduationManager");

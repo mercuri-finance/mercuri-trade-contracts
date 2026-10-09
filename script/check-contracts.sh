@@ -69,6 +69,8 @@ fi
 grep -q 'MISMATCH at offsets.*inside immutables: _getBlockNumberish' <<<"$flipped" || { echo "reactor pointer self-test failed without a pointer mismatch report: $flipped" >&2; exit 1; }
 # The deployment record is written only from a completed broadcast; every incomplete or inconsistent one is refused.
 python3 script/write-trade-record.py --self-test
+# The agent accounts record likewise: only from a completed DeployAgentAccounts broadcast, never overwritten.
+python3 script/write-agent-accounts-record.py --self-test
 # Agent accounts (spec of 9 Oct 2026). Both manifests must agree with Launch's records, the Trade router pin and the
 # spec 4.5 beta ceilings, and a copy of the mainnet manifest with one ceiling raised must be refused.
 python3 script/verify-agent-accounts.py --preflight
@@ -119,11 +121,21 @@ if [[ ${1:-} == "--stress" ]]; then
   : "${ARC_LOCAL_FORK_RPC:?set ARC_LOCAL_FORK_RPC to an approved Arc RPC or local fork}"
   : "${TRADE_FORK_CHAIN_ID:?set TRADE_FORK_CHAIN_ID to 5042 or 5042002}"
   python3 script/verify-trade-router.py
-  FOUNDRY_FUZZ_RUNS=10000 forge test --no-match-path 'test/invariant/*' --fuzz-seed 0x5042
+  # Every invariant suite runs in a deep campaign below, so the 10,000-run fuzz step leaves them out.
+  FOUNDRY_FUZZ_RUNS=10000 forge test --no-match-path 'test/invariant/*' --no-match-contract 'AgentInvariantsTest' \
+    --fuzz-seed 0x5042
   campaign_dir=$(mktemp -d -t mercuri-trade-invariant)
   echo "Invariant counterexamples, if any: $campaign_dir"
   FOUNDRY_INVARIANT_RUNS=1024 FOUNDRY_INVARIANT_DEPTH=256 \
     FOUNDRY_INVARIANT_FAIL_ON_REVERT=true \
     FOUNDRY_INVARIANT_FAILURE_PERSIST_DIR="$campaign_dir" \
     forge test --match-path 'test/invariant/*' --fuzz-seed 0x5042002
+  # Agent account invariants (spec section 5), same depth, their own counterexample directory.
+  agent_campaign_dir=$(mktemp -d -t mercuri-agent-invariant)
+  echo "Agent invariant counterexamples, if any: $agent_campaign_dir"
+  FOUNDRY_INVARIANT_RUNS=1024 FOUNDRY_INVARIANT_DEPTH=256 \
+    FOUNDRY_INVARIANT_FAIL_ON_REVERT=true \
+    FOUNDRY_INVARIANT_FAILURE_PERSIST_DIR="$agent_campaign_dir" \
+    forge test --match-path 'test/agents/AgentInvariants.t.sol' --match-contract 'AgentInvariantsTest' \
+    --fuzz-seed 0x5042002
 fi

@@ -7,6 +7,7 @@ import {BondingCurve} from "@mercuri/launch/BondingCurve.sol";
 import {LaunchFactory} from "@mercuri/launch/LaunchFactory.sol";
 import {GraduationManager} from "@mercuri/launch/GraduationManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import {DeployAgentAccounts} from "../../script/DeployAgentAccounts.s.sol";
 import {AgentAccount} from "../../src/agents/AgentAccount.sol";
 import {AgentAccountFactory} from "../../src/agents/AgentAccountFactory.sol";
@@ -42,6 +43,8 @@ contract AgentPoolForkTest is Test {
     function setUp() public {
         string memory rpc = vm.envOr("ARC_LOCAL_FORK_RPC", string(""));
         if (bytes(rpc).length == 0) vm.skip(true);
+        // Tests never use a paid provider: refuse an Alchemy endpoint outright.
+        require(!vm.contains(vm.toLowercase(rpc), "alchemy"), "fork tests must not use Alchemy");
         uint256 chain = vm.envOr("TRADE_FORK_CHAIN_ID", uint256(5042002));
         require(chain == 5042002 || chain == 5042, "unsupported fork chain");
         if (chain != 5042002) vm.skip(true);
@@ -116,5 +119,11 @@ contract AgentPoolForkTest is Test {
         assertEq(actions2, 2);
         assertEq(IERC20(USDC).allowance(address(account), vm.parseJsonAddress(manifest, ".permit2")), 0);
         assertEq(IERC20(GRADUATED).allowance(address(account), vm.parseJsonAddress(manifest, ".permit2")), 0);
+        // Permit2's own allowance from the account to the router is spent to zero for both tokens.
+        IAllowanceTransfer permit2 = IAllowanceTransfer(vm.parseJsonAddress(manifest, ".permit2"));
+        (uint160 left,,) = permit2.allowance(address(account), USDC, router);
+        assertEq(left, 0, "no Permit2 USDC allowance left");
+        (left,,) = permit2.allowance(address(account), GRADUATED, router);
+        assertEq(left, 0, "no Permit2 token allowance left");
     }
 }

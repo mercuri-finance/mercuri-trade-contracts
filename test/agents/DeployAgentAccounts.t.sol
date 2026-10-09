@@ -256,6 +256,26 @@ contract DeployAgentAccountsTest is AgentFixture {
         _expectRefused(
             vm.replace(m, g, string.concat('"guardian": "', vm.toString(address(0xBEEF)), '"')), rec, trade, ".guardian"
         );
+        // An extra key (a deployed address, say) or an extra ceiling field is refused.
+        _expectRefused(
+            vm.replace(
+                m,
+                '"chainId": 5042002,',
+                '"chainId": 5042002,\n  "factory": "0x000000000000000000000000000000000000bEEF",'
+            ),
+            rec,
+            trade,
+            "keys"
+        );
+        _expectRefused(
+            vm.replace(m, '"allowlistOnly": false', '"allowlistOnly": false,\n    "extra": 1'),
+            rec,
+            trade,
+            "ceilings keys"
+        );
+        // A Trade manifest for another chain is refused.
+        (,, string memory mainnetTrade) = _files(5042);
+        _expectRefused(m, rec, mainnetTrade, "trade manifest chainId");
         // Another network's manifest is refused on this chain.
         (string memory mainnet,,) = _files(5042);
         _expectRefused(mainnet, rec, trade, "chainId");

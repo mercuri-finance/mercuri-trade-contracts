@@ -14,8 +14,9 @@ verify-trade-filler.py, so both contracts families are checked the same way.
   python3 script/verify-agent-accounts.py --self-test-flipped KIND:NAME     # offline; must report MISMATCH
   python3 script/verify-agent-accounts.py --simulate [--rpc URL] [--block N] [--manifest FILE]
                                        # read-only: eth_call constructor simulations equal the reconstruction
-  python3 script/verify-agent-accounts.py --rpc URL --block N --deployment FILE [--account ADDR] [--manifest FILE]
-                                       # FILE has implementation, factory and registry (agent-accounts-<chainId>.json)
+  python3 script/verify-agent-accounts.py --rpc URL --block N --record FILE [--account ADDR] [--manifest FILE]
+                                       # FILE: deployments/agent-accounts-<chainId>.json, written only by
+                                       # write-agent-accounts-record.py from a completed broadcast
 
 The preflight requires the manifest to hold exactly the input keys: the Launch addresses equal to Launch's deployment
 record for the chain, admin = the record's timelock, guardian = the record's guardian (non-zero), the Universal Router
@@ -28,12 +29,17 @@ import copy
 import importlib.util
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location('verify_trade_filler', root / 'script' / 'verify-trade-filler.py')
 vtf = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(vtf)
+_wspec = importlib.util.spec_from_file_location('write_agent_accounts_record',
+                                                root / 'script' / 'write-agent-accounts-record.py')
+war = importlib.util.module_from_spec(_wspec)
+_wspec.loader.exec_module(war)
 
 DEFAULT_RPC = 'https://rpc.testnet.arc.io'
 ACCOUNT_ARTIFACT = 'out/AgentAccount.sol/AgentAccount.json'
@@ -284,6 +290,7 @@ def full_self_test():
         'preflight': preflight_self_test(),
         'clone': clone_self_test(),
         'CREATE formula': create_self_test(),
+        'deployment record': record_self_test(),
     }
     if not good or bad or not all(checks.values()):
         failed = [k for k, v in checks.items() if not v]
@@ -292,7 +299,7 @@ def full_self_test():
     print('self-test ok: the implementation, factory and registry runtimes match with every immutable substituted; a '
           'flipped byte in any of their immutables is rejected by name; an extra or missing immutable is refused; '
           'both manifests pass the preflight and every tampered input is refused; a flipped clone byte is rejected; '
-          'the CREATE formula reproduces known addresses')
+          'the CREATE formula reproduces known addresses; only a writer-shaped record matching the manifest is read')
     return True
 
 
@@ -352,14 +359,69 @@ def simulate(args):
 # ------------------------------------------------------------------------------------------------- live
 
 
+def load_record(path, manifest):
+    """The deployment record written by write-agent-accounts-record.py, and only that: the file name, the exact key set,
+    the version and every input must agree with the manifest, so a hand-written or stale record is refused."""
+    path = Path(path)
+    if path.name != f'agent-accounts-{manifest["chainId"]}.json':
+        raise SystemExit(f'{path.name} is not agent-accounts-{manifest["chainId"]}.json, the record the writer emits')
+    record = json.loads(path.read_text())
+    if set(record) != war.RECORD_KEYS:
+        raise SystemExit(f'record keys differ from the writer\'s: unexpected {sorted(set(record) - war.RECORD_KEYS)}, '
+                         f'missing {sorted(war.RECORD_KEYS - set(record))}')
+    if record['chainId'] != manifest['chainId'] or record['version'] != war.VERSION:
+        raise SystemExit(f'record chainId {record["chainId"]} / version {record["version"]} != manifest chain '
+                         f'{manifest["chainId"]} / writer version {war.VERSION}')
+    for key in ('implementation', 'factory', 'registry', 'deployer'):
+        if not vtf.is_address(record.get(key)):
+            raise SystemExit(f'record {key} is not an address: {record.get(key)!r}')
+    for key in war.ACCOUNT_INPUTS + ('admin', 'guardian'):
+        if str(record[key]).lower() != str(manifest[key]).lower():
+            raise SystemExit(f'record {key} {record[key]} != manifest {manifest[key]}')
+    if record['ceilings'] != manifest['ceilings']:
+        raise SystemExit('record ceilings != manifest ceilings')
+    if not isinstance(record['deployBlock'], int) or not isinstance(record['factoryDeployBlock'], int):
+        raise SystemExit('record blocks are not integers')
+    return record
+
+
+def record_self_test():
+    """A record shaped as the writer emits it is accepted; a renamed, extended or tampered one is refused."""
+    manifest = vtf.load('deployments/agent-accounts-manifest-5042002.json')
+    record = {key: manifest[key] for key in war.ACCOUNT_INPUTS + ('admin', 'guardian', 'ceilings')}
+    record.update(chainId=5042002, implementation=SELF_TEST['implementation'], factory=SELF_TEST['factory'],
+                  registry=SELF_TEST['registry'], deployer=SELF_TEST['implementation'], deployBlock=1,
+                  factoryDeployBlock=1, version=war.VERSION, sourceRevision='0' * 40)
+    variants = {
+        'writer-shaped record': (record, 'agent-accounts-5042002.json', True),
+        'other file name': (record, 'deployment.json', False),
+        'extra key': (dict(record, filler=SELF_TEST['factory']), 'agent-accounts-5042002.json', False),
+        'admin differs': (dict(record, admin=SELF_TEST['factory']), 'agent-accounts-5042002.json', False),
+        'ceilings differ': (dict(record, ceilings=dict(record['ceilings'], maxTradeUsdc=1)),
+                            'agent-accounts-5042002.json', False),
+        'other version': (dict(record, version='0'), 'agent-accounts-5042002.json', False),
+    }
+    ok = True
+    with tempfile.TemporaryDirectory() as d:
+        for label, (body, name, accept) in variants.items():
+            path = Path(d) / name
+            path.write_text(json.dumps(body))
+            try:
+                load_record(path, manifest)
+                accepted = True
+            except SystemExit:
+                accepted = False
+            print(f'record {label}: {"accepted" if accepted else "refused"}')
+            ok &= accepted == accept
+            path.unlink()
+    return ok
+
+
 def live(args):
     manifest = vtf.load(args.manifest)
     if not run_preflight(manifest):
         raise SystemExit('preflight failed; nothing was read from the chain')
-    deployment = json.loads(Path(args.deployment).read_text())
-    for key in ('implementation', 'factory', 'registry'):
-        if not vtf.is_address(deployment.get(key)):
-            raise SystemExit(f'deployment {key} is not an address: {deployment.get(key)!r}')
+    deployment = load_record(args.record, manifest)
     chain = int(vtf.rpc_call(args.rpc, 'eth_chainId', []), 16)
     if chain != manifest['chainId']:
         raise SystemExit(f'chain id {chain} != manifest {manifest["chainId"]}')
@@ -406,7 +468,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--rpc', default=DEFAULT_RPC)
     parser.add_argument('--block', type=int)
-    parser.add_argument('--deployment', help='JSON with implementation, factory and registry')
+    parser.add_argument('--record', help='deployments/agent-accounts-<chainId>.json from write-agent-accounts-record.py')
     parser.add_argument('--account', help='also check one account clone')
     parser.add_argument('--manifest', default='deployments/agent-accounts-manifest-5042002.json')
     parser.add_argument('--preflight', action='store_true', help='offline: manifest against records and spec')
@@ -428,8 +490,8 @@ def main():
         sys.exit(0 if run_preflight(vtf.load(args.manifest)) else 1)
     if args.simulate:
         sys.exit(0 if simulate(args) else 1)
-    if args.block is None or not args.deployment:
-        parser.error('--block and --deployment are required')
+    if args.block is None or not args.record:
+        parser.error('--block and --record are required')
     sys.exit(0 if live(args) else 1)
 
 

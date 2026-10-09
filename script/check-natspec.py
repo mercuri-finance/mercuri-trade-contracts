@@ -16,12 +16,20 @@ CONTRACTS = {
     "MercuriOrderFiller": "src/MercuriOrderFiller.sol",
     "MercuriOrderValidator": "src/MercuriOrderValidator.sol",
     "IOrderSwapRouter": "src/interfaces/IOrderSwapRouter.sol",
+    "AgentAccount": "src/agents/AgentAccount.sol",
+    "AgentAccountFactory": "src/agents/AgentAccountFactory.sol",
+    "AgentPolicyRegistry": "src/agents/AgentPolicyRegistry.sol",
+    "IAgentAccount": "src/agents/interfaces/IAgentAccount.sol",
+    "IAgentAccountFactory": "src/agents/interfaces/IAgentAccountFactory.sol",
+    "IAgentPolicyRegistry": "src/agents/interfaces/IAgentPolicyRegistry.sol",
 }
 INHERITED = {
     "UPGRADE_INTERFACE_VERSION", "acceptOwnership", "owner", "pendingOwner",
     "proxiableUUID", "transferOwnership", "upgradeToAndCall", "paused",
     "allowance", "approve", "balanceOf", "decimals", "name", "symbol",
     "totalSupply", "transfer", "transferFrom",
+    # IERC1271, inherited by IAgentAccount; AgentAccount's own override is checked.
+    "isValidSignature",
 }
 
 

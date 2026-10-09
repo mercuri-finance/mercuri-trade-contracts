@@ -40,8 +40,8 @@ fill time by the backend keeper and filled through the two contracts this reposi
 validator, which checks each order's signed condition on chain.
 
 **Contents** · [Deployment](#deployment) · [How it works](#how-it-works) · [Contracts](#contracts) ·
-[Parameters](#parameters) · [Events](#events) · [Build and verify](#build-and-verify) · [Security](#security) ·
-[License](#license)
+[Parameters](#parameters) · [Events](#events) · [Agent accounts](#agent-accounts) · [Build and verify](#build-and-verify) ·
+[Security](#security) · [License](#license)
 
 ## Deployment
 
@@ -144,6 +144,20 @@ event OrderFilled(bytes32 indexed orderHash, address indexed swapper, bytes32 in
 A public read API lists the pools Trade routes to on mainnet:
 [`trade-api.mercuri.finance/v1/pools`](https://trade-api.mercuri.finance/v1/pools), and `/v1/network` names the order
 reactor and cosigner, both empty while orders are closed.
+
+## Agent accounts
+
+Mercurifi Agent Accounts let a user's own bot or AI agent trade Launch tokens from a capped vault with keys that can
+never withdraw. Three immutable contracts in [`src/agents/`](src/agents): the `AgentAccount` implementation (one
+EIP-1167 clone per user, holding funds and cost basis and running the typed trades), the singleton
+`AgentPolicyRegistry` (owners, policies, agents, the widening queue and the period caps) and the
+`AgentAccountFactory` (clones, beta ceilings, guardian pause). Not deployed. Architecture, trust model, the loss bound,
+what is immutable, migration, gas and the release evidence:
+[`docs/agents/agent-accounts.md`](docs/agents/agent-accounts.md). Deployment inputs are in
+`deployments/agent-accounts-manifest-<chainId>.json`, deployed by
+[`script/DeployAgentAccounts.s.sol`](script/DeployAgentAccounts.s.sol) only with a separate owner go per network, and
+checked by [`script/verify-agent-accounts.py`](script/verify-agent-accounts.py) (`--preflight`, `--self-test`,
+`--simulate`, and a live runtime comparison at a pinned block).
 
 ## Build and verify
 

@@ -116,7 +116,15 @@ contract AgentPolicyRegistry is IAgentPolicyRegistry {
         }
     }
 
-    /// @inheritdoc IAgentPolicyRegistry
+    /// @notice Preamble of every agent function of the calling account (spec section 4.6, steps 2 to 7): owner
+    ///         pause, factory pause, an active and unexpired agent holding `permission`, a deadline in
+    ///         `[now, now + maxDeadlineSeconds]`, the period roll and the action count, which it increments.
+    /// @dev Callable only by a registered account, for itself (`msg.sender`). The account runs its own lock first.
+    /// @param agent_ The agent key that called the account.
+    /// @param permission The `P_*` bit the function needs.
+    /// @param deadline The agent's deadline, Unix seconds.
+    /// @return p The policy in force (amounts usdc6).
+    /// @return periodId `block.timestamp / periodSeconds`.
     function authorize(address agent_, uint16 permission, uint256 deadline)
         external
         returns (Policy memory p, uint64 periodId)

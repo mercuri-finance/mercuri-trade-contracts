@@ -69,6 +69,30 @@ fi
 grep -q 'MISMATCH at offsets.*inside immutables: _getBlockNumberish' <<<"$flipped" || { echo "reactor pointer self-test failed without a pointer mismatch report: $flipped" >&2; exit 1; }
 # The deployment record is written only from a completed broadcast; every incomplete or inconsistent one is refused.
 python3 script/write-trade-record.py --self-test
+# Agent accounts (spec of 9 Oct 2026). Both manifests must agree with Launch's records, the Trade router pin and the
+# spec 4.5 beta ceilings, and a copy of the mainnet manifest with one ceiling raised must be refused.
+python3 script/verify-agent-accounts.py --preflight
+python3 script/verify-agent-accounts.py --preflight --manifest deployments/agent-accounts-manifest-5042.json
+python3 -c 'import json, sys; m = json.load(open(sys.argv[1])); m["ceilings"]["maxTradeUsdc"] += 1; json.dump(m, open(sys.argv[2], "w"))' \
+  deployments/agent-accounts-manifest-5042.json "$pending_dir/agent-accounts-manifest-5042.json"
+if raised=$(python3 script/verify-agent-accounts.py --preflight --manifest "$pending_dir/agent-accounts-manifest-5042.json" 2>&1); then
+  echo 'verify-agent-accounts.py --preflight accepted a manifest with a ceiling above spec 4.5' >&2
+  exit 1
+fi
+grep -q 'ceilings.maxTradeUsdc .* != spec 4.5 beta ceiling' <<<"$raised" || { echo "raised-ceiling preflight failed without its report: $raised" >&2; exit 1; }
+# Runtime identity: the verifier must accept the rebuilt implementation, factory and registry runtimes with every
+# immutable substituted and reject a flipped byte in each immutable by name (the full sweep runs in --self-test; the
+# pairs below are re-run here so the gate itself sees each contract's mismatch report).
+python3 script/verify-agent-accounts.py --self-test
+for pair in 'account:FACTORY' 'account:REGISTRY' 'account:LAUNCH_FACTORY' 'account:UNIVERSAL_ROUTER' \
+  'factory:implementation' 'factory:registry' 'factory:admin' 'factory:guardianDisabled' 'factory:C_MAX_TRADE_USDC' \
+  'registry:FACTORY'; do
+  if flipped=$(python3 script/verify-agent-accounts.py --self-test-flipped "$pair" 2>&1); then
+    echo "verify-agent-accounts.py accepted a runtime with a flipped ${pair#*:} byte (${pair%%:*})" >&2
+    exit 1
+  fi
+  grep -q "MISMATCH at offsets.*inside immutables: ${pair#*:})" <<<"$flipped" || { echo "${pair} self-test failed without its mismatch report: $flipped" >&2; exit 1; }
+done
 forge test --fuzz-seed 0x5042
 # The expiring-order vector is consumed by the backend and the web app. All three copies must be identical.
 if [[ -n ${TRADE_VECTOR_BACKEND:-} && -n ${TRADE_VECTOR_WEBUI:-} ]]; then
@@ -87,6 +111,9 @@ else
 fi
 forge snapshot --check --match-path 'test/integration/*.t.sol' \
   --no-match-contract 'Fork' --no-match-test '^testFuzz_' --fuzz-seed 0x5042
+# Agent account gas: deterministic agent tests, in their own snapshot so the order suite's baseline is untouched.
+forge snapshot --check .gas-snapshot-agents --match-path 'test/agents/*.t.sol' \
+  --no-match-contract 'Fork|Invariant' --no-match-test '^testFuzz_' --fuzz-seed 0x5042
 
 if [[ ${1:-} == "--stress" ]]; then
   : "${ARC_LOCAL_FORK_RPC:?set ARC_LOCAL_FORK_RPC to an approved Arc RPC or local fork}"

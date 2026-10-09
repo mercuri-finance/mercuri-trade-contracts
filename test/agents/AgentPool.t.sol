@@ -17,6 +17,7 @@ import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiqui
 import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
 import {IV4Quoter} from "@uniswap/v4-periphery/src/interfaces/IV4Quoter.sol";
+import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import {AgentFixture} from "./AgentFixture.sol";
 import {ICanonicalRouter} from "../integration/UniversalRouterSwap.t.sol";
 import {AgentAccount} from "../../src/agents/AgentAccount.sol";
@@ -24,6 +25,22 @@ import {AgentPolicyLib} from "../../src/agents/AgentPolicyLib.sol";
 import {IAgentAccount} from "../../src/agents/interfaces/IAgentAccount.sol";
 import {IAgentPolicyRegistry} from "../../src/agents/interfaces/IAgentPolicyRegistry.sol";
 import {Policy, InitParams, P_BUY, P_SELL, ACTION_POOL_BUY, ACTION_POOL_SELL} from "../../src/agents/AgentTypes.sol";
+
+/// @dev Stands in for the Universal Router (its code is etched at the router's address): it pulls `amountIn` of the
+///      input through Permit2, as SETTLE_ALL would, so both allowances reach zero, and delivers no output.
+contract TakesInputGivesNothingRouter {
+    IAllowanceTransfer internal immutable permit2;
+
+    constructor(IAllowanceTransfer permit2_) {
+        permit2 = permit2_;
+    }
+
+    function execute(bytes calldata, bytes[] calldata inputs, uint256) external payable {
+        (, bytes[] memory params) = abi.decode(inputs[0], (bytes, bytes[]));
+        (address input, uint256 amountIn) = abi.decode(params[1], (address, uint256));
+        permit2.transferFrom(msg.sender, address(this), uint160(amountIn), input);
+    }
+}
 
 /// @dev Task 5: capped graduated-pool swaps through the Universal Router (spec section 4.6, `swapExactIn`).
 contract AgentPoolTest is AgentFixture {
@@ -335,6 +352,12 @@ contract AgentPoolTest is AgentFixture {
             _expectSwapRevert(
                 abi.encodeWithSelector(IAgentAccount.PriceImpactTooHigh.selector, sellBps), t, false, held, 1
             );
+            // Exactly the computed impact passes.
+            vm.revertToState(snap);
+            p.maxPriceImpactBps = uint16(sellBps);
+            _narrow(p);
+            _swap(t, false, held, 1);
+            assertEq(t.balanceOf(address(account)), 0, "the sell at exactly its impact went through");
             vm.revertToState(iter);
         }
     }
@@ -346,8 +369,26 @@ contract AgentPoolTest is AgentFixture {
         assertEq(AgentPolicyLib.poolImpactBps(100 * s, 101 * s), 201);
         // sqrt down exactly 1% -> price down 1.99%.
         assertEq(AgentPolicyLib.poolImpactBps(100 * s, 99 * s), 199);
-        // Rounded down: just under 2.01%.
-        assertEq(AgentPolicyLib.poolImpactBps(s, s * 101 / 100), 200);
+        // Rounded against the trade: just under 2.01% is 201, and the smallest move either way is 1.
+        assertEq(AgentPolicyLib.poolImpactBps(s, s * 101 / 100), 201);
+        assertEq(AgentPolicyLib.poolImpactBps(s, s + 1), 1);
+        assertEq(AgentPolicyLib.poolImpactBps(s, s - 1), 1);
+        assertEq(AgentPolicyLib.poolImpactBps(100 * s, 99 * s + 1), 199);
+        // Extreme moves stay typed: a fall to zero is 10,000; a rise across the whole range saturates.
+        uint256 minSqrt = 4295128739;
+        uint256 maxSqrt = 1461446703485210103287273052203988822378723970342;
+        assertEq(AgentPolicyLib.poolImpactBps(maxSqrt, minSqrt), 10_000);
+        assertEq(AgentPolicyLib.poolImpactBps(minSqrt, maxSqrt), type(uint256).max);
+        assertGt(AgentPolicyLib.poolImpactBps(s, s * 1e9), 1e21);
+    }
+
+    function testFuzz_PoolImpactNeverPanics(uint160 a, uint160 b) public pure {
+        a = uint160(bound(a, 4295128739, 1461446703485210103287273052203988822378723970342));
+        b = uint160(bound(b, 4295128739, 1461446703485210103287273052203988822378723970342));
+        uint256 bps = AgentPolicyLib.poolImpactBps(a, b);
+        if (a == b) assertEq(bps, 0);
+        else assertGt(bps, 0, "any move counts");
+        if (b < a) assertLe(bps, 10_000, "a fall is at most 100%");
     }
 
     function test_MinOutNotMetBubblesTheRouterRevert() public {
@@ -367,6 +408,33 @@ contract AgentPoolTest is AgentFixture {
                 abi.encodeWithSelector(IV4Router.V4TooLittleReceived.selector, out + 1, out), t, false, held, out + 1
             );
             _assertNoAllowance(address(t));
+        }
+    }
+
+    function test_RouterThatTakesInputButGivesNothingRevertsUnexpectedSwapDelta() public {
+        for (uint256 i; i < 2; ++i) {
+            LaunchToken t = toks[i];
+            uint256 held = _swap(t, true, 10e6, 1);
+            uint256 snap = vm.snapshotState();
+            vm.etch(address(router), address(new TakesInputGivesNothingRouter(permit2)).code);
+            // The mock leaves both allowances at zero and the pool price unmoved, so only the delta check can
+            // catch it: input taken, no output.
+            _expectSwapRevert(abi.encodeWithSelector(IAgentAccount.UnexpectedSwapDelta.selector), t, true, 10e6, 1);
+            _expectSwapRevert(abi.encodeWithSelector(IAgentAccount.UnexpectedSwapDelta.selector), t, false, held, 1);
+            // Without the account's check the buy would have gone through: the mock really does take the input.
+            vm.prank(address(account));
+            IERC20(USDC).approve(address(permit2), 10e6);
+            vm.prank(address(account));
+            permit2.approve(USDC, address(router), 10e6, uint48(block.timestamp));
+            uint256 bal = address(account).balance;
+            bytes[] memory inputs = _routerInputs(t, true, 10e6, 1);
+            uint256 dl = _dl();
+            vm.prank(address(account));
+            router.execute(hex"10", inputs, dl);
+            assertEq(bal - address(account).balance, 10e18, "the mock pulled the input");
+            assertEq(t.balanceOf(address(account)), held, "and delivered nothing");
+            _assertNoAllowance(USDC);
+            vm.revertToState(snap);
         }
     }
 

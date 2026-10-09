@@ -134,17 +134,21 @@ library AgentPolicyLib {
     }
 
     /// @notice Price impact of a pool swap: how far the pool price moved, from `sqrtPriceX96` before and after.
-    /// @dev `r = floor(after * 1e18 / before)`, `ratio = floor(r * r / 1e18)` (the price ratio scaled by 1e18) and
-    ///      impact `floor(|ratio - 1e18| * 10,000 / 1e18)`. Symmetric in direction; callers pass `sqrtBefore > 0`
-    ///      (an initialised pool).
+    /// @dev `r = after * 1e18 / before` and `ratio = r * r / 1e18` (the price ratio scaled by 1e18), both rounded
+    ///      away from 1e18 (up for a rise, down for a fall), then impact `ceil(|ratio - 1e18| * 10,000 / 1e18)`: every
+    ///      step rounds against the trade, as the curve checks do. Every step uses `Math.mulDiv`, and a rise of more
+    ///      than 2^128 / 1e18 in `r` returns `type(uint256).max`, so an extreme move ends in the caller's typed
+    ///      `PriceImpactTooHigh` instead of an overflow. Callers pass `sqrtBefore > 0` (an initialised pool).
     /// @param sqrtBefore Pool `sqrtPriceX96` before the swap (Q64.96).
     /// @param sqrtAfter Pool `sqrtPriceX96` after the swap (Q64.96).
     /// @return Impact, basis points.
     function poolImpactBps(uint256 sqrtBefore, uint256 sqrtAfter) internal pure returns (uint256) {
-        uint256 r = Math.mulDiv(sqrtAfter, 1e18, sqrtBefore);
-        uint256 ratio = Math.mulDiv(r, r, 1e18);
-        uint256 diff = ratio > 1e18 ? ratio - 1e18 : 1e18 - ratio;
-        return diff * MAX_BPS / 1e18;
+        bool up = sqrtAfter >= sqrtBefore;
+        Math.Rounding away = up ? Math.Rounding.Ceil : Math.Rounding.Floor;
+        uint256 r = Math.mulDiv(sqrtAfter, 1e18, sqrtBefore, away);
+        if (r > type(uint128).max) return type(uint256).max;
+        uint256 ratio = Math.mulDiv(r, r, 1e18, away);
+        return Math.mulDiv(up ? ratio - 1e18 : 1e18 - ratio, MAX_BPS, 1e18, Math.Rounding.Ceil);
     }
 
     /// @dev Per-field narrowing rule. `minTokenAgeBlocks` is a floor, so higher is tighter; for `allowlistOnly`

@@ -5,6 +5,7 @@ import {ERC20Mock} from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
 import {AgentFixture} from "./AgentFixture.sol";
 import {AgentAccount} from "../../src/agents/AgentAccount.sol";
 import {IAgentAccount} from "../../src/agents/interfaces/IAgentAccount.sol";
+import {IAgentPolicyRegistry} from "../../src/agents/interfaces/IAgentPolicyRegistry.sol";
 import {AgentPolicyLib} from "../../src/agents/AgentPolicyLib.sol";
 import {IAgentAccountFactory} from "../../src/agents/interfaces/IAgentAccountFactory.sol";
 import {
@@ -93,24 +94,24 @@ contract AgentOwnerTest is AgentFixture {
 
     function _setPolicy(Policy memory p) internal returns (uint256 id) {
         vm.prank(accountOwner);
-        id = account.setPolicy(p);
+        id = registry.setPolicy(address(account), p);
     }
 
     function _eta(uint256 id) internal view returns (uint40 eta) {
-        (, eta,,,) = account.queued(id);
+        (, eta,,,) = registry.queued(address(account), id);
     }
 
     // ---------------------------------------------------------------- views and ids
 
     function test_InitialViews() public view {
         assertEq(account.referrer(), referrer);
-        assertEq(account.periodSeconds(), 1 days);
-        assertEq(account.increaseDelay(), 1 hours);
-        assertEq(account.activeAgentCount(), 1);
-        assertFalse(account.retired(agentKey));
-        assertFalse(account.ownerPaused());
-        assertEq(account.epoch(), 0);
-        (uint8 kind, uint40 eta, uint64 ep,, bytes memory payload) = account.queued(1);
+        assertEq(registry.periodSeconds(address(account)), 1 days);
+        assertEq(registry.increaseDelay(address(account)), 1 hours);
+        assertEq(registry.activeAgentCount(address(account)), 1);
+        assertFalse(registry.retired(address(account), agentKey));
+        assertFalse(registry.ownerPaused(address(account)));
+        assertEq(registry.epoch(address(account)), 0);
+        (uint8 kind, uint40 eta, uint64 ep,, bytes memory payload) = registry.queued(address(account), 1);
         assertEq(kind, 0);
         assertEq(eta, 0);
         assertEq(ep, 0);
@@ -122,13 +123,13 @@ contract AgentOwnerTest is AgentFixture {
         p.maxTradeUsdc = 200e6;
         assertEq(_setPolicy(p), 1);
         vm.prank(accountOwner);
-        assertEq(account.addAgent(newKey, uint40(_now() + 30 days), P_BUY), 2);
-        (uint8 kind, uint40 eta, uint64 ep,, bytes memory payload) = account.queued(1);
+        assertEq(registry.addAgent(address(account), newKey, uint40(_now() + 30 days), P_BUY), 2);
+        (uint8 kind, uint40 eta, uint64 ep,, bytes memory payload) = registry.queued(address(account), 1);
         assertEq(kind, Q_POLICY);
         assertEq(eta, _now() + 1 hours);
         assertEq(ep, 0);
         _eq(abi.decode(payload, (Policy)), p);
-        (kind,,,,) = account.queued(2);
+        (kind,,,,) = registry.queued(address(account), 2);
         assertEq(kind, Q_ADD_AGENT);
     }
 
@@ -152,21 +153,21 @@ contract AgentOwnerTest is AgentFixture {
             if (f == 8) p.minTokenAgeBlocks += 1;
             if (f == 9) p.maxDeadlineSeconds -= 1;
             if (f == 10) p.allowlistOnly = true;
-            vm.expectEmit(address(acc));
-            emit IAgentAccount.PolicyApplied(p);
+            vm.expectEmit(address(registry));
+            emit IAgentPolicyRegistry.PolicyApplied(address(acc), p);
             vm.prank(accountOwner);
-            assertEq(acc.setPolicy(p), 0);
-            _eq(acc.policy(), p);
+            assertEq(registry.setPolicy(address(acc), p), 0);
+            _eq(registry.policy(address(acc)), p);
         }
     }
 
     function test_AgentNarrowingIsImmediate() public {
-        Agent memory before = account.agent(agentKey);
-        vm.expectEmit(address(account));
-        emit IAgentAccount.AgentActivated(agentKey, before.expiresAt - 1 days, P_BUY);
+        Agent memory before = registry.agent(address(account), agentKey);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.AgentActivated(address(account), agentKey, before.expiresAt - 1 days, P_BUY);
         vm.prank(accountOwner);
-        assertEq(account.setAgent(agentKey, before.expiresAt - 1 days, P_BUY), 0);
-        Agent memory a = account.agent(agentKey);
+        assertEq(registry.setAgent(address(account), agentKey, before.expiresAt - 1 days, P_BUY), 0);
+        Agent memory a = registry.agent(address(account), agentKey);
         assertTrue(a.active);
         assertEq(a.expiresAt, before.expiresAt - 1 days);
         assertEq(a.permissions, P_BUY);
@@ -174,31 +175,31 @@ contract AgentOwnerTest is AgentFixture {
 
     function test_SetAgentOnInactiveReverts() public {
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.AgentNotActive.selector);
-        account.setAgent(newKey, uint40(_now() + 1 days), P_BUY);
+        vm.expectRevert(IAgentPolicyRegistry.AgentNotActive.selector);
+        registry.setAgent(address(account), newKey, uint40(_now() + 1 days), P_BUY);
     }
 
     function test_RemoveTokenIsImmediateAddIsQueued() public {
         address token = makeAddr("token");
         vm.prank(accountOwner);
-        uint256 id = account.setTokenAllowed(token, true);
+        uint256 id = registry.setTokenAllowed(address(account), token, true);
         assertEq(id, 1);
-        assertFalse(account.tokenAllowed(token));
-        (uint8 kind,,,,) = account.queued(id);
+        assertFalse(registry.tokenAllowed(address(account), token));
+        (uint8 kind,,,,) = registry.queued(address(account), id);
         assertEq(kind, Q_ALLOW_TOKEN);
         _warp(_eta(id));
-        vm.expectEmit(address(account));
-        emit IAgentAccount.TokenAllowed(token, true);
-        account.executeQueued(id);
-        assertTrue(account.tokenAllowed(token));
-        vm.expectEmit(address(account));
-        emit IAgentAccount.TokenAllowed(token, false);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.TokenAllowed(address(account), token, true);
+        registry.executeQueued(address(account), id);
+        assertTrue(registry.tokenAllowed(address(account), token));
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.TokenAllowed(address(account), token, false);
         vm.prank(accountOwner);
-        assertEq(account.setTokenAllowed(token, false), 0);
-        assertFalse(account.tokenAllowed(token));
+        assertEq(registry.setTokenAllowed(address(account), token, false), 0);
+        assertFalse(registry.tokenAllowed(address(account), token));
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.ZeroAddress.selector);
-        account.setTokenAllowed(address(0), true);
+        vm.expectRevert(IAgentPolicyRegistry.ZeroAddress.selector);
+        registry.setTokenAllowed(address(account), address(0), true);
     }
 
     // ---------------------------------------------------------------- widening is delayed
@@ -207,28 +208,28 @@ contract AgentOwnerTest is AgentFixture {
         Policy memory p = _defaultPolicy();
         p.maxTradeUsdc = 200e6;
         uint40 eta = uint40(_now() + 1 hours);
-        vm.expectEmit(address(account));
-        emit IAgentAccount.PolicyQueued(1, eta, p);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.PolicyQueued(address(account), 1, eta, p);
         uint256 id = _setPolicy(p);
-        _eq(account.policy(), _defaultPolicy());
+        _eq(registry.policy(address(account)), _defaultPolicy());
 
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.TooEarly.selector, eta));
-        account.executeQueued(id);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.TooEarly.selector, eta));
+        registry.executeQueued(address(account), id);
         _warp(eta - 1);
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.TooEarly.selector, eta));
-        account.executeQueued(id);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.TooEarly.selector, eta));
+        registry.executeQueued(address(account), id);
 
         _warp(eta);
-        vm.expectEmit(address(account));
-        emit IAgentAccount.PolicyApplied(p);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.PolicyApplied(address(account), p);
         vm.prank(stranger);
-        account.executeQueued(id);
-        _eq(account.policy(), p);
+        registry.executeQueued(address(account), id);
+        _eq(registry.policy(address(account)), p);
         // Executed items are gone.
-        (uint8 kind,,,,) = account.queued(id);
+        (uint8 kind,,,,) = registry.queued(address(account), id);
         assertEq(kind, 0);
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.UnknownQueued.selector, id));
-        account.executeQueued(id);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.UnknownQueued.selector, id));
+        registry.executeQueued(address(account), id);
     }
 
     function test_QueuedItemExpiresSevenDaysAfterEta() public {
@@ -239,85 +240,85 @@ contract AgentOwnerTest is AgentFixture {
         uint256 id2 = _setPolicy(p);
         uint40 eta = _eta(id1);
         _warp(eta + QUEUE_TTL + 1);
-        vm.expectRevert(IAgentAccount.QueuedExpired.selector);
-        account.executeQueued(id1);
+        vm.expectRevert(IAgentPolicyRegistry.QueuedExpired.selector);
+        registry.executeQueued(address(account), id1);
         // The last executable second is ETA + 7 days.
         _warp(eta + QUEUE_TTL);
-        account.executeQueued(id2);
-        assertEq(account.policy().maxTradeUsdc, 300e6);
+        registry.executeQueued(address(account), id2);
+        assertEq(registry.policy(address(account)).maxTradeUsdc, 300e6);
     }
 
     function test_AgentWideningQueues() public {
-        Agent memory before = account.agent(agentKey);
+        Agent memory before = registry.agent(address(account), agentKey);
         vm.prank(accountOwner);
-        account.setAgent(agentKey, before.expiresAt, P_BUY);
+        registry.setAgent(address(account), agentKey, before.expiresAt, P_BUY);
         // Adding a permission back is a widening.
         uint40 eta = uint40(_now() + 1 hours);
-        vm.expectEmit(address(account));
-        emit IAgentAccount.AgentQueued(1, agentKey, before.expiresAt + 1, P_BUY | P_SELL, eta);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.AgentQueued(address(account), 1, agentKey, before.expiresAt + 1, P_BUY | P_SELL, eta);
         vm.prank(accountOwner);
-        uint256 id = account.setAgent(agentKey, before.expiresAt + 1, P_BUY | P_SELL);
+        uint256 id = registry.setAgent(address(account), agentKey, before.expiresAt + 1, P_BUY | P_SELL);
         assertEq(id, 1);
-        assertEq(account.agent(agentKey).permissions, P_BUY);
-        (uint8 kind,,,,) = account.queued(id);
+        assertEq(registry.agent(address(account), agentKey).permissions, P_BUY);
+        (uint8 kind,,,,) = registry.queued(address(account), id);
         assertEq(kind, Q_SET_AGENT);
         _warp(eta);
-        vm.expectEmit(address(account));
-        emit IAgentAccount.AgentActivated(agentKey, before.expiresAt + 1, P_BUY | P_SELL);
-        account.executeQueued(id);
-        assertEq(account.agent(agentKey).permissions, P_BUY | P_SELL);
-        assertEq(account.agent(agentKey).expiresAt, before.expiresAt + 1);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.AgentActivated(address(account), agentKey, before.expiresAt + 1, P_BUY | P_SELL);
+        registry.executeQueued(address(account), id);
+        assertEq(registry.agent(address(account), agentKey).permissions, P_BUY | P_SELL);
+        assertEq(registry.agent(address(account), agentKey).expiresAt, before.expiresAt + 1);
     }
 
     function test_SetAgentTighteningAfterQueueMakesItStale() public {
-        Agent memory before = account.agent(agentKey);
+        Agent memory before = registry.agent(address(account), agentKey);
         vm.prank(accountOwner);
-        account.setAgent(agentKey, before.expiresAt, P_BUY);
+        registry.setAgent(address(account), agentKey, before.expiresAt, P_BUY);
         vm.prank(accountOwner);
-        uint256 id = account.setAgent(agentKey, before.expiresAt, P_ALL);
+        uint256 id = registry.setAgent(address(account), agentKey, before.expiresAt, P_ALL);
         vm.prank(accountOwner);
-        account.setAgent(agentKey, before.expiresAt - 1, P_BUY);
+        registry.setAgent(address(account), agentKey, before.expiresAt - 1, P_BUY);
         _warp(_eta(id));
-        vm.expectRevert(IAgentAccount.StaleQueued.selector);
-        account.executeQueued(id);
-        assertEq(account.agent(agentKey).permissions, P_BUY);
+        vm.expectRevert(IAgentPolicyRegistry.StaleQueued.selector);
+        registry.executeQueued(address(account), id);
+        assertEq(registry.agent(address(account), agentKey).permissions, P_BUY);
     }
 
     function test_AddAgentQueuesAndActivatesAfterEta() public {
         uint40 exp = uint40(_now() + 30 days);
         vm.prank(accountOwner);
-        uint256 id = account.addAgent(newKey, exp, P_BUY);
-        assertFalse(account.agent(newKey).active);
-        assertEq(account.activeAgentCount(), 1);
+        uint256 id = registry.addAgent(address(account), newKey, exp, P_BUY);
+        assertFalse(registry.agent(address(account), newKey).active);
+        assertEq(registry.activeAgentCount(address(account)), 1);
         _warp(_eta(id));
-        vm.expectEmit(address(account));
-        emit IAgentAccount.AgentActivated(newKey, exp, P_BUY);
-        account.executeQueued(id);
-        assertTrue(account.agent(newKey).active);
-        assertEq(account.activeAgentCount(), 2);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.AgentActivated(address(account), newKey, exp, P_BUY);
+        registry.executeQueued(address(account), id);
+        assertTrue(registry.agent(address(account), newKey).active);
+        assertEq(registry.activeAgentCount(address(account)), 2);
     }
 
     function test_AddAgentChecksTerms() public {
         vm.startPrank(accountOwner);
-        vm.expectRevert(IAgentAccount.InvalidAgent.selector);
-        account.addAgent(accountOwner, uint40(_now() + 1 days), P_BUY);
-        vm.expectRevert(IAgentAccount.InvalidAgent.selector);
-        account.addAgent(address(account), uint40(_now() + 1 days), P_BUY);
-        vm.expectRevert(IAgentAccount.AgentExpiryOutOfRange.selector);
-        account.addAgent(newKey, uint40(_now() + MAX_AGENT_TTL + 1), P_BUY);
-        vm.expectRevert(IAgentAccount.InvalidPermissions.selector);
-        account.addAgent(newKey, uint40(_now() + 1 days), 0);
-        vm.expectRevert(IAgentAccount.AgentAlreadyActive.selector);
-        account.addAgent(agentKey, uint40(_now() + 1 days), P_BUY);
+        vm.expectRevert(IAgentPolicyRegistry.InvalidAgent.selector);
+        registry.addAgent(address(account), accountOwner, uint40(_now() + 1 days), P_BUY);
+        vm.expectRevert(IAgentPolicyRegistry.InvalidAgent.selector);
+        registry.addAgent(address(account), address(account), uint40(_now() + 1 days), P_BUY);
+        vm.expectRevert(IAgentPolicyRegistry.AgentExpiryOutOfRange.selector);
+        registry.addAgent(address(account), newKey, uint40(_now() + MAX_AGENT_TTL + 1), P_BUY);
+        vm.expectRevert(IAgentPolicyRegistry.InvalidPermissions.selector);
+        registry.addAgent(address(account), newKey, uint40(_now() + 1 days), 0);
+        vm.expectRevert(IAgentPolicyRegistry.AgentAlreadyActive.selector);
+        registry.addAgent(address(account), agentKey, uint40(_now() + 1 days), P_BUY);
         vm.stopPrank();
     }
 
     function test_AddAgentExpiryCheckedAtExecution() public {
         vm.prank(accountOwner);
-        uint256 id = account.addAgent(newKey, uint40(_now() + 2 hours), P_BUY);
+        uint256 id = registry.addAgent(address(account), newKey, uint40(_now() + 2 hours), P_BUY);
         _warp(_now() + 2 hours);
-        vm.expectRevert(IAgentAccount.AgentExpiryOutOfRange.selector);
-        account.executeQueued(id);
+        vm.expectRevert(IAgentPolicyRegistry.AgentExpiryOutOfRange.selector);
+        registry.executeQueued(address(account), id);
     }
 
     function test_PauseAgentsCancelsQueuedItems() public {
@@ -325,35 +326,35 @@ contract AgentOwnerTest is AgentFixture {
         p.maxTradeUsdc = 200e6;
         uint256 idPolicy = _setPolicy(p);
         vm.prank(accountOwner);
-        uint256 idAgent = account.addAgent(newKey, uint40(_now() + 30 days), P_BUY);
+        uint256 idAgent = registry.addAgent(address(account), newKey, uint40(_now() + 30 days), P_BUY);
 
-        vm.expectEmit(address(account));
-        emit IAgentAccount.AgentsPaused(true);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.AgentsPaused(address(account), true);
         vm.prank(accountOwner);
-        account.pauseAgents(true);
-        assertTrue(account.ownerPaused());
-        assertEq(account.epoch(), 1);
+        registry.pauseAgents(address(account), true);
+        assertTrue(registry.ownerPaused(address(account)));
+        assertEq(registry.epoch(address(account)), 1);
 
         _warp(_eta(idAgent));
-        vm.expectEmit(address(account));
-        emit IAgentAccount.QueuedCancelled(idPolicy);
-        account.executeQueued(idPolicy);
-        vm.expectEmit(address(account));
-        emit IAgentAccount.QueuedCancelled(idAgent);
-        account.executeQueued(idAgent);
-        _eq(account.policy(), _defaultPolicy());
-        assertFalse(account.agent(newKey).active);
-        (uint8 kind,,,,) = account.queued(idPolicy);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.QueuedCancelled(address(account), idPolicy);
+        registry.executeQueued(address(account), idPolicy);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.QueuedCancelled(address(account), idAgent);
+        registry.executeQueued(address(account), idAgent);
+        _eq(registry.policy(address(account)), _defaultPolicy());
+        assertFalse(registry.agent(address(account), newKey).active);
+        (uint8 kind,,,,) = registry.queued(address(account), idPolicy);
         assertEq(kind, 0);
 
         // Unpausing does not revive them; new items queue in the new epoch.
         vm.prank(accountOwner);
-        account.pauseAgents(false);
-        assertEq(account.epoch(), 1);
+        registry.pauseAgents(address(account), false);
+        assertEq(registry.epoch(address(account)), 1);
         uint256 id3 = _setPolicy(p);
         _warp(_eta(id3));
-        account.executeQueued(id3);
-        assertEq(account.policy().maxTradeUsdc, 200e6);
+        registry.executeQueued(address(account), id3);
+        assertEq(registry.policy(address(account)).maxTradeUsdc, 200e6);
     }
 
     function test_TighteningAfterQueueSurvivesExecution() public {
@@ -369,8 +370,8 @@ contract AgentOwnerTest is AgentFixture {
         assertEq(_setPolicy(tight), 0);
 
         _warp(_eta(id));
-        account.executeQueued(id);
-        Policy memory got = account.policy();
+        registry.executeQueued(address(account), id);
+        Policy memory got = registry.policy(address(account));
         assertEq(got.maxTradeUsdc, 500e6, "untouched widening applies");
         assertEq(got.periodSpendCap, 300e6, "later tightening survives");
         assertEq(got.maxPriceImpactBps, 1_000);
@@ -383,267 +384,267 @@ contract AgentOwnerTest is AgentFixture {
         p.periodSpendCap = 1_000e6; // wider
         Policy memory now_ = _defaultPolicy();
         now_.maxTradeUsdc = 50e6;
-        vm.expectEmit(address(account));
-        emit IAgentAccount.PolicyApplied(now_);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.PolicyApplied(address(account), now_);
         uint256 id = _setPolicy(p);
         assertEq(id, 1);
-        _eq(account.policy(), now_);
-        (,,,, bytes memory payload) = account.queued(id);
+        _eq(registry.policy(address(account)), now_);
+        (,,,, bytes memory payload) = registry.queued(address(account), id);
         _eq(abi.decode(payload, (Policy)), p);
         _warp(_eta(id));
-        account.executeQueued(id);
-        _eq(account.policy(), p);
+        registry.executeQueued(address(account), id);
+        _eq(registry.policy(address(account)), p);
     }
 
     function test_PolicyAboveCeilingRevertsAtQueue() public {
         Policy memory p = _defaultPolicy();
         p.maxTradeUsdc = 1_000e6 + 1;
         vm.prank(accountOwner);
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.BetaCeiling.selector, uint8(0)));
-        account.setPolicy(p);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.BetaCeiling.selector, uint8(0)));
+        registry.setPolicy(address(account), p);
         p = _defaultPolicy();
         p.maxDeadlineSeconds = 0;
         vm.prank(accountOwner);
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.InvalidPolicy.selector, uint8(9)));
-        account.setPolicy(p);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.InvalidPolicy.selector, uint8(9)));
+        registry.setPolicy(address(account), p);
     }
 
     function test_NinthAgentFailsAtExecution() public {
         uint256[] memory ids = new uint256[](8);
         vm.startPrank(accountOwner);
         for (uint256 i = 0; i < 8; i++) {
-            ids[i] = account.addAgent(address(uint160(0xA000 + i)), uint40(_now() + 30 days), P_BUY);
+            ids[i] = registry.addAgent(address(account), address(uint160(0xA000 + i)), uint40(_now() + 30 days), P_BUY);
         }
         vm.stopPrank();
         _warp(_eta(ids[0]));
         for (uint256 i = 0; i < 7; i++) {
-            account.executeQueued(ids[i]);
+            registry.executeQueued(address(account), ids[i]);
         }
-        assertEq(account.activeAgentCount(), 8);
-        vm.expectRevert(IAgentAccount.TooManyAgents.selector);
-        account.executeQueued(ids[7]);
+        assertEq(registry.activeAgentCount(address(account)), 8);
+        vm.expectRevert(IAgentPolicyRegistry.TooManyAgents.selector);
+        registry.executeQueued(address(account), ids[7]);
         // A revocation frees a slot.
         vm.prank(accountOwner);
-        account.revokeAgent(agentKey);
-        account.executeQueued(ids[7]);
-        assertEq(account.activeAgentCount(), 8);
+        registry.revokeAgent(address(account), agentKey);
+        registry.executeQueued(address(account), ids[7]);
+        assertEq(registry.activeAgentCount(address(account)), 8);
     }
 
     function test_RevokedAgentCannotBeReAdded() public {
-        Agent memory a = account.agent(agentKey);
-        vm.expectEmit(address(account));
-        emit IAgentAccount.AgentRevoked(agentKey, a.expiresAt, a.permissions);
+        Agent memory a = registry.agent(address(account), agentKey);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.AgentRevoked(address(account), agentKey, a.expiresAt, a.permissions);
         vm.prank(accountOwner);
-        account.revokeAgent(agentKey);
-        assertTrue(account.retired(agentKey));
-        assertFalse(account.agent(agentKey).active);
-        assertEq(account.activeAgentCount(), 0);
+        registry.revokeAgent(address(account), agentKey);
+        assertTrue(registry.retired(address(account), agentKey));
+        assertFalse(registry.agent(address(account), agentKey).active);
+        assertEq(registry.activeAgentCount(address(account)), 0);
 
         vm.startPrank(accountOwner);
-        vm.expectRevert(IAgentAccount.AgentRetired.selector);
-        account.addAgent(agentKey, uint40(_now() + 1 days), P_BUY);
-        vm.expectRevert(IAgentAccount.AgentRetired.selector);
-        account.revokeAgent(agentKey);
+        vm.expectRevert(IAgentPolicyRegistry.AgentRetired.selector);
+        registry.addAgent(address(account), agentKey, uint40(_now() + 1 days), P_BUY);
+        vm.expectRevert(IAgentPolicyRegistry.AgentRetired.selector);
+        registry.revokeAgent(address(account), agentKey);
         // Any address can be retired pre-emptively, active or not.
-        account.revokeAgent(stranger);
-        assertTrue(account.retired(stranger));
-        assertEq(account.activeAgentCount(), 0);
-        vm.expectRevert(IAgentAccount.AgentRetired.selector);
-        account.addAgent(stranger, uint40(_now() + 1 days), P_BUY);
+        registry.revokeAgent(address(account), stranger);
+        assertTrue(registry.retired(address(account), stranger));
+        assertEq(registry.activeAgentCount(address(account)), 0);
+        vm.expectRevert(IAgentPolicyRegistry.AgentRetired.selector);
+        registry.addAgent(address(account), stranger, uint40(_now() + 1 days), P_BUY);
         vm.stopPrank();
     }
 
     function test_RevokedAgentCannotBeReAddedViaQueuedAdd() public {
         vm.startPrank(accountOwner);
-        uint256 id1 = account.addAgent(newKey, uint40(_now() + 30 days), P_BUY);
-        uint256 id2 = account.addAgent(newKey, uint40(_now() + 30 days), P_ALL);
+        uint256 id1 = registry.addAgent(address(account), newKey, uint40(_now() + 30 days), P_BUY);
+        uint256 id2 = registry.addAgent(address(account), newKey, uint40(_now() + 30 days), P_ALL);
         vm.stopPrank();
         _warp(_eta(id1));
-        account.executeQueued(id1);
+        registry.executeQueued(address(account), id1);
         vm.prank(accountOwner);
-        account.revokeAgent(newKey);
-        vm.expectRevert(IAgentAccount.AgentRetired.selector);
-        account.executeQueued(id2);
-        assertFalse(account.agent(newKey).active);
+        registry.revokeAgent(address(account), newKey);
+        vm.expectRevert(IAgentPolicyRegistry.AgentRetired.selector);
+        registry.executeQueued(address(account), id2);
+        assertFalse(registry.agent(address(account), newKey).active);
     }
 
     function test_QueuedSetAgentDiesWithRevoke() public {
-        Agent memory a = account.agent(agentKey);
+        Agent memory a = registry.agent(address(account), agentKey);
         vm.prank(accountOwner);
-        uint256 id = account.setAgent(agentKey, a.expiresAt + 1 days, P_ALL);
+        uint256 id = registry.setAgent(address(account), agentKey, a.expiresAt + 1 days, P_ALL);
         vm.prank(accountOwner);
-        account.revokeAgent(agentKey);
+        registry.revokeAgent(address(account), agentKey);
         _warp(_eta(id));
-        vm.expectRevert(IAgentAccount.StaleQueued.selector);
-        account.executeQueued(id);
+        vm.expectRevert(IAgentPolicyRegistry.StaleQueued.selector);
+        registry.executeQueued(address(account), id);
     }
 
     function test_RotationRevokesImmediatelyAndQueuesNewKey() public {
         uint40 exp = uint40(_now() + 30 days);
         vm.prank(accountOwner);
-        uint256 id = account.rotateAgent(agentKey, newKey, exp, P_BUY);
+        uint256 id = registry.rotateAgent(address(account), agentKey, newKey, exp, P_BUY);
         assertEq(id, 1);
-        assertTrue(account.retired(agentKey));
-        assertFalse(account.agent(agentKey).active);
-        assertFalse(account.agent(newKey).active);
-        assertEq(account.activeAgentCount(), 0);
+        assertTrue(registry.retired(address(account), agentKey));
+        assertFalse(registry.agent(address(account), agentKey).active);
+        assertFalse(registry.agent(address(account), newKey).active);
+        assertEq(registry.activeAgentCount(address(account)), 0);
         _warp(_eta(id));
-        account.executeQueued(id);
-        assertTrue(account.agent(newKey).active);
-        assertEq(account.activeAgentCount(), 1);
+        registry.executeQueued(address(account), id);
+        assertTrue(registry.agent(address(account), newKey).active);
+        assertEq(registry.activeAgentCount(address(account)), 1);
 
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.AgentRetired.selector);
-        account.rotateAgent(agentKey, makeAddr("x"), exp, P_BUY);
+        vm.expectRevert(IAgentPolicyRegistry.AgentRetired.selector);
+        registry.rotateAgent(address(account), agentKey, makeAddr("x"), exp, P_BUY);
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.AgentRetired.selector);
-        account.rotateAgent(newKey, newKey, exp, P_BUY);
+        vm.expectRevert(IAgentPolicyRegistry.AgentRetired.selector);
+        registry.rotateAgent(address(account), newKey, newKey, exp, P_BUY);
     }
 
     function test_CancelQueued() public {
         Policy memory p = _defaultPolicy();
         p.maxTradeUsdc = 200e6;
         uint256 id = _setPolicy(p);
-        vm.expectEmit(address(account));
-        emit IAgentAccount.QueuedCancelled(id);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.QueuedCancelled(address(account), id);
         vm.prank(accountOwner);
-        account.cancelQueued(id);
+        registry.cancelQueued(address(account), id);
         _warp(_now() + 1 hours);
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.UnknownQueued.selector, id));
-        account.executeQueued(id);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.UnknownQueued.selector, id));
+        registry.executeQueued(address(account), id);
         vm.prank(accountOwner);
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.UnknownQueued.selector, id));
-        account.cancelQueued(id);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.UnknownQueued.selector, id));
+        registry.cancelQueued(address(account), id);
     }
 
     // ---------------------------------------------------------------- ownership
 
     function test_OnlyQueuedNewOwnerAcceptsAndAcceptingCancelsOldQueue() public {
         uint40 eta = uint40(_now() + 1 hours);
-        vm.expectEmit(address(account));
-        emit IAgentAccount.OwnershipQueued(1, newOwner, eta);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.OwnershipQueued(address(account), 1, newOwner, eta);
         vm.prank(accountOwner);
-        uint256 idOwner = account.transferOwnership(newOwner);
+        uint256 idOwner = registry.transferOwnership(address(account), newOwner);
         Policy memory p = _defaultPolicy();
         p.maxTradeUsdc = 200e6;
         uint256 idPolicy = _setPolicy(p);
-        (uint8 kind,,,,) = account.queued(idOwner);
+        (uint8 kind,,,,) = registry.queued(address(account), idOwner);
         assertEq(kind, Q_OWNER);
 
         vm.prank(newOwner);
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.TooEarly.selector, eta));
-        account.acceptOwnership(idOwner);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.TooEarly.selector, eta));
+        registry.acceptOwnership(address(account), idOwner);
 
         _warp(eta);
         vm.prank(stranger);
-        vm.expectRevert(IAgentAccount.NotPendingOwner.selector);
-        account.acceptOwnership(idOwner);
+        vm.expectRevert(IAgentPolicyRegistry.NotPendingOwner.selector);
+        registry.acceptOwnership(address(account), idOwner);
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.NotPendingOwner.selector);
-        account.acceptOwnership(idOwner);
+        vm.expectRevert(IAgentPolicyRegistry.NotPendingOwner.selector);
+        registry.acceptOwnership(address(account), idOwner);
         vm.prank(newOwner);
-        vm.expectRevert(IAgentAccount.NotPendingOwner.selector);
-        account.acceptOwnership(idPolicy);
-        vm.expectRevert(IAgentAccount.AcceptRequired.selector);
-        account.executeQueued(idOwner);
+        vm.expectRevert(IAgentPolicyRegistry.NotPendingOwner.selector);
+        registry.acceptOwnership(address(account), idPolicy);
+        vm.expectRevert(IAgentPolicyRegistry.AcceptRequired.selector);
+        registry.executeQueued(address(account), idOwner);
 
-        vm.expectEmit(address(account));
-        emit IAgentAccount.AccountOwnerChanged(accountOwner, newOwner);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.AccountOwnerChanged(address(account), accountOwner, newOwner);
         vm.prank(newOwner);
-        account.acceptOwnership(idOwner);
+        registry.acceptOwnership(address(account), idOwner);
         assertEq(account.owner(), newOwner);
-        assertEq(account.epoch(), 1);
+        assertEq(registry.epoch(address(account)), 1);
 
-        vm.expectEmit(address(account));
-        emit IAgentAccount.QueuedCancelled(idPolicy);
-        account.executeQueued(idPolicy);
-        _eq(account.policy(), _defaultPolicy());
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.QueuedCancelled(address(account), idPolicy);
+        registry.executeQueued(address(account), idPolicy);
+        _eq(registry.policy(address(account)), _defaultPolicy());
 
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.NotOwner.selector);
-        account.pauseAgents(true);
+        vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+        registry.pauseAgents(address(account), true);
         vm.prank(newOwner);
-        account.pauseAgents(true);
+        registry.pauseAgents(address(account), true);
     }
 
     function test_AcceptOwnershipExpires() public {
         vm.prank(accountOwner);
-        uint256 id = account.transferOwnership(newOwner);
+        uint256 id = registry.transferOwnership(address(account), newOwner);
         _warp(_eta(id) + QUEUE_TTL + 1);
         vm.prank(newOwner);
-        vm.expectRevert(IAgentAccount.QueuedExpired.selector);
-        account.acceptOwnership(id);
+        vm.expectRevert(IAgentPolicyRegistry.QueuedExpired.selector);
+        registry.acceptOwnership(address(account), id);
     }
 
     function test_AcceptOwnershipAfterPauseIsCancelled() public {
         vm.prank(accountOwner);
-        uint256 id = account.transferOwnership(newOwner);
+        uint256 id = registry.transferOwnership(address(account), newOwner);
         vm.prank(accountOwner);
-        account.pauseAgents(true);
+        registry.pauseAgents(address(account), true);
         _warp(_eta(id));
         vm.prank(newOwner);
-        vm.expectRevert(IAgentAccount.StaleQueued.selector);
-        account.acceptOwnership(id);
+        vm.expectRevert(IAgentPolicyRegistry.StaleQueued.selector);
+        registry.acceptOwnership(address(account), id);
         assertEq(account.owner(), accountOwner);
     }
 
     function test_AcceptingAgentLosesAgentRole() public {
         vm.prank(accountOwner);
-        uint256 id = account.transferOwnership(agentKey);
+        uint256 id = registry.transferOwnership(address(account), agentKey);
         _warp(_eta(id));
         vm.prank(agentKey);
-        account.acceptOwnership(id);
+        registry.acceptOwnership(address(account), id);
         assertEq(account.owner(), agentKey);
-        assertFalse(account.agent(agentKey).active);
-        assertTrue(account.retired(agentKey));
-        assertEq(account.activeAgentCount(), 0);
+        assertFalse(registry.agent(address(account), agentKey).active);
+        assertTrue(registry.retired(address(account), agentKey));
+        assertEq(registry.activeAgentCount(address(account)), 0);
     }
 
     function test_TransferOwnershipBadTargets() public {
         vm.startPrank(accountOwner);
-        vm.expectRevert(IAgentAccount.InvalidOwner.selector);
-        account.transferOwnership(address(0));
-        vm.expectRevert(IAgentAccount.InvalidOwner.selector);
-        account.transferOwnership(address(account));
-        vm.expectRevert(IAgentAccount.InvalidOwner.selector);
-        account.transferOwnership(accountOwner);
+        vm.expectRevert(IAgentPolicyRegistry.InvalidOwner.selector);
+        registry.transferOwnership(address(account), address(0));
+        vm.expectRevert(IAgentPolicyRegistry.InvalidOwner.selector);
+        registry.transferOwnership(address(account), address(account));
+        vm.expectRevert(IAgentPolicyRegistry.InvalidOwner.selector);
+        registry.transferOwnership(address(account), accountOwner);
         vm.stopPrank();
     }
 
     // ---------------------------------------------------------------- delay
 
     function test_DelayRaiseIsImmediateLowerIsQueued() public {
-        vm.expectEmit(address(account));
-        emit IAgentAccount.IncreaseDelaySet(2 hours);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.IncreaseDelaySet(address(account), 2 hours);
         vm.prank(accountOwner);
-        assertEq(account.setIncreaseDelay(2 hours), 0);
-        assertEq(account.increaseDelay(), 2 hours);
+        assertEq(registry.setIncreaseDelay(address(account), 2 hours), 0);
+        assertEq(registry.increaseDelay(address(account)), 2 hours);
 
         vm.prank(accountOwner);
-        uint256 id = account.setIncreaseDelay(30 minutes);
+        uint256 id = registry.setIncreaseDelay(address(account), 30 minutes);
         assertEq(id, 1);
-        assertEq(account.increaseDelay(), 2 hours);
-        (uint8 kind, uint40 eta,,,) = account.queued(id);
+        assertEq(registry.increaseDelay(address(account)), 2 hours);
+        (uint8 kind, uint40 eta,,,) = registry.queued(address(account), id);
         assertEq(kind, Q_DELAY);
         assertEq(eta, _now() + 2 hours, "lowering waits the current delay");
         _warp(eta);
-        account.executeQueued(id);
-        assertEq(account.increaseDelay(), 30 minutes);
+        registry.executeQueued(address(account), id);
+        assertEq(registry.increaseDelay(address(account)), 30 minutes);
 
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.DelayOutOfRange.selector);
-        account.setIncreaseDelay(uint32(MAX_DELAY + 1));
+        vm.expectRevert(IAgentPolicyRegistry.DelayOutOfRange.selector);
+        registry.setIncreaseDelay(address(account), uint32(MAX_DELAY + 1));
     }
 
     function test_DelayRaiseAfterQueuedLowerSurvives() public {
         vm.prank(accountOwner);
-        uint256 id = account.setIncreaseDelay(0);
+        uint256 id = registry.setIncreaseDelay(address(account), 0);
         vm.prank(accountOwner);
-        account.setIncreaseDelay(3 days);
+        registry.setIncreaseDelay(address(account), 3 days);
         _warp(_eta(id));
-        vm.expectRevert(IAgentAccount.StaleQueued.selector);
-        account.executeQueued(id);
-        assertEq(account.increaseDelay(), 3 days);
+        vm.expectRevert(IAgentPolicyRegistry.StaleQueued.selector);
+        registry.executeQueued(address(account), id);
+        assertEq(registry.increaseDelay(address(account)), 3 days);
     }
 
     function test_ZeroDelayExecutesInTheSameBlock() public {
@@ -653,15 +654,15 @@ contract AgentOwnerTest is AgentFixture {
         Policy memory p = _defaultPolicy();
         p.maxTradeUsdc = 200e6;
         vm.prank(accountOwner);
-        uint256 id = acc.setPolicy(p);
-        (, uint40 eta,,,) = acc.queued(id);
+        uint256 id = registry.setPolicy(address(acc), p);
+        (, uint40 eta,,,) = registry.queued(address(acc), id);
         assertEq(eta, _now());
-        acc.executeQueued(id);
-        assertEq(acc.policy().maxTradeUsdc, 200e6);
+        registry.executeQueued(address(acc), id);
+        assertEq(registry.policy(address(acc)).maxTradeUsdc, 200e6);
         vm.prank(accountOwner);
-        id = acc.addAgent(newKey, uint40(_now() + 1 days), P_BUY);
-        acc.executeQueued(id);
-        assertTrue(acc.agent(newKey).active);
+        id = registry.addAgent(address(acc), newKey, uint40(_now() + 1 days), P_BUY);
+        registry.executeQueued(address(acc), id);
+        assertTrue(registry.agent(address(acc), newKey).active);
     }
 
     // ---------------------------------------------------------------- withdrawals
@@ -724,7 +725,7 @@ contract AgentOwnerTest is AgentFixture {
         vm.prank(agentGuardian);
         agentFactory.guardianPause();
         vm.prank(accountOwner);
-        account.pauseAgents(true);
+        registry.pauseAgents(address(account), true);
         vm.prank(accountOwner);
         account.withdraw(address(0), 1e18);
         assertEq(address(account).balance, 0);
@@ -754,26 +755,26 @@ contract AgentOwnerTest is AgentFixture {
         Policy memory p = _defaultPolicy();
         for (uint256 i = 0; i < callers.length; i++) {
             vm.startPrank(callers[i]);
-            vm.expectRevert(IAgentAccount.NotOwner.selector);
-            account.addAgent(newKey, exp, P_BUY);
-            vm.expectRevert(IAgentAccount.NotOwner.selector);
-            account.setAgent(agentKey, exp, P_BUY);
-            vm.expectRevert(IAgentAccount.NotOwner.selector);
-            account.revokeAgent(agentKey);
-            vm.expectRevert(IAgentAccount.NotOwner.selector);
-            account.rotateAgent(agentKey, newKey, exp, P_BUY);
-            vm.expectRevert(IAgentAccount.NotOwner.selector);
-            account.setPolicy(p);
-            vm.expectRevert(IAgentAccount.NotOwner.selector);
-            account.setTokenAllowed(stranger, false);
-            vm.expectRevert(IAgentAccount.NotOwner.selector);
-            account.setIncreaseDelay(2 hours);
-            vm.expectRevert(IAgentAccount.NotOwner.selector);
-            account.transferOwnership(callers[i]);
-            vm.expectRevert(IAgentAccount.NotOwner.selector);
-            account.cancelQueued(1);
-            vm.expectRevert(IAgentAccount.NotOwner.selector);
-            account.pauseAgents(true);
+            vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+            registry.addAgent(address(account), newKey, exp, P_BUY);
+            vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+            registry.setAgent(address(account), agentKey, exp, P_BUY);
+            vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+            registry.revokeAgent(address(account), agentKey);
+            vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+            registry.rotateAgent(address(account), agentKey, newKey, exp, P_BUY);
+            vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+            registry.setPolicy(address(account), p);
+            vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+            registry.setTokenAllowed(address(account), stranger, false);
+            vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+            registry.setIncreaseDelay(address(account), 2 hours);
+            vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+            registry.transferOwnership(address(account), callers[i]);
+            vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+            registry.cancelQueued(address(account), 1);
+            vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+            registry.pauseAgents(address(account), true);
             vm.expectRevert(IAgentAccount.NotOwner.selector);
             account.withdraw(address(0), 0);
             vm.expectRevert(IAgentAccount.NotOwner.selector);
@@ -795,67 +796,67 @@ contract AgentOwnerTest is AgentFixture {
         p.maxTradeUsdc = 100e6;
         uint256 id2 = _setPolicy(p);
         _warp(_eta(id2));
-        account.executeQueued(id2);
-        assertEq(account.policy().maxTradeUsdc, 100e6);
-        account.executeQueued(id1);
-        assertEq(account.policy().maxTradeUsdc, 100e6, "old widening must not return");
+        registry.executeQueued(address(account), id2);
+        assertEq(registry.policy(address(account)).maxTradeUsdc, 100e6);
+        registry.executeQueued(address(account), id1);
+        assertEq(registry.policy(address(account)).maxTradeUsdc, 100e6, "old widening must not return");
     }
 
     function test_SetAgentABAWideningIsStale() public {
-        uint40 e = account.agent(agentKey).expiresAt;
+        uint40 e = registry.agent(address(account), agentKey).expiresAt;
         vm.startPrank(accountOwner);
-        uint256 id1 = account.setAgent(agentKey, e + 10 days, P_ALL);
-        assertEq(account.setAgent(agentKey, e - 1 days, P_ALL), 0);
-        uint256 id2 = account.setAgent(agentKey, e, P_ALL);
+        uint256 id1 = registry.setAgent(address(account), agentKey, e + 10 days, P_ALL);
+        assertEq(registry.setAgent(address(account), agentKey, e - 1 days, P_ALL), 0);
+        uint256 id2 = registry.setAgent(address(account), agentKey, e, P_ALL);
         vm.stopPrank();
         _warp(_eta(id2));
-        account.executeQueued(id2);
-        assertEq(account.agent(agentKey).expiresAt, e);
-        vm.expectRevert(IAgentAccount.StaleQueued.selector);
-        account.executeQueued(id1);
-        assertEq(account.agent(agentKey).expiresAt, e);
+        registry.executeQueued(address(account), id2);
+        assertEq(registry.agent(address(account), agentKey).expiresAt, e);
+        vm.expectRevert(IAgentPolicyRegistry.StaleQueued.selector);
+        registry.executeQueued(address(account), id1);
+        assertEq(registry.agent(address(account), agentKey).expiresAt, e);
     }
 
     function test_DelayABALoweringIsStale() public {
         vm.startPrank(accountOwner);
-        uint256 id1 = account.setIncreaseDelay(0);
-        account.setIncreaseDelay(2 hours);
-        uint256 id2 = account.setIncreaseDelay(1 hours);
+        uint256 id1 = registry.setIncreaseDelay(address(account), 0);
+        registry.setIncreaseDelay(address(account), 2 hours);
+        uint256 id2 = registry.setIncreaseDelay(address(account), 1 hours);
         vm.stopPrank();
         _warp(_eta(id2));
-        account.executeQueued(id2);
-        assertEq(account.increaseDelay(), 1 hours);
-        vm.expectRevert(IAgentAccount.StaleQueued.selector);
-        account.executeQueued(id1);
-        assertEq(account.increaseDelay(), 1 hours);
+        registry.executeQueued(address(account), id2);
+        assertEq(registry.increaseDelay(address(account)), 1 hours);
+        vm.expectRevert(IAgentPolicyRegistry.StaleQueued.selector);
+        registry.executeQueued(address(account), id1);
+        assertEq(registry.increaseDelay(address(account)), 1 hours);
     }
 
     function test_DoubleQueuedTokenAddGoesStaleAfterRemoval() public {
         address token = makeAddr("token");
         vm.startPrank(accountOwner);
-        uint256 id1 = account.setTokenAllowed(token, true);
-        uint256 id2 = account.setTokenAllowed(token, true);
+        uint256 id1 = registry.setTokenAllowed(address(account), token, true);
+        uint256 id2 = registry.setTokenAllowed(address(account), token, true);
         vm.stopPrank();
         _warp(_eta(id2));
-        account.executeQueued(id2);
-        assertTrue(account.tokenAllowed(token));
+        registry.executeQueued(address(account), id2);
+        assertTrue(registry.tokenAllowed(address(account), token));
         vm.prank(accountOwner);
-        account.setTokenAllowed(token, false);
-        vm.expectRevert(IAgentAccount.StaleQueued.selector);
-        account.executeQueued(id1);
-        assertFalse(account.tokenAllowed(token));
+        registry.setTokenAllowed(address(account), token, false);
+        vm.expectRevert(IAgentPolicyRegistry.StaleQueued.selector);
+        registry.executeQueued(address(account), id1);
+        assertFalse(registry.tokenAllowed(address(account), token));
     }
 
     function test_RemovalWhileAddPendingMakesAddStale() public {
         address token = makeAddr("token");
         vm.prank(accountOwner);
-        uint256 id = account.setTokenAllowed(token, true);
+        uint256 id = registry.setTokenAllowed(address(account), token, true);
         vm.prank(accountOwner);
-        assertEq(account.setTokenAllowed(token, false), 0);
+        assertEq(registry.setTokenAllowed(address(account), token, false), 0);
         _warp(_eta(id));
-        vm.expectRevert(IAgentAccount.StaleQueued.selector);
-        account.executeQueued(id);
-        assertFalse(account.tokenAllowed(token));
+        vm.expectRevert(IAgentPolicyRegistry.StaleQueued.selector);
+        registry.executeQueued(address(account), id);
+        assertFalse(registry.tokenAllowed(address(account), token));
     }
 
     function test_DelayRaiseAlsoDelaysQueuedItems() public {
@@ -867,48 +868,174 @@ contract AgentOwnerTest is AgentFixture {
         uint256 idLate = _setPolicy(p);
         assertEq(_eta(id), t0 + 1 hours);
         vm.prank(accountOwner);
-        account.setIncreaseDelay(5 hours);
+        registry.setIncreaseDelay(address(account), 5 hours);
         assertEq(_eta(id), t0 + 5 hours, "effective ETA follows the raised delay");
         _warp(t0 + 1 hours);
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.TooEarly.selector, uint40(t0 + 5 hours)));
-        account.executeQueued(id);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.TooEarly.selector, uint40(t0 + 5 hours)));
+        registry.executeQueued(address(account), id);
         _warp(t0 + 5 hours);
-        account.executeQueued(id);
-        assertEq(account.policy().maxTradeUsdc, 200e6);
+        registry.executeQueued(address(account), id);
+        assertEq(registry.policy(address(account)).maxTradeUsdc, 200e6);
         // Expiry is measured from the effective ETA, and the expired item stays in storage.
         _warp(t0 + 5 hours + QUEUE_TTL + 1);
-        vm.expectRevert(IAgentAccount.QueuedExpired.selector);
-        account.executeQueued(idLate);
-        (uint8 kind,,,,) = account.queued(idLate);
+        vm.expectRevert(IAgentPolicyRegistry.QueuedExpired.selector);
+        registry.executeQueued(address(account), idLate);
+        (uint8 kind,,,,) = registry.queued(address(account), idLate);
         assertEq(kind, Q_POLICY);
     }
 
     function test_RetiringInactiveAddressKillsPendingAdd() public {
         vm.prank(accountOwner);
-        uint256 id = account.addAgent(newKey, uint40(_now() + 30 days), P_BUY);
-        vm.expectEmit(address(account));
-        emit IAgentAccount.AgentRevoked(newKey, 0, 0);
+        uint256 id = registry.addAgent(address(account), newKey, uint40(_now() + 30 days), P_BUY);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.AgentRevoked(address(account), newKey, 0, 0);
         vm.prank(accountOwner);
-        account.revokeAgent(newKey);
-        assertTrue(account.retired(newKey));
-        assertEq(account.activeAgentCount(), 1);
+        registry.revokeAgent(address(account), newKey);
+        assertTrue(registry.retired(address(account), newKey));
+        assertEq(registry.activeAgentCount(address(account)), 1);
         _warp(_eta(id));
-        vm.expectRevert(IAgentAccount.AgentRetired.selector);
-        account.executeQueued(id);
+        vm.expectRevert(IAgentPolicyRegistry.AgentRetired.selector);
+        registry.executeQueued(address(account), id);
     }
 
     function test_WriteSeqMovesOnEveryAppliedChange() public {
-        uint64 s0 = account.writeSeq();
+        uint64 s0 = registry.writeSeq(address(account));
         Policy memory p = _defaultPolicy();
         p.maxTradeUsdc = 50e6;
         _setPolicy(p);
-        assertEq(account.writeSeq(), s0 + 1);
+        assertEq(registry.writeSeq(address(account)), s0 + 1);
         vm.startPrank(accountOwner);
-        account.setTokenAllowed(stranger, false);
-        account.setIncreaseDelay(2 hours);
-        account.revokeAgent(agentKey);
+        registry.setTokenAllowed(address(account), stranger, false);
+        registry.setIncreaseDelay(address(account), 2 hours);
+        registry.revokeAgent(address(account), agentKey);
         vm.stopPrank();
-        assertEq(account.writeSeq(), s0 + 4);
+        assertEq(registry.writeSeq(address(account)), s0 + 4);
+    }
+
+    // ---------------------------------------------------------------- registry isolation (split of Task 3)
+
+    function test_NonAccountCannotAuthorizeOrRecord() public {
+        address[4] memory callers = [stranger, accountOwner, agentKey, address(agentImpl)];
+        uint256 dl = _now() + 60;
+        for (uint256 i; i < callers.length; ++i) {
+            vm.prank(callers[i]);
+            vm.expectRevert(IAgentPolicyRegistry.NotAccount.selector);
+            registry.authorize(agentKey, P_BUY, dl);
+            vm.prank(callers[i]);
+            vm.expectRevert(IAgentPolicyRegistry.NotAccount.selector);
+            registry.record(stranger, 1, 1, true);
+        }
+        // Even the factory, which registers accounts, is not one.
+        vm.prank(address(agentFactory));
+        vm.expectRevert(IAgentPolicyRegistry.NotAccount.selector);
+        registry.record(stranger, 1, 0, false);
+    }
+
+    function test_AccountCanOnlyAuthorizeAndRecordForItself() public {
+        address agentB = makeAddr("agent b");
+        InitParams memory p = _defaults();
+        p.firstAgent = agentB;
+        AgentAccount b = _account(stranger, bytes32(0), p);
+        address tok = makeAddr("token");
+
+        // `record` has no account parameter: account A's call charges A only.
+        vm.prank(address(account));
+        registry.record(tok, 10e6, 5e6, true);
+        (, uint64 spentA, uint64 soldA,, uint16 launchesA) = registry.usage(address(account));
+        assertEq(spentA, 10e6);
+        assertEq(soldA, 5e6);
+        assertEq(launchesA, 1);
+        assertEq(registry.tokenSpent(address(account), tok), 10e6);
+        (, uint64 spentB, uint64 soldB, uint32 actionsB, uint16 launchesB) = registry.usage(address(b));
+        assertEq(spentB, 0);
+        assertEq(soldB, 0);
+        assertEq(actionsB, 0);
+        assertEq(launchesB, 0);
+        assertEq(registry.tokenSpent(address(b), tok), 0);
+
+        // Account A cannot borrow account B's agent, nor B account A's.
+        uint256 dl = _now() + 60;
+        vm.prank(address(account));
+        vm.expectRevert(IAgentPolicyRegistry.NotAgent.selector);
+        registry.authorize(agentB, P_BUY, dl);
+        vm.prank(address(b));
+        vm.expectRevert(IAgentPolicyRegistry.NotAgent.selector);
+        registry.authorize(agentKey, P_BUY, dl);
+        // Through the accounts themselves: B's agent cannot trade A.
+        vm.prank(agentB);
+        vm.expectRevert(IAgentPolicyRegistry.NotAgent.selector);
+        account.buy(tok, 1e6, 1, dl);
+    }
+
+    function test_RecordEnforcesEachCapWithTypedErrors() public {
+        address tok = makeAddr("token");
+        vm.startPrank(address(account));
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSpendExceeded.selector, 500e6));
+        registry.record(tok, 500e6 + 1, 0, false);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.TokenCapExceeded.selector, 100e6));
+        registry.record(tok, 100e6 + 1, 0, false);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, 500e6));
+        registry.record(tok, 0, 500e6 + 1, false);
+        // Arbitrary inputs cannot overflow the comparison.
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSpendExceeded.selector, 500e6));
+        registry.record(tok, type(uint256).max, 0, false);
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, 500e6));
+        registry.record(tok, 0, type(uint256).max, false);
+        registry.record(tok, 0, 0, true);
+        registry.record(tok, 0, 0, true);
+        registry.record(tok, 0, 0, true);
+        vm.expectRevert(IAgentPolicyRegistry.LaunchLimit.selector);
+        registry.record(tok, 0, 0, true);
+        vm.stopPrank();
+    }
+
+    function test_OwnerOfOneAccountCannotManageAnother() public {
+        AgentAccount b = _account(stranger, bytes32(0), _defaults());
+        address bAddr = address(b);
+        uint40 exp = uint40(_now() + 1 days);
+        Policy memory p = _defaultPolicy();
+        address[] memory tokens = new address[](1);
+        // Queue an item on B (by B's owner) so `cancelQueued` and `executeQueued` have a real id.
+        vm.prank(stranger);
+        uint256 idB = registry.addAgent(bAddr, newKey, exp, P_BUY);
+
+        vm.startPrank(accountOwner);
+        vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+        registry.addAgent(bAddr, newKey, exp, P_BUY);
+        vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+        registry.setAgent(bAddr, agentKey, exp, P_BUY);
+        vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+        registry.revokeAgent(bAddr, agentKey);
+        vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+        registry.rotateAgent(bAddr, agentKey, newKey, exp, P_BUY);
+        vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+        registry.setPolicy(bAddr, p);
+        vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+        registry.setTokenAllowed(bAddr, stranger, false);
+        vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+        registry.setIncreaseDelay(bAddr, 2 hours);
+        vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+        registry.transferOwnership(bAddr, accountOwner);
+        vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+        registry.cancelQueued(bAddr, idB);
+        vm.expectRevert(IAgentPolicyRegistry.NotOwner.selector);
+        registry.pauseAgents(bAddr, true);
+        vm.expectRevert(IAgentAccount.NotOwner.selector);
+        b.withdraw(address(0), 0);
+        vm.expectRevert(IAgentAccount.NotOwner.selector);
+        b.withdrawMany(tokens);
+        // A's own queued items live in A's queue only: queueing on A does not touch B's id space.
+        uint256 idA = registry.addAgent(address(account), newKey, exp, P_BUY);
+        vm.stopPrank();
+        assertEq(idA, 1);
+        assertEq(idB, 1);
+        (uint8 kind,,,, bytes memory payload) = registry.queued(bAddr, idB);
+        assertEq(kind, Q_ADD_AGENT);
+        (address queuedKey,,) = abi.decode(payload, (address, uint40, uint16));
+        assertEq(queuedKey, newKey);
+        assertEq(registry.owner(bAddr), stranger);
+        assertFalse(registry.ownerPaused(bAddr));
+        assertTrue(registry.agent(bAddr, agentKey).active);
     }
 
     // ---------------------------------------------------------------- indexer views and events
@@ -917,30 +1044,30 @@ contract AgentOwnerTest is AgentFixture {
         Policy memory p = _defaultPolicy();
         p.maxTradeUsdc = 50e6;
         _setPolicy(p);
-        uint64 sPolicy = account.writeSeq();
-        assertEq(account.policyWrite(0), sPolicy, "maxTradeUsdc written");
+        uint64 sPolicy = registry.writeSeq(address(account));
+        assertEq(registry.policyWrite(address(account), 0), sPolicy, "maxTradeUsdc written");
         p.periodSpendCap = 600e6;
         uint256 id = _setPolicy(p);
-        (,,, uint64 seq,) = account.queued(id);
+        (,,, uint64 seq,) = registry.queued(address(account), id);
         assertEq(seq, sPolicy, "item seq is writeSeq at queue time");
 
         vm.startPrank(accountOwner);
-        account.setIncreaseDelay(2 hours);
-        assertEq(account.delayWrite(), account.writeSeq());
-        account.setTokenAllowed(stranger, false);
-        assertEq(account.tokenWrite(stranger), account.writeSeq());
-        account.revokeAgent(agentKey);
-        assertEq(account.agentWrite(agentKey), account.writeSeq());
+        registry.setIncreaseDelay(address(account), 2 hours);
+        assertEq(registry.delayWrite(address(account)), registry.writeSeq(address(account)));
+        registry.setTokenAllowed(address(account), stranger, false);
+        assertEq(registry.tokenWrite(address(account), stranger), registry.writeSeq(address(account)));
+        registry.revokeAgent(address(account), agentKey);
+        assertEq(registry.agentWrite(address(account), agentKey), registry.writeSeq(address(account)));
         vm.stopPrank();
-        assertLe(account.policyWrite(1), seq, "periodSpendCap not written since");
+        assertLe(registry.policyWrite(address(account), 1), seq, "periodSpendCap not written since");
     }
 
     function test_AgentQueuedCarriesIdAndQueueTimeEta() public {
         uint40 exp = uint40(_now() + 30 days);
-        vm.expectEmit(address(account));
-        emit IAgentAccount.AgentQueued(1, newKey, exp, P_BUY, uint40(_now() + 1 hours));
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.AgentQueued(address(account), 1, newKey, exp, P_BUY, uint40(_now() + 1 hours));
         vm.prank(accountOwner);
-        account.addAgent(newKey, exp, P_BUY);
+        registry.addAgent(address(account), newKey, exp, P_BUY);
     }
 
     function test_FullyStalePolicyExecutionAppliesNothing() public {
@@ -965,17 +1092,17 @@ contract AgentOwnerTest is AgentFixture {
         w.maxSnipeBps = 100;
         uint256 idSnipe = _setPolicy(w);
         _warp(_eta(idSnipe));
-        account.executeQueued(idSnipe);
-        (,,, uint64 seq,) = account.queued(id);
+        registry.executeQueued(address(account), idSnipe);
+        (,,, uint64 seq,) = registry.queued(address(account), id);
         for (uint256 i; i < 11; ++i) {
-            assertGt(account.policyWrite(i), seq, "every field written since");
+            assertGt(registry.policyWrite(address(account), i), seq, "every field written since");
         }
-        uint64 before = account.writeSeq();
+        uint64 before = registry.writeSeq(address(account));
         vm.recordLogs();
-        account.executeQueued(id);
+        registry.executeQueued(address(account), id);
         assertEq(vm.getRecordedLogs().length, 1, "only QueuedExecuted");
-        assertEq(account.writeSeq(), before, "nothing written");
-        _eq(account.policy(), w);
+        assertEq(registry.writeSeq(address(account)), before, "nothing written");
+        _eq(registry.policy(address(account)), w);
     }
 
     function test_RevokeAndRotateRejectZeroOwnerAndSelf() public {
@@ -983,10 +1110,10 @@ contract AgentOwnerTest is AgentFixture {
         uint40 exp = uint40(_now() + 30 days);
         vm.startPrank(accountOwner);
         for (uint256 i; i < 3; ++i) {
-            vm.expectRevert(IAgentAccount.InvalidAgent.selector);
-            account.revokeAgent(bad[i]);
-            vm.expectRevert(IAgentAccount.InvalidAgent.selector);
-            account.rotateAgent(bad[i], newKey, exp, P_BUY);
+            vm.expectRevert(IAgentPolicyRegistry.InvalidAgent.selector);
+            registry.revokeAgent(address(account), bad[i]);
+            vm.expectRevert(IAgentPolicyRegistry.InvalidAgent.selector);
+            registry.rotateAgent(address(account), bad[i], newKey, exp, P_BUY);
         }
         vm.stopPrank();
     }
@@ -1065,8 +1192,8 @@ contract AgentOwnerTest is AgentFixture {
         tight.maxPriceImpactBps = tightImpact;
         _setPolicy(tight);
         _warp(_eta(id));
-        account.executeQueued(id);
-        assertEq(account.policy().maxTradeUsdc, tightTrade);
-        assertEq(account.policy().maxPriceImpactBps, tightImpact);
+        registry.executeQueued(address(account), id);
+        assertEq(registry.policy(address(account)).maxTradeUsdc, tightTrade);
+        assertEq(registry.policy(address(account)).maxPriceImpactBps, tightImpact);
     }
 }

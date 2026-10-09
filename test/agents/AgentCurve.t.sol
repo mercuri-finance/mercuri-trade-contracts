@@ -7,6 +7,7 @@ import {BondingCurve} from "@mercuri/launch/BondingCurve.sol";
 import {AgentFixture} from "./AgentFixture.sol";
 import {AgentAccount} from "../../src/agents/AgentAccount.sol";
 import {IAgentAccount} from "../../src/agents/interfaces/IAgentAccount.sol";
+import {IAgentPolicyRegistry} from "../../src/agents/interfaces/IAgentPolicyRegistry.sol";
 import {Policy, P_BUY, P_SELL, ACTION_BUY, ACTION_SELL} from "../../src/agents/AgentTypes.sol";
 
 /// @dev Task 3: capped curve buys and sells with cost basis (spec sections 4.2, 4.5 and 4.6).
@@ -52,7 +53,7 @@ contract AgentCurveTest is AgentFixture {
 
     function _narrow(Policy memory p) internal {
         vm.prank(accountOwner);
-        assertEq(account.setPolicy(p), 0, "narrowing only");
+        assertEq(registry.setPolicy(address(account), p), 0, "narrowing only");
     }
 
     function _expectBuyRevert(bytes memory err, uint256 usdcIn) internal {
@@ -68,15 +69,15 @@ contract AgentCurveTest is AgentFixture {
     }
 
     function _usageSpent() internal view returns (uint64 spent) {
-        (, spent,,,) = account.usage();
+        (, spent,,,) = registry.usage(address(account));
     }
 
     function _usageSold() internal view returns (uint64 sold) {
-        (,, sold,,) = account.usage();
+        (,, sold,,) = registry.usage(address(account));
     }
 
     function _usageActions() internal view returns (uint32 actions) {
-        (,,, actions,) = account.usage();
+        (,,, actions,) = registry.usage(address(account));
     }
 
     /// @dev Bob buys the curve up to `leftWei` (approximately) of gross USDC before it sells out.
@@ -105,16 +106,16 @@ contract AgentCurveTest is AgentFixture {
         (uint128 cost, uint128 held) = account.basis(address(token));
         assertEq(cost, 50e6);
         assertEq(held, out);
-        (uint64 pid, uint64 spent, uint64 sold, uint32 actions, uint16 launches) = account.usage();
+        (uint64 pid, uint64 spent, uint64 sold, uint32 actions, uint16 launches) = registry.usage(address(account));
         assertEq(pid, _pid());
         assertEq(spent, 50e6);
         assertEq(sold, 0);
         assertEq(actions, 1);
         assertEq(launches, 0);
-        assertEq(account.tokenSpent(address(token)), 50e6);
+        assertEq(registry.tokenSpent(address(account), address(token)), 50e6);
         assertEq(feeManager.referrerOf(address(account)), referrer);
         assertGt(feeManager.balances(referrer), refBefore, "referrer earns its share");
-        (uint64 hs, uint64 hsell, uint32 ha, uint16 hl) = account.headroom();
+        (uint64 hs, uint64 hsell, uint32 ha, uint16 hl) = registry.headroom(address(account));
         assertEq(hs, 450e6);
         assertEq(hsell, 500e6);
         assertEq(ha, 499);
@@ -162,59 +163,59 @@ contract AgentCurveTest is AgentFixture {
     function test_OnlyActiveAgentsWithThePermissionTrade() public {
         uint256 dl = _dl();
         vm.prank(stranger);
-        vm.expectRevert(IAgentAccount.NotAgent.selector);
+        vm.expectRevert(IAgentPolicyRegistry.NotAgent.selector);
         account.buy(address(token), 1e6, 1, dl);
         // The owner has no trade path.
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.NotAgent.selector);
+        vm.expectRevert(IAgentPolicyRegistry.NotAgent.selector);
         account.buy(address(token), 1e6, 1, dl);
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.NotAgent.selector);
+        vm.expectRevert(IAgentPolicyRegistry.NotAgent.selector);
         account.sell(address(token), 1, 1, dl);
 
-        uint40 exp = account.agent(agentKey).expiresAt;
+        uint40 exp = registry.agent(address(account), agentKey).expiresAt;
         vm.prank(accountOwner);
-        account.setAgent(agentKey, exp, P_BUY);
+        registry.setAgent(address(account), agentKey, exp, P_BUY);
         _buy(1e6);
-        _expectSellRevert(abi.encodeWithSelector(IAgentAccount.MissingPermission.selector), 1);
+        _expectSellRevert(abi.encodeWithSelector(IAgentPolicyRegistry.MissingPermission.selector), 1);
         // Swapping the bit is a widening: queue it and execute after the delay.
         vm.prank(accountOwner);
-        uint256 id = account.setAgent(agentKey, exp, P_SELL);
+        uint256 id = registry.setAgent(address(account), agentKey, exp, P_SELL);
         vm.warp(_now() + 1 hours);
-        account.executeQueued(id);
-        _expectBuyRevert(abi.encodeWithSelector(IAgentAccount.MissingPermission.selector), 1e6);
+        registry.executeQueued(address(account), id);
+        _expectBuyRevert(abi.encodeWithSelector(IAgentPolicyRegistry.MissingPermission.selector), 1e6);
 
         vm.warp(exp);
-        _expectBuyRevert(abi.encodeWithSelector(IAgentAccount.AgentExpired.selector), 1e6);
+        _expectBuyRevert(abi.encodeWithSelector(IAgentPolicyRegistry.AgentExpired.selector), 1e6);
 
         vm.prank(accountOwner);
-        account.revokeAgent(agentKey);
-        _expectBuyRevert(abi.encodeWithSelector(IAgentAccount.NotAgent.selector), 1e6);
+        registry.revokeAgent(address(account), agentKey);
+        _expectBuyRevert(abi.encodeWithSelector(IAgentPolicyRegistry.NotAgent.selector), 1e6);
     }
 
     function test_OwnerAndFactoryPausesStopAgents() public {
         vm.prank(accountOwner);
-        account.pauseAgents(true);
-        _expectBuyRevert(abi.encodeWithSelector(IAgentAccount.Paused.selector), 1e6);
-        _expectSellRevert(abi.encodeWithSelector(IAgentAccount.Paused.selector), 1);
+        registry.pauseAgents(address(account), true);
+        _expectBuyRevert(abi.encodeWithSelector(IAgentPolicyRegistry.Paused.selector), 1e6);
+        _expectSellRevert(abi.encodeWithSelector(IAgentPolicyRegistry.Paused.selector), 1);
         vm.prank(accountOwner);
-        account.pauseAgents(false);
+        registry.pauseAgents(address(account), false);
         _buy(1e6);
 
         vm.prank(agentGuardian);
         agentFactory.guardianPause();
-        _expectBuyRevert(abi.encodeWithSelector(IAgentAccount.Paused.selector), 1e6);
-        _expectSellRevert(abi.encodeWithSelector(IAgentAccount.Paused.selector), 1);
+        _expectBuyRevert(abi.encodeWithSelector(IAgentPolicyRegistry.Paused.selector), 1e6);
+        _expectSellRevert(abi.encodeWithSelector(IAgentPolicyRegistry.Paused.selector), 1);
     }
 
     function test_DeadlineMustBeWithinWindow() public {
         uint256 t = _now();
         vm.startPrank(agentKey);
-        vm.expectRevert(IAgentAccount.DeadlineOutOfRange.selector);
+        vm.expectRevert(IAgentPolicyRegistry.DeadlineOutOfRange.selector);
         account.buy(address(token), 1e6, 1, t - 1);
-        vm.expectRevert(IAgentAccount.DeadlineOutOfRange.selector);
+        vm.expectRevert(IAgentPolicyRegistry.DeadlineOutOfRange.selector);
         account.buy(address(token), 1e6, 1, t + 121);
-        vm.expectRevert(IAgentAccount.DeadlineOutOfRange.selector);
+        vm.expectRevert(IAgentPolicyRegistry.DeadlineOutOfRange.selector);
         account.sell(address(token), 1, 1, t + 121);
         account.buy(address(token), 1e6, 1, t);
         account.buy(address(token), 1e6, 1, t + 120);
@@ -297,6 +298,18 @@ contract AgentCurveTest is AgentFixture {
         vm.stopPrank();
     }
 
+    function test_HugeMinOutRevertsAmountTooLarge() public {
+        uint256 held = _buy(1e6);
+        uint256 dl = _dl();
+        vm.prank(agentKey);
+        vm.expectRevert(IAgentAccount.AmountTooLarge.selector);
+        account.sell(address(token), held, type(uint256).max / 1e12 + 1, dl);
+        // The largest convertible value reaches the curve and fails its slippage check, not with a panic.
+        vm.prank(agentKey);
+        vm.expectRevert(BondingCurve.Slippage.selector);
+        account.sell(address(token), held, type(uint256).max / 1e12, dl);
+    }
+
     // ---------------------------------------------------------------- caps
 
     function test_TradeTooLarge() public {
@@ -317,7 +330,7 @@ contract AgentCurveTest is AgentFixture {
         _narrow(p);
         _buy(100e6);
         vm.prank(agentKey);
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.PeriodSpendExceeded.selector, 50e6));
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSpendExceeded.selector, 50e6));
         account.buy(address(t2), 60e6, 1, _now() + 60);
         _buyOf(address(t2), 50e6);
         assertEq(_usageSpent(), 150e6);
@@ -325,9 +338,9 @@ contract AgentCurveTest is AgentFixture {
 
     function test_TokenCapExceeded() public {
         _buy(60e6);
-        _expectBuyRevert(abi.encodeWithSelector(IAgentAccount.TokenCapExceeded.selector, 40e6), 60e6);
+        _expectBuyRevert(abi.encodeWithSelector(IAgentPolicyRegistry.TokenCapExceeded.selector, 40e6), 60e6);
         _buy(40e6);
-        assertEq(account.tokenSpent(address(token)), 100e6);
+        assertEq(registry.tokenSpent(address(account), address(token)), 100e6);
     }
 
     function test_PeriodSellExceeded() public {
@@ -335,10 +348,10 @@ contract AgentCurveTest is AgentFixture {
         Policy memory p = _defaultPolicy();
         p.periodSellCap = 50e6;
         _narrow(p);
-        _expectSellRevert(abi.encodeWithSelector(IAgentAccount.PeriodSellExceeded.selector, 50e6), held);
+        _expectSellRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, 50e6), held);
         _sell(held / 2);
         assertEq(_usageSold(), 50e6);
-        _expectSellRevert(abi.encodeWithSelector(IAgentAccount.PeriodSellExceeded.selector, 0), held / 4);
+        _expectSellRevert(abi.encodeWithSelector(IAgentPolicyRegistry.PeriodSellExceeded.selector, 0), held / 4);
     }
 
     function test_ActionLimit() public {
@@ -347,8 +360,8 @@ contract AgentCurveTest is AgentFixture {
         _narrow(p);
         uint256 held = _buy(1e6);
         _sell(held / 2);
-        _expectBuyRevert(abi.encodeWithSelector(IAgentAccount.ActionLimit.selector), 1e6);
-        _expectSellRevert(abi.encodeWithSelector(IAgentAccount.ActionLimit.selector), 1);
+        _expectBuyRevert(abi.encodeWithSelector(IAgentPolicyRegistry.ActionLimit.selector), 1e6);
+        _expectSellRevert(abi.encodeWithSelector(IAgentPolicyRegistry.ActionLimit.selector), 1);
     }
 
     function test_GraduatedCurveRevertsNotTradingWithoutPanic() public {
@@ -366,28 +379,28 @@ contract AgentCurveTest is AgentFixture {
         vm.roll(vm.getBlockNumber() + 1);
         _buy(10e6);
         vm.roll(vm.getBlockNumber() + 1);
-        (uint64 pid, uint64 spent,, uint32 actions,) = account.usage();
+        (uint64 pid, uint64 spent,, uint32 actions,) = registry.usage(address(account));
         assertEq(pid, _pid());
         assertEq(spent, 20e6);
         assertEq(actions, 2);
-        assertEq(account.tokenSpent(address(token)), 20e6);
+        assertEq(registry.tokenSpent(address(account), address(token)), 20e6);
 
         // The last second of the period still counts in it.
         vm.warp((uint256(_pid()) + 1) * 1 days - 1);
         _buy(10e6);
-        (, spent,, actions,) = account.usage();
+        (, spent,, actions,) = registry.usage(address(account));
         assertEq(spent, 30e6);
 
         vm.warp((uint256(_pid()) + 1) * 1 days);
-        (pid, spent,, actions,) = account.usage();
+        (pid, spent,, actions,) = registry.usage(address(account));
         assertEq(pid, _pid());
         assertEq(spent, 0);
         assertEq(actions, 0);
-        assertEq(account.tokenSpent(address(token)), 0, "per-token spend is per period");
-        (uint64 hs,,,) = account.headroom();
+        assertEq(registry.tokenSpent(address(account), address(token)), 0, "per-token spend is per period");
+        (uint64 hs,,,) = registry.headroom(address(account));
         assertEq(hs, 500e6);
         _buy(100e6);
-        (, spent,, actions,) = account.usage();
+        (, spent,, actions,) = registry.usage(address(account));
         assertEq(spent, 100e6);
         assertEq(actions, 1);
     }
@@ -411,7 +424,7 @@ contract AgentCurveTest is AgentFixture {
         assertEq(delta, used, "refund netted");
         uint256 spent6 = Math.ceilDiv(delta, 1e12);
         assertEq(_usageSpent(), spent6);
-        assertEq(account.tokenSpent(address(token)), spent6);
+        assertEq(registry.tokenSpent(address(account), address(token)), spent6);
         (uint128 cost, uint128 tokens) = account.basis(address(token));
         assertEq(cost, spent6);
         assertEq(tokens, remaining);
@@ -459,9 +472,10 @@ contract AgentCurveTest is AgentFixture {
 
     function _coolAll() internal {
         bytes32 implSlot = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
-        address[16] memory list = [
+        address[17] memory list = [
             address(account),
             address(agentImpl),
+            address(registry),
             address(agentFactory),
             address(factory),
             address(uint160(uint256(vm.load(address(factory), implSlot)))),
@@ -492,7 +506,7 @@ contract AgentCurveTest is AgentFixture {
         uint256 extra = token.balanceOf(bob);
         vm.prank(bob);
         token.transfer(address(account), extra);
-        (uint64 hsBefore,,,) = account.headroom();
+        (uint64 hsBefore,,,) = registry.headroom(address(account));
 
         (uint256 quoteExtra,) = curve.quoteSell(extra);
         uint256 expected = 50e6 + Math.ceilDiv(quoteExtra, 1e12);
@@ -503,7 +517,7 @@ contract AgentCurveTest is AgentFixture {
         (uint128 cost, uint128 tokens) = account.basis(address(token));
         assertEq(cost, 0);
         assertEq(tokens, 0);
-        (uint64 hsAfter,,,) = account.headroom();
+        (uint64 hsAfter,,,) = registry.headroom(address(account));
         assertEq(hsAfter, hsBefore, "no buy headroom from proceeds");
         assertEq(_usageSpent(), 50e6);
     }

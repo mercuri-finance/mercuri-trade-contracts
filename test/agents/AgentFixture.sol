@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import {UniversalRouterHarness} from "../integration/UniversalRouterSwap.t.sol";
 import {AgentAccount} from "../../src/agents/AgentAccount.sol";
 import {AgentAccountFactory} from "../../src/agents/AgentAccountFactory.sol";
+import {AgentPolicyRegistry} from "../../src/agents/AgentPolicyRegistry.sol";
 import {Policy, InitParams, P_ALL} from "../../src/agents/AgentTypes.sol";
 
 /// @dev The real Launch system and Universal Router (from `UniversalRouterHarness`), plus an agent account
@@ -11,6 +12,8 @@ import {Policy, InitParams, P_ALL} from "../../src/agents/AgentTypes.sol";
 abstract contract AgentFixture is UniversalRouterHarness {
     AgentAccountFactory internal agentFactory;
     AgentAccount internal agentImpl;
+    /// @dev The agent factory's registry, where owners manage their accounts.
+    AgentPolicyRegistry internal registry;
 
     /// @dev Stands in for the network's Launch timelock.
     address internal agentAdmin = makeAddr("agent admin");
@@ -23,17 +26,28 @@ abstract contract AgentFixture is UniversalRouterHarness {
     function setUp() public virtual override {
         super.setUp();
         (agentImpl, agentFactory) = _deployAgents(agentGuardian, _ceilings());
+        registry = AgentPolicyRegistry(agentFactory.registry());
         vm.deal(accountOwner, 100_000e18);
     }
 
-    /// @dev Deploys an implementation bound to the factory deployed right after it, as the deploy script does.
+    /// @dev Deploys an implementation bound to the factory deployed right after it (and to the registry that
+    ///      factory deploys as its first CREATE), as the deploy script does.
     function _deployAgents(address guardian_, Policy memory ceilings_)
         internal
         returns (AgentAccount impl, AgentAccountFactory f)
     {
         address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
-        impl = new AgentAccount(
-            predicted,
+        impl = _newImpl(predicted);
+        f = new AgentAccountFactory(address(impl), agentAdmin, guardian_, ceilings_);
+        require(address(f) == predicted, "agent factory address");
+        require(f.registry() == vm.computeCreateAddress(predicted, 1), "registry address");
+    }
+
+    /// @dev An implementation bound to `factory_` and to the registry `factory_` will deploy.
+    function _newImpl(address factory_) internal returns (AgentAccount) {
+        return new AgentAccount(
+            factory_,
+            vm.computeCreateAddress(factory_, 1),
             address(factory),
             address(feeManager),
             address(gm),
@@ -43,8 +57,6 @@ abstract contract AgentFixture is UniversalRouterHarness {
             address(permit2),
             USDC
         );
-        f = new AgentAccountFactory(address(impl), agentAdmin, guardian_, ceilings_);
-        require(address(f) == predicted, "agent factory address");
     }
 
     /// @dev The beta ceilings of spec section 4.5 (usdc6 for amounts).

@@ -22,7 +22,7 @@ interface IAgentAccountFactory {
 
     /// @notice The implementation, the admin or a new guardian is the zero address.
     error ZeroAddress();
-    /// @notice The implementation is bound to another factory.
+    /// @notice The implementation is bound to another factory or another registry.
     error ImplementationMismatch();
     /// @notice A beta ceiling is outside its valid range: a bps field above 10,000 or a deadline outside 1–600 s.
     /// @param field Index of the field in `Policy` struct order (6 impact, 7 snipe, 9 deadline).
@@ -45,7 +45,8 @@ interface IAgentAccountFactory {
     /// @param readyAt Unix time (seconds) from which the guardian may pause again.
     error PauseCooldown(uint40 readyAt);
 
-    /// @notice Creates the caller's account at a deterministic address and initialises it.
+    /// @notice Creates the caller's account at a deterministic address, registers it in the registry (owner, policy,
+    ///         period, delay, first agent) and initialises it (referrer binding).
     /// @dev The CREATE2 salt is `keccak256(abi.encode(msg.sender, salt))`, so nobody can take another owner's
     ///      address. Reverts `AccountExists` if that address is already used.
     /// @param salt Caller-chosen salt.
@@ -64,6 +65,9 @@ interface IAgentAccountFactory {
     /// @notice The account implementation every clone delegates to.
     /// @return The implementation address.
     function implementation() external view returns (address);
+    /// @notice The registry of every account's owner, policy, agents, queue and usage, deployed by this factory.
+    /// @return The AgentPolicyRegistry address.
+    function registry() external view returns (address);
     /// @notice The beta ceilings every stored policy must stay within.
     /// @dev Same shape as `Policy` (amounts usdc6). `allowlistOnly` is ignored; `minTokenAgeBlocks` is a floor.
     /// @return The ceilings.

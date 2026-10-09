@@ -2,7 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
-import {IAgentAccount} from "./interfaces/IAgentAccount.sol";
+import {IAgentPolicyRegistry} from "./interfaces/IAgentPolicyRegistry.sol";
 import {
     Policy,
     MAX_BPS,
@@ -30,7 +30,7 @@ library AgentPolicyLib {
         uint256[11] memory cw = words(c);
         for (uint256 i; i < F_ALLOWLIST_ONLY; ++i) {
             if (i == F_MIN_TOKEN_AGE_BLOCKS ? pw[i] < cw[i] : pw[i] > cw[i]) {
-                revert IAgentAccount.BetaCeiling(uint8(i));
+                revert IAgentPolicyRegistry.BetaCeiling(uint8(i));
             }
         }
     }
@@ -41,7 +41,7 @@ library AgentPolicyLib {
     /// @param p Policy to check.
     function validate(Policy memory p) internal pure {
         (bool ok, uint8 field) = checkShape(p);
-        if (!ok) revert IAgentAccount.InvalidPolicy(field);
+        if (!ok) revert IAgentPolicyRegistry.InvalidPolicy(field);
     }
 
     /// @notice Whether `p` is well formed: the bounds `validate` enforces, also applied to the factory's ceilings.

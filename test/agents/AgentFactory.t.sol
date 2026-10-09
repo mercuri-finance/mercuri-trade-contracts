@@ -5,6 +5,7 @@ import {AgentFixture} from "./AgentFixture.sol";
 import {AgentAccount} from "../../src/agents/AgentAccount.sol";
 import {AgentAccountFactory} from "../../src/agents/AgentAccountFactory.sol";
 import {IAgentAccount} from "../../src/agents/interfaces/IAgentAccount.sol";
+import {IAgentPolicyRegistry} from "../../src/agents/interfaces/IAgentPolicyRegistry.sol";
 import {AgentPolicyLib} from "../../src/agents/AgentPolicyLib.sol";
 import {IAgentAccountFactory} from "../../src/agents/interfaces/IAgentAccountFactory.sol";
 import {
@@ -55,22 +56,33 @@ contract AgentFactoryTest is AgentFixture {
         InitParams memory p = _defaults();
         vm.prank(stranger);
         vm.expectRevert(IAgentAccount.NotFactory.selector);
-        account.initialize(stranger, p);
-        // Even the factory cannot initialise an account twice.
+        account.initialize(stranger);
+        // Even the factory cannot initialise an account twice, nor register it twice.
         vm.prank(address(agentFactory));
         vm.expectRevert(IAgentAccount.AlreadyInitialized.selector);
-        account.initialize(stranger, p);
+        account.initialize(stranger);
+        vm.prank(stranger);
+        vm.expectRevert(IAgentPolicyRegistry.NotFactory.selector);
+        registry.register(address(account), stranger, p);
+        vm.prank(address(agentFactory));
+        vm.expectRevert(IAgentPolicyRegistry.AlreadyInitialized.selector);
+        registry.register(address(account), stranger, p);
     }
 
     function test_InitializeOnImplementationReverts() public {
         InitParams memory p = _defaults();
+        p;
         vm.prank(stranger);
         vm.expectRevert(IAgentAccount.NotFactory.selector);
-        agentImpl.initialize(stranger, p);
+        agentImpl.initialize(stranger);
         vm.prank(address(agentFactory));
         vm.expectRevert(IAgentAccount.AlreadyInitialized.selector);
-        agentImpl.initialize(stranger, p);
+        agentImpl.initialize(stranger);
         assertEq(agentImpl.owner(), address(0));
+        // The implementation has no owner, so nobody can withdraw from it.
+        vm.prank(stranger);
+        vm.expectRevert(IAgentAccount.NotOwner.selector);
+        agentImpl.withdraw(address(0), 0);
     }
 
     function test_IsAccountIsSet() public {
@@ -86,6 +98,9 @@ contract AgentFactoryTest is AgentFixture {
         assertEq(agentFactory.guardian(), agentGuardian);
         assertEq(agentFactory.VERSION(), "1.0.0-beta.1");
         assertEq(agentImpl.FACTORY(), address(agentFactory));
+        assertEq(address(agentImpl.REGISTRY()), address(registry));
+        assertEq(agentFactory.registry(), address(registry));
+        assertEq(registry.FACTORY(), address(agentFactory));
         assertEq(address(agentImpl.LAUNCH_FACTORY()), address(factory));
         assertEq(address(agentImpl.FEE_MANAGER()), address(feeManager));
         assertEq(address(agentImpl.GRADUATION_MANAGER()), address(gm));
@@ -107,7 +122,13 @@ contract AgentFactoryTest is AgentFixture {
     }
 
     function test_FactoryRejectsImplementationBoundElsewhere() public {
-        AgentAccount impl = new AgentAccount(
+        AgentAccount impl = _newImpl(stranger);
+        vm.expectRevert(IAgentAccountFactory.ImplementationMismatch.selector);
+        new AgentAccountFactory(address(impl), agentAdmin, agentGuardian, _ceilings());
+        // Bound to the right factory address but to another registry.
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
+        impl = new AgentAccount(
+            predicted,
             stranger,
             address(factory),
             address(feeManager),
@@ -126,6 +147,7 @@ contract AgentFactoryTest is AgentFixture {
         vm.expectRevert(IAgentAccount.ZeroAddress.selector);
         new AgentAccount(
             address(0),
+            stranger,
             address(factory),
             address(feeManager),
             address(gm),
@@ -138,6 +160,7 @@ contract AgentFactoryTest is AgentFixture {
         vm.expectRevert(IAgentAccount.ZeroAddress.selector);
         new AgentAccount(
             stranger,
+            stranger,
             address(factory),
             address(feeManager),
             address(gm),
@@ -146,6 +169,19 @@ contract AgentFactoryTest is AgentFixture {
             address(router),
             address(permit2),
             address(0)
+        );
+        vm.expectRevert(IAgentAccount.ZeroAddress.selector);
+        new AgentAccount(
+            stranger,
+            address(0),
+            address(factory),
+            address(feeManager),
+            address(gm),
+            address(hook),
+            address(poolManager),
+            address(router),
+            address(permit2),
+            USDC
         );
         vm.expectRevert(IAgentAccountFactory.ZeroAddress.selector);
         new AgentAccountFactory(address(0), agentAdmin, agentGuardian, _ceilings());
@@ -159,23 +195,23 @@ contract AgentFactoryTest is AgentFixture {
         InitParams memory p = _defaults();
         AgentAccount account = _account();
         assertEq(account.referrer(), referrer);
-        assertEq(abi.encode(account.policy()), abi.encode(p.policy));
-        assertEq(account.periodSeconds(), 1 days);
-        assertEq(account.increaseDelay(), 1 hours);
-        Agent memory a = account.agent(agentKey);
+        assertEq(abi.encode(registry.policy(address(account))), abi.encode(p.policy));
+        assertEq(registry.periodSeconds(address(account)), 1 days);
+        assertEq(registry.increaseDelay(address(account)), 1 hours);
+        Agent memory a = registry.agent(address(account), agentKey);
         assertTrue(a.active);
         assertEq(a.expiresAt, p.firstAgentExpiresAt);
         assertEq(a.permissions, P_ALL);
-        assertEq(account.activeAgentCount(), 1);
+        assertEq(registry.activeAgentCount(address(account)), 1);
     }
 
     function test_InitializeEmitsPolicyAndAgent() public {
         InitParams memory p = _defaults();
         address predicted = agentFactory.predictAccount(accountOwner, bytes32(0));
-        vm.expectEmit(predicted);
-        emit IAgentAccount.PolicyApplied(p.policy);
-        vm.expectEmit(predicted);
-        emit IAgentAccount.AgentActivated(agentKey, p.firstAgentExpiresAt, P_ALL);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.PolicyApplied(predicted, p.policy);
+        vm.expectEmit(address(registry));
+        emit IAgentPolicyRegistry.AgentActivated(predicted, agentKey, p.firstAgentExpiresAt, P_ALL);
         _account();
     }
 
@@ -183,8 +219,8 @@ contract AgentFactoryTest is AgentFixture {
         InitParams memory p = _defaults();
         p.firstAgent = address(0);
         AgentAccount account = _account(accountOwner, bytes32(0), p);
-        assertEq(account.activeAgentCount(), 0);
-        assertFalse(account.agent(agentKey).active);
+        assertEq(registry.activeAgentCount(address(account)), 0);
+        assertFalse(registry.agent(address(account), agentKey).active);
     }
 
     function test_ReferrerIsBound() public {
@@ -222,7 +258,7 @@ contract AgentFactoryTest is AgentFixture {
         p.policy = _ceilings();
         p.policy.allowlistOnly = true;
         AgentAccount account = _account(accountOwner, bytes32(0), p);
-        assertEq(abi.encode(account.policy()), abi.encode(p.policy));
+        assertEq(abi.encode(registry.policy(address(account))), abi.encode(p.policy));
     }
 
     function test_EachCeilingExceededReverts() public {
@@ -233,7 +269,7 @@ contract AgentFactoryTest is AgentFixture {
             p.policy = _ceilings();
             _loosen(p.policy, field);
             vm.prank(accountOwner);
-            vm.expectRevert(abi.encodeWithSelector(IAgentAccount.BetaCeiling.selector, field));
+            vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.BetaCeiling.selector, field));
             agentFactory.createAccount(bytes32(uint256(field)), p);
         }
     }
@@ -245,7 +281,7 @@ contract AgentFactoryTest is AgentFixture {
         InitParams memory p = _defaults();
         p.policy.minTokenAgeBlocks = 9;
         vm.prank(accountOwner);
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.BetaCeiling.selector, F_MIN_TOKEN_AGE_BLOCKS));
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.BetaCeiling.selector, F_MIN_TOKEN_AGE_BLOCKS));
         f.createAccount(bytes32(0), p);
         p.policy.minTokenAgeBlocks = 10;
         vm.prank(accountOwner);
@@ -257,21 +293,21 @@ contract AgentFactoryTest is AgentFixture {
         InitParams memory p = _defaults();
         p.policy.maxDeadlineSeconds = 0;
         vm.prank(accountOwner);
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.InvalidPolicy.selector, uint8(9)));
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.InvalidPolicy.selector, uint8(9)));
         agentFactory.createAccount(bytes32(0), p);
 
         // The library bounds, checked directly.
         Policy memory q = _defaultPolicy();
         q.maxPriceImpactBps = 10_001;
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.InvalidPolicy.selector, uint8(6)));
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.InvalidPolicy.selector, uint8(6)));
         this.validatePolicy(q);
         q = _defaultPolicy();
         q.maxSnipeBps = 10_001;
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.InvalidPolicy.selector, uint8(7)));
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.InvalidPolicy.selector, uint8(7)));
         this.validatePolicy(q);
         q = _defaultPolicy();
         q.maxDeadlineSeconds = 601;
-        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.InvalidPolicy.selector, uint8(9)));
+        vm.expectRevert(abi.encodeWithSelector(IAgentPolicyRegistry.InvalidPolicy.selector, uint8(9)));
         this.validatePolicy(q);
         q = _defaultPolicy();
         q.maxPriceImpactBps = 10_000;
@@ -291,14 +327,14 @@ contract AgentFactoryTest is AgentFixture {
             InitParams memory p = _defaults();
             p.periodSeconds = bad[i];
             vm.prank(accountOwner);
-            vm.expectRevert(IAgentAccount.PeriodOutOfRange.selector);
+            vm.expectRevert(IAgentPolicyRegistry.PeriodOutOfRange.selector);
             agentFactory.createAccount(bytes32(i), p);
         }
         uint32[2] memory good = [uint32(1 hours), uint32(7 days)];
         for (uint256 i; i < 2; ++i) {
             InitParams memory p = _defaults();
             p.periodSeconds = good[i];
-            assertEq(_account(accountOwner, bytes32(i), p).periodSeconds(), good[i]);
+            assertEq(registry.periodSeconds(address(_account(accountOwner, bytes32(i), p))), good[i]);
         }
     }
 
@@ -306,56 +342,58 @@ contract AgentFactoryTest is AgentFixture {
         InitParams memory p = _defaults();
         p.increaseDelay = 7 days + 1;
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.DelayOutOfRange.selector);
+        vm.expectRevert(IAgentPolicyRegistry.DelayOutOfRange.selector);
         agentFactory.createAccount(bytes32(0), p);
         p.increaseDelay = 7 days;
-        assertEq(_account(accountOwner, bytes32(0), p).increaseDelay(), 7 days);
+        assertEq(registry.increaseDelay(address(_account(accountOwner, bytes32(0), p))), 7 days);
         p.increaseDelay = 0;
-        assertEq(_account(accountOwner, bytes32(uint256(1)), p).increaseDelay(), 0);
+        assertEq(registry.increaseDelay(address(_account(accountOwner, bytes32(uint256(1)), p))), 0);
     }
 
     function test_FirstAgentExpiryOutOfRangeReverts() public {
         InitParams memory p = _defaults();
         p.firstAgentExpiresAt = uint40(block.timestamp + MAX_AGENT_TTL + 1);
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.AgentExpiryOutOfRange.selector);
+        vm.expectRevert(IAgentPolicyRegistry.AgentExpiryOutOfRange.selector);
         agentFactory.createAccount(bytes32(0), p);
 
         p.firstAgentExpiresAt = uint40(block.timestamp);
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.AgentExpiryOutOfRange.selector);
+        vm.expectRevert(IAgentPolicyRegistry.AgentExpiryOutOfRange.selector);
         agentFactory.createAccount(bytes32(0), p);
 
         p.firstAgentExpiresAt = uint40(block.timestamp + MAX_AGENT_TTL);
-        assertEq(_account(accountOwner, bytes32(0), p).agent(agentKey).expiresAt, p.firstAgentExpiresAt);
+        assertEq(
+            registry.agent(address(_account(accountOwner, bytes32(0), p)), agentKey).expiresAt, p.firstAgentExpiresAt
+        );
     }
 
     function test_FirstAgentPermissionsValidated() public {
         InitParams memory p = _defaults();
         p.firstAgentPermissions = 0;
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.InvalidPermissions.selector);
+        vm.expectRevert(IAgentPolicyRegistry.InvalidPermissions.selector);
         agentFactory.createAccount(bytes32(0), p);
 
         p.firstAgentPermissions = P_ALL + 1;
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.InvalidPermissions.selector);
+        vm.expectRevert(IAgentPolicyRegistry.InvalidPermissions.selector);
         agentFactory.createAccount(bytes32(0), p);
 
         p.firstAgentPermissions = P_BUY;
-        assertEq(_account(accountOwner, bytes32(0), p).agent(agentKey).permissions, P_BUY);
+        assertEq(registry.agent(address(_account(accountOwner, bytes32(0), p)), agentKey).permissions, P_BUY);
     }
 
     function test_FirstAgentCannotBeOwnerOrAccount() public {
         InitParams memory p = _defaults();
         p.firstAgent = accountOwner;
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.InvalidAgent.selector);
+        vm.expectRevert(IAgentPolicyRegistry.InvalidAgent.selector);
         agentFactory.createAccount(bytes32(0), p);
 
         p.firstAgent = agentFactory.predictAccount(accountOwner, bytes32(0));
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.InvalidAgent.selector);
+        vm.expectRevert(IAgentPolicyRegistry.InvalidAgent.selector);
         agentFactory.createAccount(bytes32(0), p);
     }
 
@@ -533,17 +571,7 @@ contract AgentFactoryTest is AgentFixture {
         bad[3].maxDeadlineSeconds = 601;
         for (uint256 i; i < 4; ++i) {
             address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
-            AgentAccount impl = new AgentAccount(
-                predicted,
-                address(factory),
-                address(feeManager),
-                address(gm),
-                address(hook),
-                address(poolManager),
-                address(router),
-                address(permit2),
-                USDC
-            );
+            AgentAccount impl = _newImpl(predicted);
             vm.expectRevert(abi.encodeWithSelector(IAgentAccountFactory.InvalidCeiling.selector, fields[i]));
             new AgentAccountFactory(address(impl), agentAdmin, agentGuardian, bad[i]);
         }

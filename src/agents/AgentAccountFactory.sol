@@ -4,6 +4,8 @@ pragma solidity ^0.8.26;
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IAgentAccount} from "./interfaces/IAgentAccount.sol";
 import {IAgentAccountFactory} from "./interfaces/IAgentAccountFactory.sol";
+import {IAgentPolicyRegistry} from "./interfaces/IAgentPolicyRegistry.sol";
+import {AgentPolicyRegistry} from "./AgentPolicyRegistry.sol";
 import {AgentPolicyLib} from "./AgentPolicyLib.sol";
 import {Policy, InitParams, GUARDIAN_PAUSE, GUARDIAN_COOLDOWN, MAX_ADMIN_PAUSE} from "./AgentTypes.sol";
 
@@ -19,6 +21,8 @@ contract AgentAccountFactory is IAgentAccountFactory {
 
     /// @notice The account implementation every clone delegates to.
     address public immutable implementation;
+    /// @notice The registry of every account's owner, policy, agents, queue and usage, deployed by this factory.
+    address public immutable registry;
     /// @notice Address that may replace the guardian and extend or lift a pause: the network's Launch timelock.
     address public immutable admin;
     /// @notice True when deployed without a guardian; then no pause can ever be set.
@@ -47,20 +51,27 @@ contract AgentAccountFactory is IAgentAccountFactory {
     mapping(address account => bool) public isAccount;
 
     /// @notice Binds the factory to its implementation, admin, guardian and beta ceilings for life.
-    /// @dev Reverts `ZeroAddress` for a zero implementation or admin, and `ImplementationMismatch` unless the
-    ///      implementation was deployed for this factory's address, and `InvalidCeiling(field)` for a ceiling outside
+    /// @dev Deploys the registry (this factory's first CREATE, so its address is predictable). Reverts `ZeroAddress`
+    ///      for a zero implementation or admin, `ImplementationMismatch` unless the implementation was deployed for
+    ///      this factory's address and this factory's registry, and `InvalidCeiling(field)` for a ceiling outside
     ///      the bounds every policy must meet (bps at most 10,000, deadline in `[1, 600]`). A zero guardian disables
     ///      the pause forever.
-    /// @param implementation_ AgentAccount implementation whose `FACTORY` is this factory's address.
+    /// @param implementation_ AgentAccount implementation whose `FACTORY` is this factory and whose `REGISTRY` is the
+    ///        registry this constructor deploys.
     /// @param admin_ The network's Launch timelock.
     /// @param guardian_ The Guardian Safe, or zero for no pause at all.
     /// @param ceilings_ Beta ceilings (amounts usdc6); `allowlistOnly` is ignored, `minTokenAgeBlocks` is a floor.
     constructor(address implementation_, address admin_, address guardian_, Policy memory ceilings_) {
         if (implementation_ == address(0) || admin_ == address(0)) revert ZeroAddress();
-        if (IAgentAccount(implementation_).FACTORY() != address(this)) revert ImplementationMismatch();
         (bool ok, uint8 field) = AgentPolicyLib.checkShape(ceilings_);
         if (!ok) revert InvalidCeiling(field);
+        address registry_ = address(new AgentPolicyRegistry());
+        if (
+            IAgentAccount(implementation_).FACTORY() != address(this)
+                || address(IAgentAccount(implementation_).REGISTRY()) != registry_
+        ) revert ImplementationMismatch();
         implementation = implementation_;
+        registry = registry_;
         admin = admin_;
         guardianDisabled = guardian_ == address(0);
         if (guardian_ != address(0)) {
@@ -86,7 +97,8 @@ contract AgentAccountFactory is IAgentAccountFactory {
         account = Clones.predictDeterministicAddress(implementation, salt_);
         if (account.code.length != 0) revert AccountExists(account);
         Clones.cloneDeterministic(implementation, salt_);
-        IAgentAccount(account).initialize(msg.sender, p);
+        IAgentPolicyRegistry(registry).register(account, msg.sender, p);
+        IAgentAccount(account).initialize(p.referrer);
         isAccount[account] = true;
         emit AccountCreated(msg.sender, account, p.referrer, salt);
     }

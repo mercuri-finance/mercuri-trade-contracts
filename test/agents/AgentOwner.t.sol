@@ -35,12 +35,12 @@ contract PolicyLibHarness {
         return AgentPolicyLib.tighten(cur, next);
     }
 
-    function merge(Policy memory cur, Policy memory snapshot, Policy memory target)
+    function merge(Policy memory cur, Policy memory target, uint64[11] memory lastWrite, uint64 seq)
         external
         pure
         returns (Policy memory)
     {
-        return AgentPolicyLib.merge(cur, snapshot, target);
+        return AgentPolicyLib.merge(cur, target, lastWrite, seq);
     }
 }
 
@@ -127,9 +127,7 @@ contract AgentOwnerTest is AgentFixture {
         assertEq(kind, Q_POLICY);
         assertEq(eta, _now() + 1 hours);
         assertEq(ep, 0);
-        (Policy memory target, Policy memory snap) = abi.decode(payload, (Policy, Policy));
-        _eq(target, p);
-        _eq(snap, _defaultPolicy());
+        _eq(abi.decode(payload, (Policy)), p);
         (kind,,,) = account.queued(2);
         assertEq(kind, Q_ADD_AGENT);
     }
@@ -391,9 +389,7 @@ contract AgentOwnerTest is AgentFixture {
         assertEq(id, 1);
         _eq(account.policy(), now_);
         (,,, bytes memory payload) = account.queued(id);
-        (Policy memory target, Policy memory snap) = abi.decode(payload, (Policy, Policy));
-        _eq(target, p);
-        _eq(snap, now_);
+        _eq(abi.decode(payload, (Policy)), p);
         _warp(_eta(id));
         account.executeQueued(id);
         _eq(account.policy(), p);
@@ -446,10 +442,14 @@ contract AgentOwnerTest is AgentFixture {
         vm.startPrank(accountOwner);
         vm.expectRevert(IAgentAccount.AgentRetired.selector);
         account.addAgent(agentKey, uint40(_now() + 1 days), P_BUY);
-        vm.expectRevert(IAgentAccount.AgentNotActive.selector);
+        vm.expectRevert(IAgentAccount.AgentRetired.selector);
         account.revokeAgent(agentKey);
-        vm.expectRevert(IAgentAccount.AgentNotActive.selector);
+        // Any address can be retired pre-emptively, active or not.
         account.revokeAgent(stranger);
+        assertTrue(account.retired(stranger));
+        assertEq(account.activeAgentCount(), 0);
+        vm.expectRevert(IAgentAccount.AgentRetired.selector);
+        account.addAgent(stranger, uint40(_now() + 1 days), P_BUY);
         vm.stopPrank();
     }
 
@@ -493,7 +493,7 @@ contract AgentOwnerTest is AgentFixture {
         assertEq(account.activeAgentCount(), 1);
 
         vm.prank(accountOwner);
-        vm.expectRevert(IAgentAccount.AgentNotActive.selector);
+        vm.expectRevert(IAgentAccount.AgentRetired.selector);
         account.rotateAgent(agentKey, makeAddr("x"), exp, P_BUY);
         vm.prank(accountOwner);
         vm.expectRevert(IAgentAccount.AgentRetired.selector);
@@ -782,6 +782,135 @@ contract AgentOwnerTest is AgentFixture {
         }
     }
 
+    // ---------------------------------------------------------------- version-based staleness (fix round 1)
+
+    /// @dev A->B->A: item 1 widens 100 -> 200; the owner tightens to 50, then queues and executes 50 -> 100.
+    ///      Item 1 must not apply 200, although the value is back at its queue-time value.
+    function test_PolicyABAWideningDoesNotReturn() public {
+        Policy memory p = _defaultPolicy();
+        p.maxTradeUsdc = 200e6;
+        uint256 id1 = _setPolicy(p);
+        p.maxTradeUsdc = 50e6;
+        assertEq(_setPolicy(p), 0);
+        p.maxTradeUsdc = 100e6;
+        uint256 id2 = _setPolicy(p);
+        _warp(_eta(id2));
+        account.executeQueued(id2);
+        assertEq(account.policy().maxTradeUsdc, 100e6);
+        account.executeQueued(id1);
+        assertEq(account.policy().maxTradeUsdc, 100e6, "old widening must not return");
+    }
+
+    function test_SetAgentABAWideningIsStale() public {
+        uint40 e = account.agent(agentKey).expiresAt;
+        vm.startPrank(accountOwner);
+        uint256 id1 = account.setAgent(agentKey, e + 10 days, P_ALL);
+        assertEq(account.setAgent(agentKey, e - 1 days, P_ALL), 0);
+        uint256 id2 = account.setAgent(agentKey, e, P_ALL);
+        vm.stopPrank();
+        _warp(_eta(id2));
+        account.executeQueued(id2);
+        assertEq(account.agent(agentKey).expiresAt, e);
+        vm.expectRevert(IAgentAccount.StaleQueued.selector);
+        account.executeQueued(id1);
+        assertEq(account.agent(agentKey).expiresAt, e);
+    }
+
+    function test_DelayABALoweringIsStale() public {
+        vm.startPrank(accountOwner);
+        uint256 id1 = account.setIncreaseDelay(0);
+        account.setIncreaseDelay(2 hours);
+        uint256 id2 = account.setIncreaseDelay(1 hours);
+        vm.stopPrank();
+        _warp(_eta(id2));
+        account.executeQueued(id2);
+        assertEq(account.increaseDelay(), 1 hours);
+        vm.expectRevert(IAgentAccount.StaleQueued.selector);
+        account.executeQueued(id1);
+        assertEq(account.increaseDelay(), 1 hours);
+    }
+
+    function test_DoubleQueuedTokenAddGoesStaleAfterRemoval() public {
+        address token = makeAddr("token");
+        vm.startPrank(accountOwner);
+        uint256 id1 = account.setTokenAllowed(token, true);
+        uint256 id2 = account.setTokenAllowed(token, true);
+        vm.stopPrank();
+        _warp(_eta(id2));
+        account.executeQueued(id2);
+        assertTrue(account.tokenAllowed(token));
+        vm.prank(accountOwner);
+        account.setTokenAllowed(token, false);
+        vm.expectRevert(IAgentAccount.StaleQueued.selector);
+        account.executeQueued(id1);
+        assertFalse(account.tokenAllowed(token));
+    }
+
+    function test_RemovalWhileAddPendingMakesAddStale() public {
+        address token = makeAddr("token");
+        vm.prank(accountOwner);
+        uint256 id = account.setTokenAllowed(token, true);
+        vm.prank(accountOwner);
+        assertEq(account.setTokenAllowed(token, false), 0);
+        _warp(_eta(id));
+        vm.expectRevert(IAgentAccount.StaleQueued.selector);
+        account.executeQueued(id);
+        assertFalse(account.tokenAllowed(token));
+    }
+
+    function test_DelayRaiseAlsoDelaysQueuedItems() public {
+        uint256 t0 = _now();
+        Policy memory p = _defaultPolicy();
+        p.maxTradeUsdc = 200e6;
+        uint256 id = _setPolicy(p);
+        p.maxTradeUsdc = 300e6;
+        uint256 idLate = _setPolicy(p);
+        assertEq(_eta(id), t0 + 1 hours);
+        vm.prank(accountOwner);
+        account.setIncreaseDelay(5 hours);
+        assertEq(_eta(id), t0 + 5 hours, "effective ETA follows the raised delay");
+        _warp(t0 + 1 hours);
+        vm.expectRevert(abi.encodeWithSelector(IAgentAccount.TooEarly.selector, uint40(t0 + 5 hours)));
+        account.executeQueued(id);
+        _warp(t0 + 5 hours);
+        account.executeQueued(id);
+        assertEq(account.policy().maxTradeUsdc, 200e6);
+        // Expiry is measured from the effective ETA, and the expired item stays in storage.
+        _warp(t0 + 5 hours + QUEUE_TTL + 1);
+        vm.expectRevert(IAgentAccount.QueuedExpired.selector);
+        account.executeQueued(idLate);
+        (uint8 kind,,,) = account.queued(idLate);
+        assertEq(kind, Q_POLICY);
+    }
+
+    function test_RetiringInactiveAddressKillsPendingAdd() public {
+        vm.prank(accountOwner);
+        uint256 id = account.addAgent(newKey, uint40(_now() + 30 days), P_BUY);
+        vm.expectEmit(address(account));
+        emit IAgentAccount.AgentRevoked(newKey, 0, 0);
+        vm.prank(accountOwner);
+        account.revokeAgent(newKey);
+        assertTrue(account.retired(newKey));
+        assertEq(account.activeAgentCount(), 1);
+        _warp(_eta(id));
+        vm.expectRevert(IAgentAccount.AgentRetired.selector);
+        account.executeQueued(id);
+    }
+
+    function test_WriteSeqMovesOnEveryAppliedChange() public {
+        uint64 s0 = account.writeSeq();
+        Policy memory p = _defaultPolicy();
+        p.maxTradeUsdc = 50e6;
+        _setPolicy(p);
+        assertEq(account.writeSeq(), s0 + 1);
+        vm.startPrank(accountOwner);
+        account.setTokenAllowed(stranger, false);
+        account.setIncreaseDelay(2 hours);
+        account.revokeAgent(agentKey);
+        vm.stopPrank();
+        assertEq(account.writeSeq(), s0 + 4);
+    }
+
     // ---------------------------------------------------------------- library fuzz
 
     function testFuzz_IsNarrowingMatchesPerFieldRule(Policy memory cur, Policy memory next) public view {
@@ -825,39 +954,19 @@ contract AgentOwnerTest is AgentFixture {
         assertEq(lib.isNarrowing(cur, next), narrowing);
     }
 
-    function testFuzz_MergeKeepsChangedFields(Policy memory cur, Policy memory snap, Policy memory target) public view {
-        Policy memory m = lib.merge(cur, snap, target);
-        assertEq(m.maxTradeUsdc, cur.maxTradeUsdc == snap.maxTradeUsdc ? target.maxTradeUsdc : cur.maxTradeUsdc);
-        assertEq(
-            m.periodSpendCap, cur.periodSpendCap == snap.periodSpendCap ? target.periodSpendCap : cur.periodSpendCap
-        );
-        assertEq(
-            m.perTokenPeriodCap,
-            cur.perTokenPeriodCap == snap.perTokenPeriodCap ? target.perTokenPeriodCap : cur.perTokenPeriodCap
-        );
-        assertEq(m.periodSellCap, cur.periodSellCap == snap.periodSellCap ? target.periodSellCap : cur.periodSellCap);
-        assertEq(
-            m.maxActionsPerPeriod,
-            cur.maxActionsPerPeriod == snap.maxActionsPerPeriod ? target.maxActionsPerPeriod : cur.maxActionsPerPeriod
-        );
-        assertEq(
-            m.launchesPerPeriod,
-            cur.launchesPerPeriod == snap.launchesPerPeriod ? target.launchesPerPeriod : cur.launchesPerPeriod
-        );
-        assertEq(
-            m.maxPriceImpactBps,
-            cur.maxPriceImpactBps == snap.maxPriceImpactBps ? target.maxPriceImpactBps : cur.maxPriceImpactBps
-        );
-        assertEq(m.maxSnipeBps, cur.maxSnipeBps == snap.maxSnipeBps ? target.maxSnipeBps : cur.maxSnipeBps);
-        assertEq(
-            m.minTokenAgeBlocks,
-            cur.minTokenAgeBlocks == snap.minTokenAgeBlocks ? target.minTokenAgeBlocks : cur.minTokenAgeBlocks
-        );
-        assertEq(
-            m.maxDeadlineSeconds,
-            cur.maxDeadlineSeconds == snap.maxDeadlineSeconds ? target.maxDeadlineSeconds : cur.maxDeadlineSeconds
-        );
-        assertEq(m.allowlistOnly, cur.allowlistOnly == snap.allowlistOnly ? target.allowlistOnly : cur.allowlistOnly);
+    function testFuzz_MergeTakesTargetOnlyForUnwrittenFields(
+        Policy memory cur,
+        Policy memory target,
+        uint64[11] memory lastWrite,
+        uint64 seq
+    ) public view {
+        Policy memory m = lib.merge(cur, target, lastWrite, seq);
+        uint256[11] memory c = abi.decode(abi.encode(cur), (uint256[11]));
+        uint256[11] memory t = abi.decode(abi.encode(target), (uint256[11]));
+        uint256[11] memory r = abi.decode(abi.encode(m), (uint256[11]));
+        for (uint256 i; i < 11; ++i) {
+            assertEq(r[i], lastWrite[i] <= seq ? t[i] : c[i]);
+        }
     }
 
     /// @dev Review focus 2 end to end: any tightening after a queued widening survives its execution.

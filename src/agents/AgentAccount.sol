@@ -39,11 +39,17 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     using AgentPolicyLib for Policy;
     using SafeERC20 for IERC20;
 
-    /// @dev A queued owner change; see `queued` for the payload encodings.
+    /// @dev A queued owner change; see `queued` for the payload encodings. One slot plus the payload.
     struct QueuedItem {
         uint8 kind;
-        uint40 eta;
+        /// @dev Unix seconds when queued.
+        uint40 queuedAt;
+        /// @dev `increaseDelay` when queued, seconds.
+        uint32 delayAtQueue;
+        /// @dev `epoch` when queued.
         uint64 epoch;
+        /// @dev `writeSeq` when queued.
+        uint64 seq;
         bytes payload;
     }
 
@@ -90,6 +96,16 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     bool public ownerPaused;
     /// @inheritdoc IAgentAccount
     uint64 public epoch;
+    /// @inheritdoc IAgentAccount
+    uint64 public writeSeq;
+    /// @dev Delay's last write sequence number.
+    uint64 private delayWrite;
+    /// @dev Each policy field's last write sequence number, in `Policy` struct order.
+    uint64[11] private policyWrite;
+    /// @dev Each agent address's last write sequence number (activation, term change or retirement).
+    mapping(address => uint64) private agentWrite;
+    /// @dev Each token's last allowlist write sequence number (addition or removal).
+    mapping(address => uint64) private tokenWrite;
     /// @dev Last queue id handed out; ids start at 1.
     uint256 private lastQueueId;
     /// @dev Queued items by id; deleted on execution or cancellation.
@@ -179,7 +195,8 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     /// @inheritdoc IAgentAccount
     function queued(uint256 id) external view returns (uint8 kind, uint40 eta, uint64 itemEpoch, bytes memory payload) {
         QueuedItem storage q = queue[id];
-        return (q.kind, q.eta, q.epoch, q.payload);
+        if (q.kind == 0) return (0, 0, 0, "");
+        return (q.kind, _eta(q.queuedAt, q.delayAtQueue), q.epoch, q.payload);
     }
 
     // ------------------------------------------------------------------ agents
@@ -188,7 +205,7 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     function addAgent(address a, uint40 expiresAt, uint16 permissions) public onlyOwner returns (uint256 id) {
         _checkAddable(a, expiresAt, permissions);
         id = _queue(Q_ADD_AGENT, abi.encode(a, expiresAt, permissions));
-        emit AgentQueued(id, a, expiresAt, permissions, queue[id].eta);
+        emit AgentQueued(id, a, expiresAt, permissions, uint40(block.timestamp + increaseDelay));
     }
 
     /// @inheritdoc IAgentAccount
@@ -200,8 +217,8 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
             _setAgentTerms(a, expiresAt, permissions);
             return 0;
         }
-        id = _queue(Q_SET_AGENT, abi.encode(a, expiresAt, permissions, cur));
-        emit AgentQueued(id, a, expiresAt, permissions, queue[id].eta);
+        id = _queue(Q_SET_AGENT, abi.encode(a, expiresAt, permissions));
+        emit AgentQueued(id, a, expiresAt, permissions, uint40(block.timestamp + increaseDelay));
     }
 
     /// @inheritdoc IAgentAccount
@@ -231,7 +248,7 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
             target.checkCeilings(IAgentAccountFactory(FACTORY).ceilings());
             target.validate();
             id = _queue(Q_POLICY, abi.encode(target, now_));
-            emit PolicyQueued(id, queue[id].eta, target);
+            emit PolicyQueued(id, uint40(block.timestamp + increaseDelay), target);
         }
     }
 
@@ -240,12 +257,13 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         if (token == address(0)) revert ZeroAddress();
         if (!allowed) {
             tokenAllowed[token] = false;
+            tokenWrite[token] = ++writeSeq;
             emit TokenAllowed(token, false);
             return 0;
         }
         if (tokenAllowed[token]) return 0;
         id = _queue(Q_ALLOW_TOKEN, abi.encode(token));
-        emit TokenAllowQueued(id, token, queue[id].eta);
+        emit TokenAllowQueued(id, token, uint40(block.timestamp + increaseDelay));
     }
 
     /// @inheritdoc IAgentAccount
@@ -253,12 +271,11 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         if (d > MAX_DELAY) revert DelayOutOfRange();
         uint32 cur = increaseDelay;
         if (d >= cur) {
-            increaseDelay = d;
-            emit IncreaseDelaySet(d);
+            _setDelay(d);
             return 0;
         }
-        id = _queue(Q_DELAY, abi.encode(d, cur));
-        emit IncreaseDelayQueued(id, d, queue[id].eta);
+        id = _queue(Q_DELAY, abi.encode(d));
+        emit IncreaseDelayQueued(id, d, uint40(block.timestamp + increaseDelay));
     }
 
     // ------------------------------------------------------------------ ownership
@@ -267,7 +284,7 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     function transferOwnership(address newOwner) external onlyOwner returns (uint256 id) {
         if (newOwner == address(0) || newOwner == address(this) || newOwner == owner) revert InvalidOwner();
         id = _queue(Q_OWNER, abi.encode(newOwner));
-        emit OwnershipQueued(id, newOwner, queue[id].eta);
+        emit OwnershipQueued(id, newOwner, uint40(block.timestamp + increaseDelay));
     }
 
     /// @inheritdoc IAgentAccount
@@ -276,7 +293,7 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         if (q.kind == 0) revert UnknownQueued(id);
         if (q.kind != Q_OWNER || abi.decode(q.payload, (address)) != msg.sender) revert NotPendingOwner();
         if (q.epoch != epoch) revert StaleQueued();
-        _checkWindow(q.eta);
+        _checkWindow(_eta(q.queuedAt, q.delayAtQueue));
         delete queue[id];
         if (agents[msg.sender].active) _revoke(msg.sender);
         address previous = owner;
@@ -298,34 +315,31 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
             emit QueuedCancelled(id);
             return;
         }
-        _checkWindow(q.eta);
-        if (q.kind == Q_ADD_AGENT) {
-            (address a, uint40 expiresAt, uint16 permissions) = abi.decode(q.payload, (address, uint40, uint16));
-            _checkAddable(a, expiresAt, permissions);
-            if (activeAgentCount >= MAX_AGENTS) revert TooManyAgents();
-            ++activeAgentCount;
-            _setAgentTerms(a, expiresAt, permissions);
-        } else if (q.kind == Q_SET_AGENT) {
-            (address a, uint40 expiresAt, uint16 permissions, Agent memory snap) =
-                abi.decode(q.payload, (address, uint40, uint16, Agent));
-            Agent memory cur = agents[a];
-            if (cur.active != snap.active || cur.expiresAt != snap.expiresAt || cur.permissions != snap.permissions) {
-                revert StaleQueued();
-            }
-            _checkAgentTerms(a, expiresAt, permissions);
-            _setAgentTerms(a, expiresAt, permissions);
-        } else if (q.kind == Q_POLICY) {
-            (Policy memory target, Policy memory snap) = abi.decode(q.payload, (Policy, Policy));
-            _applyPolicy(_policy.merge(snap, target));
+        _checkWindow(_eta(q.queuedAt, q.delayAtQueue));
+        if (q.kind == Q_POLICY) {
+            _applyPolicy(_policy.merge(abi.decode(q.payload, (Policy)), policyWrite, q.seq));
         } else if (q.kind == Q_ALLOW_TOKEN) {
             address token = abi.decode(q.payload, (address));
+            _checkFresh(tokenWrite[token], q.seq);
             tokenAllowed[token] = true;
+            tokenWrite[token] = ++writeSeq;
             emit TokenAllowed(token, true);
+        } else if (q.kind == Q_DELAY) {
+            _checkFresh(delayWrite, q.seq);
+            _setDelay(abi.decode(q.payload, (uint32)));
         } else {
-            (uint32 d, uint32 snap) = abi.decode(q.payload, (uint32, uint32));
-            if (increaseDelay != snap) revert StaleQueued();
-            increaseDelay = d;
-            emit IncreaseDelaySet(d);
+            (address a, uint40 expiresAt, uint16 permissions) = abi.decode(q.payload, (address, uint40, uint16));
+            if (q.kind == Q_ADD_AGENT) {
+                _checkAddable(a, expiresAt, permissions);
+                _checkFresh(agentWrite[a], q.seq);
+                if (activeAgentCount >= MAX_AGENTS) revert TooManyAgents();
+                ++activeAgentCount;
+            } else {
+                _checkFresh(agentWrite[a], q.seq);
+                if (!agents[a].active) revert AgentNotActive();
+                _checkAgentTerms(a, expiresAt, permissions);
+            }
+            _setAgentTerms(a, expiresAt, permissions);
         }
         emit QueuedExecuted(id);
     }
@@ -378,6 +392,12 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     function _applyPolicy(Policy memory next) private {
         next.checkCeilings(IAgentAccountFactory(FACTORY).ceilings());
         next.validate();
+        uint256[11] memory o = AgentPolicyLib.words(_policy);
+        uint256[11] memory n = AgentPolicyLib.words(next);
+        uint64 seq = ++writeSeq;
+        for (uint256 i; i < 11; ++i) {
+            if (o[i] != n[i]) policyWrite[i] = seq;
+        }
         _policy = next;
         emit PolicyApplied(next);
     }
@@ -387,21 +407,52 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
         if (msg.sender != owner) revert NotOwner();
     }
 
-    /// @dev Stores a new queued item for the current epoch with ETA `now + increaseDelay`.
+    /// @dev Stores a new queued item with the current time, delay, epoch and write sequence number.
     /// @param kind `Q_*` kind.
     /// @param payload ABI-encoded arguments.
     /// @return id The new queue id.
     function _queue(uint8 kind, bytes memory payload) private returns (uint256 id) {
         id = ++lastQueueId;
-        queue[id] =
-            QueuedItem({kind: kind, eta: uint40(block.timestamp + increaseDelay), epoch: epoch, payload: payload});
+        queue[id] = QueuedItem({
+            kind: kind,
+            queuedAt: uint40(block.timestamp),
+            delayAtQueue: increaseDelay,
+            epoch: epoch,
+            seq: writeSeq,
+            payload: payload
+        });
+    }
+
+    /// @dev Effective ETA: `queuedAt + max(delayAtQueue, increaseDelay)`, so raising the delay also delays items
+    ///      already queued.
+    /// @param queuedAt The item's queue time, Unix seconds.
+    /// @param delayAtQueue The delay when it was queued, seconds.
+    /// @return Unix seconds.
+    function _eta(uint40 queuedAt, uint32 delayAtQueue) private view returns (uint40) {
+        uint32 d = increaseDelay;
+        return queuedAt + (delayAtQueue > d ? delayAtQueue : d);
     }
 
     /// @dev Reverts `TooEarly` before `eta` and `QueuedExpired` after `eta + QUEUE_TTL`.
-    /// @param eta The item's ETA, Unix seconds.
+    /// @param eta The item's effective ETA, Unix seconds.
     function _checkWindow(uint40 eta) private view {
         if (block.timestamp < eta) revert TooEarly(eta);
         if (block.timestamp > eta + QUEUE_TTL) revert QueuedExpired();
+    }
+
+    /// @dev Reverts `StaleQueued` when the item's subject was written after the item was queued.
+    /// @param lastWrite The subject's last write sequence number.
+    /// @param seq The item's `writeSeq` at queue time.
+    function _checkFresh(uint64 lastWrite, uint64 seq) private pure {
+        if (lastWrite > seq) revert StaleQueued();
+    }
+
+    /// @dev Stores the widening delay, records the write and emits `IncreaseDelaySet`.
+    /// @param d Delay, seconds.
+    function _setDelay(uint32 d) private {
+        increaseDelay = d;
+        delayWrite = ++writeSeq;
+        emit IncreaseDelaySet(d);
     }
 
     /// @dev Reverts unless `a` can be added now: not retired, not active, and acceptable terms.
@@ -420,17 +471,21 @@ contract AgentAccount is IAgentAccount, ReentrancyGuardTransient {
     /// @param permissions `P_*` bitmask.
     function _setAgentTerms(address a, uint40 expiresAt, uint16 permissions) private {
         agents[a] = Agent({active: true, expiresAt: expiresAt, permissions: permissions});
+        agentWrite[a] = ++writeSeq;
         emit AgentActivated(a, expiresAt, permissions);
     }
 
-    /// @dev Revokes an active agent and retires its address forever.
-    /// @param a The agent key.
+    /// @dev Retires `a` forever, revoking it if active, and records the write.
+    /// @param a The address.
     function _revoke(address a) private {
+        if (retired[a]) revert AgentRetired();
         Agent memory cur = agents[a];
-        if (!cur.active) revert AgentNotActive();
-        agents[a].active = false;
         retired[a] = true;
-        --activeAgentCount;
+        agentWrite[a] = ++writeSeq;
+        if (cur.active) {
+            agents[a].active = false;
+            --activeAgentCount;
+        }
         emit AgentRevoked(a, cur.expiresAt, cur.permissions);
     }
 

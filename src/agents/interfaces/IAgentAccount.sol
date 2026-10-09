@@ -27,15 +27,15 @@ interface IAgentAccount is IERC1271 {
     /// @param permissions Requested `P_*` bitmask.
     /// @param eta Unix time (seconds) from which anyone may execute the item; it expires 7 days later.
     event AgentQueued(uint256 indexed id, address indexed agent, uint40 expiresAt, uint16 permissions, uint40 eta);
-    /// @notice An agent was revoked and retired forever.
-    /// @param agent The agent key.
-    /// @param expiresAt Expiry it had, Unix seconds.
-    /// @param permissions `P_*` bitmask it had.
+    /// @notice An address was retired forever, and revoked if it was an active agent.
+    /// @param agent The address.
+    /// @param expiresAt Expiry it had, Unix seconds; zero if it was never an agent.
+    /// @param permissions `P_*` bitmask it had; zero if it was never an agent.
     event AgentRevoked(address indexed agent, uint40 expiresAt, uint16 permissions);
     /// @notice A policy widening was queued.
     /// @param id Queue id.
     /// @param eta Unix time (seconds) from which anyone may execute the item; it expires 7 days later.
-    /// @param policy The full target policy (amounts usdc6); fields tightened before execution keep their value.
+    /// @param policy The full target policy (amounts usdc6); fields changed after queueing keep their value.
     event PolicyQueued(uint256 indexed id, uint40 eta, Policy policy);
     /// @notice A queued item was cancelled by the owner, or found void on an execution attempt after the account's
     ///         epoch moved (agents paused or ownership transferred).
@@ -120,8 +120,8 @@ interface IAgentAccount is IERC1271 {
     error TooEarly(uint40 eta);
     /// @notice The queued item expired 7 days after its ETA.
     error QueuedExpired();
-    /// @notice The queued item no longer applies: the state it was queued against changed (agent terms or delay
-    ///         changed, or the epoch moved before an ownership acceptance).
+    /// @notice The queued item no longer applies: its subject (the agent, the token's allowlist entry or the delay)
+    ///         was written after it was queued, or, for an ownership acceptance, the epoch moved.
     error StaleQueued();
     /// @notice Ownership transfers complete only through `acceptOwnership` by the new owner.
     error AcceptRequired();
@@ -199,19 +199,26 @@ interface IAgentAccount is IERC1271 {
     /// @notice Whether the owner has paused this account's agents.
     /// @return True when paused.
     function ownerPaused() external view returns (bool);
+    /// @notice Write sequence number: incremented by every applied change to the policy, an agent, a token's
+    ///         allowlist entry or the delay. Queued items record it, and an item's subject written after that number
+    ///         is not overwritten by it.
+    /// @return The current number.
+    function writeSeq() external view returns (uint64);
     /// @notice Current queue epoch. Items queued in an older epoch are void; pausing agents and accepting ownership
     ///         move it.
     /// @return The epoch.
     function epoch() external view returns (uint64);
     /// @notice A queued item. An item is executable when it exists, its epoch equals `epoch()` and
-    ///         `eta <= now <= eta + 7 days`.
+    ///         `eta <= now <= eta + 7 days`. Expired and older-epoch items stay in storage until executed (which
+    ///         deletes an older-epoch item) or cancelled.
     /// @param id Queue id (ids start at 1).
     /// @return kind `Q_*` kind; zero when no item has this id.
-    /// @return eta Unix time (seconds) from which it may be executed.
+    /// @return eta Effective ETA, Unix seconds: queue time plus the larger of the delay at queue time and the
+    ///         current delay, so raising the delay also delays items already queued. Expiry is `eta + 7 days`.
     /// @return itemEpoch Epoch at queue time.
-    /// @return payload ABI-encoded arguments: `(address, uint40, uint16)` for an addition; `(address, uint40, uint16,
-    ///         Agent snapshot)` for an agent widening; `(Policy target, Policy snapshot)` for a policy; `(address)` for
-    ///         a token; `(uint32 delay, uint32 snapshot)` for the delay; `(address)` for an owner.
+    /// @return payload ABI-encoded arguments: `(address agent, uint40 expiresAt, uint16 permissions)` for an agent
+    ///         addition or widening; `(Policy target)` for a policy; `(address token)`; `(uint32 delay)`;
+    ///         `(address newOwner)`.
     function queued(uint256 id) external view returns (uint8 kind, uint40 eta, uint64 itemEpoch, bytes memory payload);
 
     /// @notice Queues a new agent key; it becomes active once the item executes.
@@ -223,19 +230,19 @@ interface IAgentAccount is IERC1271 {
     /// @return id Queue id.
     function addAgent(address a, uint40 expiresAt, uint16 permissions) external returns (uint256 id);
     /// @notice Replaces an active agent's terms: immediately when the expiry is not later and no permission is added,
-    ///         otherwise queued as a full replacement that executes only if the agent is unchanged by then.
+    ///         otherwise queued as a full replacement that executes only if the agent was not written since.
     /// @dev Owner only. Reverts `AgentNotActive` for an inactive key.
     /// @param a The agent key.
     /// @param expiresAt New expiry, Unix seconds, in `(now, now + 180 days]`.
     /// @param permissions New `P_*` bitmask, non-zero and within `P_ALL`.
     /// @return id Queue id, or zero when applied immediately.
     function setAgent(address a, uint40 expiresAt, uint16 permissions) external returns (uint256 id);
-    /// @notice Revokes an active agent now and retires its address forever. Queued items for it can no longer
-    ///         execute.
-    /// @dev Owner only.
-    /// @param a The agent key.
+    /// @notice Retires an address forever, revoking it now if it is an active agent. Queued items for it can no
+    ///         longer execute (an addition fails `AgentRetired`, a widening `StaleQueued`).
+    /// @dev Owner only. Reverts `AgentRetired` if already retired.
+    /// @param a The address.
     function revokeAgent(address a) external;
-    /// @notice Revokes `oldA` now and queues `newA` with the given terms.
+    /// @notice Retires `oldA` now (revoking it if active) and queues `newA` with the given terms.
     /// @dev Owner only. Same checks as `revokeAgent` and `addAgent`.
     /// @param oldA The agent key to retire.
     /// @param newA The replacement key.
@@ -244,20 +251,22 @@ interface IAgentAccount is IERC1271 {
     /// @return id Queue id of the addition.
     function rotateAgent(address oldA, address newA, uint40 expiresAt, uint16 permissions) external returns (uint256 id);
     /// @notice Sets the policy: every field that is not looser takes effect now; if any field is looser, the full
-    ///         target is queued with a snapshot of the policy after the immediate part.
+    ///         target is queued after the immediate part. On execution, fields written after queueing keep their
+    ///         current value.
     /// @dev Owner only. Both the immediate result and the target are checked against the beta ceilings and policy
     ///      bounds; on execution the merged result is checked again.
     /// @param p Target policy (amounts usdc6).
     /// @return id Queue id, or zero when nothing was queued.
     function setPolicy(Policy calldata p) external returns (uint256 id);
     /// @notice Removes a token from the buy allowlist now, or queues adding it.
-    /// @dev Owner only. Adding a token already allowed returns zero without queueing.
+    /// @dev Owner only. Adding a token already allowed returns zero without queueing. A removal makes every pending
+    ///      addition of the token stale.
     /// @param token The token; not zero.
     /// @param allowed True to add, false to remove.
     /// @return id Queue id, or zero when applied immediately.
     function setTokenAllowed(address token, bool allowed) external returns (uint256 id);
     /// @notice Raises (or keeps) the widening delay now, or queues lowering it behind the current delay.
-    /// @dev Owner only. A queued lowering executes only if the delay is unchanged by then.
+    /// @dev Owner only. A queued lowering executes only if the delay was not written since.
     /// @param d New delay, seconds, at most 7 days.
     /// @return id Queue id, or zero when applied immediately.
     function setIncreaseDelay(uint32 d) external returns (uint256 id);
@@ -272,8 +281,9 @@ interface IAgentAccount is IERC1271 {
     /// @param id Queue id of the transfer.
     function acceptOwnership(uint256 id) external;
     /// @notice Executes a queued item. Anyone may call it.
-    /// @dev From the ETA to 7 days after it. An item from an older epoch is deleted with `QueuedCancelled` instead,
-    ///      without reverting. Ownership items revert `AcceptRequired`.
+    /// @dev From the effective ETA to 7 days after it; an expired item reverts `QueuedExpired` and stays in storage
+    ///      until cancelled. An item from an older epoch is deleted with `QueuedCancelled` instead, without
+    ///      reverting. Ownership items revert `AcceptRequired`.
     /// @param id Queue id.
     function executeQueued(uint256 id) external;
     /// @notice Deletes a queued item.

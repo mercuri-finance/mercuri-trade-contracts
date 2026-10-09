@@ -25,8 +25,8 @@ library AgentPolicyLib {
     /// @param p Policy to check (amounts usdc6).
     /// @param c Beta ceilings (amounts usdc6).
     function checkCeilings(Policy memory p, Policy memory c) internal pure {
-        uint256[11] memory pw = _words(p);
-        uint256[11] memory cw = _words(c);
+        uint256[11] memory pw = words(p);
+        uint256[11] memory cw = words(c);
         for (uint256 i; i < F_ALLOWLIST_ONLY; ++i) {
             if (i == F_MIN_TOKEN_AGE_BLOCKS ? pw[i] < cw[i] : pw[i] > cw[i]) {
                 revert IAgentAccount.BetaCeiling(uint8(i));
@@ -61,8 +61,8 @@ library AgentPolicyLib {
     /// @param next Proposed policy (amounts usdc6).
     /// @return True when no field of `next` is looser than in `current`.
     function isNarrowing(Policy memory current, Policy memory next) internal pure returns (bool) {
-        uint256[11] memory c = _words(current);
-        uint256[11] memory n = _words(next);
+        uint256[11] memory c = words(current);
+        uint256[11] memory n = words(next);
         for (uint256 i; i < POLICY_FIELDS; ++i) {
             if (!_narrows(i, c[i], n[i])) return false;
         }
@@ -77,32 +77,33 @@ library AgentPolicyLib {
     /// @param next Proposed policy (amounts usdc6).
     /// @return The policy to apply now (amounts usdc6).
     function tighten(Policy memory current, Policy memory next) internal pure returns (Policy memory) {
-        uint256[11] memory c = _words(current);
-        uint256[11] memory n = _words(next);
+        uint256[11] memory c = words(current);
+        uint256[11] memory n = words(next);
         for (uint256 i; i < POLICY_FIELDS; ++i) {
             if (_narrows(i, c[i], n[i])) c[i] = n[i];
         }
         return _fromWords(c);
     }
 
-    /// @notice The policy a queued change applies: field by field, `target` where `current` still equals the
-    ///         `snapshot` taken at queue time, and `current` where the field changed since.
-    /// @dev A field changes while an item waits only through an immediate tightening or another executed queued
-    ///      item; either way the newer value wins, so an older queued widening never undoes a later tightening.
+    /// @notice The policy a queued change applies: field by field, `target` where the field was last written at or
+    ///         before the item was queued (`lastWrite[i] <= seq`), and `current` where it was written since.
+    /// @dev Versions, not values, decide: a field written after queueing (an immediate tightening, or another
+    ///      executed item) keeps its value even if it later returns to the value it had at queue time, so an older
+    ///      queued widening never undoes a later change.
     /// @param current Policy in force (amounts usdc6).
-    /// @param snapshot Policy in force when the change was queued (amounts usdc6).
     /// @param target Policy the owner asked for (amounts usdc6).
+    /// @param lastWrite Write sequence number of each field's last change, in `Policy` struct order.
+    /// @param seq The account's write sequence number when the change was queued.
     /// @return The merged policy (amounts usdc6).
-    function merge(Policy memory current, Policy memory snapshot, Policy memory target)
+    function merge(Policy memory current, Policy memory target, uint64[11] memory lastWrite, uint64 seq)
         internal
         pure
         returns (Policy memory)
     {
-        uint256[11] memory c = _words(current);
-        uint256[11] memory s = _words(snapshot);
-        uint256[11] memory t = _words(target);
+        uint256[11] memory c = words(current);
+        uint256[11] memory t = words(target);
         for (uint256 i; i < POLICY_FIELDS; ++i) {
-            if (c[i] == s[i]) c[i] = t[i];
+            if (lastWrite[i] <= seq) c[i] = t[i];
         }
         return _fromWords(c);
     }
@@ -117,14 +118,15 @@ library AgentPolicyLib {
         return field == F_MIN_TOKEN_AGE_BLOCKS || field == F_ALLOWLIST_ONLY ? next >= current : next <= current;
     }
 
-    /// @dev A policy as its 11 ABI words, one per field in struct order (a static struct encodes field by field).
+    /// @notice A policy as its 11 ABI words, one per field in `Policy` struct order (a static struct encodes field
+    ///         by field; `allowlistOnly` is 0 or 1).
     /// @param p The policy.
     /// @return The field values.
-    function _words(Policy memory p) private pure returns (uint256[11] memory) {
+    function words(Policy memory p) internal pure returns (uint256[11] memory) {
         return abi.decode(abi.encode(p), (uint256[11]));
     }
 
-    /// @dev Inverse of `_words`; every word comes from a field of the same type, so the decode cannot fail.
+    /// @dev Inverse of `words`; every word comes from a field of the same type, so the decode cannot fail.
     /// @param w The field values.
     /// @return The policy.
     function _fromWords(uint256[11] memory w) private pure returns (Policy memory) {

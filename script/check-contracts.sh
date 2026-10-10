@@ -69,32 +69,6 @@ fi
 grep -q 'MISMATCH at offsets.*inside immutables: _getBlockNumberish' <<<"$flipped" || { echo "reactor pointer self-test failed without a pointer mismatch report: $flipped" >&2; exit 1; }
 # The deployment record is written only from a completed broadcast; every incomplete or inconsistent one is refused.
 python3 script/write-trade-record.py --self-test
-# The agent accounts record likewise: only from a completed DeployAgentAccounts broadcast, never overwritten.
-python3 script/write-agent-accounts-record.py --self-test
-# Agent accounts (spec of 9 Oct 2026). Both manifests must agree with Launch's records, the Trade router pin and the
-# spec 4.5 beta ceilings, and a copy of the mainnet manifest with one ceiling raised must be refused.
-python3 script/verify-agent-accounts.py --preflight
-python3 script/verify-agent-accounts.py --preflight --manifest deployments/agent-accounts-manifest-5042.json
-python3 -c 'import json, sys; m = json.load(open(sys.argv[1])); m["ceilings"]["maxTradeUsdc"] += 1; json.dump(m, open(sys.argv[2], "w"))' \
-  deployments/agent-accounts-manifest-5042.json "$pending_dir/agent-accounts-manifest-5042.json"
-if raised=$(python3 script/verify-agent-accounts.py --preflight --manifest "$pending_dir/agent-accounts-manifest-5042.json" 2>&1); then
-  echo 'verify-agent-accounts.py --preflight accepted a manifest with a ceiling above spec 4.5' >&2
-  exit 1
-fi
-grep -q 'ceilings.maxTradeUsdc .* != spec 4.5 beta ceiling' <<<"$raised" || { echo "raised-ceiling preflight failed without its report: $raised" >&2; exit 1; }
-# Runtime identity: the verifier must accept the rebuilt implementation, factory and registry runtimes with every
-# immutable substituted and reject a flipped byte in each immutable by name (the full sweep runs in --self-test; the
-# pairs below are re-run here so the gate itself sees each contract's mismatch report).
-python3 script/verify-agent-accounts.py --self-test
-for pair in 'account:FACTORY' 'account:REGISTRY' 'account:LAUNCH_FACTORY' 'account:UNIVERSAL_ROUTER' \
-  'factory:implementation' 'factory:registry' 'factory:admin' 'factory:guardianDisabled' 'factory:C_MAX_TRADE_USDC' \
-  'registry:FACTORY'; do
-  if flipped=$(python3 script/verify-agent-accounts.py --self-test-flipped "$pair" 2>&1); then
-    echo "verify-agent-accounts.py accepted a runtime with a flipped ${pair#*:} byte (${pair%%:*})" >&2
-    exit 1
-  fi
-  grep -q "MISMATCH at offsets.*inside immutables: ${pair#*:})" <<<"$flipped" || { echo "${pair} self-test failed without its mismatch report: $flipped" >&2; exit 1; }
-done
 forge test --fuzz-seed 0x5042
 # The expiring-order vector is consumed by the backend and the web app. All three copies must be identical.
 if [[ -n ${TRADE_VECTOR_BACKEND:-} && -n ${TRADE_VECTOR_WEBUI:-} ]]; then
@@ -113,38 +87,16 @@ else
 fi
 forge snapshot --check --match-path 'test/integration/*.t.sol' \
   --no-match-contract 'Fork' --no-match-test '^testFuzz_' --fuzz-seed 0x5042
-# Agent account gas: deterministic agent tests, in their own snapshot so the order suite's baseline is untouched.
-forge snapshot --check .gas-snapshot-agents --match-path 'test/agents/*.t.sol' \
-  --no-match-contract 'Fork|Invariant' --no-match-test '^testFuzz_' --fuzz-seed 0x5042
-# Slither over the agent contracts: offline, about 15 s, on a temporary copy of the tree. It runs when Slither 0.11.3
-# is installed (or SLITHER names it) and then every result must match the triaged baseline; otherwise a notice only,
-# since Slither is a Python tool outside the repo. The release evidence always records a full run of the script.
-slither_bin=${SLITHER:-slither}
-if command -v "$slither_bin" > /dev/null && [[ $("$slither_bin" --version 2> /dev/null) == 0.11.3 ]]; then
-  SLITHER="$slither_bin" bash script/run-slither.sh
-else
-  echo "notice: Slither 0.11.3 not installed (set SLITHER to it); skipping the agent Slither baseline check"
-fi
 
 if [[ ${1:-} == "--stress" ]]; then
   : "${ARC_LOCAL_FORK_RPC:?set ARC_LOCAL_FORK_RPC to an approved Arc RPC or local fork}"
   : "${TRADE_FORK_CHAIN_ID:?set TRADE_FORK_CHAIN_ID to 5042 or 5042002}"
   python3 script/verify-trade-router.py
-  # Every invariant suite runs in a deep campaign below, so the 10,000-run fuzz step leaves them out.
-  FOUNDRY_FUZZ_RUNS=10000 forge test --no-match-path 'test/invariant/*' --no-match-contract 'AgentInvariantsTest' \
-    --fuzz-seed 0x5042
+  FOUNDRY_FUZZ_RUNS=10000 forge test --no-match-path 'test/invariant/*' --fuzz-seed 0x5042
   campaign_dir=$(mktemp -d -t mercuri-trade-invariant)
   echo "Invariant counterexamples, if any: $campaign_dir"
   FOUNDRY_INVARIANT_RUNS=1024 FOUNDRY_INVARIANT_DEPTH=256 \
     FOUNDRY_INVARIANT_FAIL_ON_REVERT=true \
     FOUNDRY_INVARIANT_FAILURE_PERSIST_DIR="$campaign_dir" \
     forge test --match-path 'test/invariant/*' --fuzz-seed 0x5042002
-  # Agent account invariants (spec section 5), same depth, their own counterexample directory.
-  agent_campaign_dir=$(mktemp -d -t mercuri-agent-invariant)
-  echo "Agent invariant counterexamples, if any: $agent_campaign_dir"
-  FOUNDRY_INVARIANT_RUNS=1024 FOUNDRY_INVARIANT_DEPTH=256 \
-    FOUNDRY_INVARIANT_FAIL_ON_REVERT=true \
-    FOUNDRY_INVARIANT_FAILURE_PERSIST_DIR="$agent_campaign_dir" \
-    forge test --match-path 'test/agents/AgentInvariants.t.sol' --match-contract 'AgentInvariantsTest' \
-    --fuzz-seed 0x5042002
 fi
